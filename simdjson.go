@@ -20,6 +20,7 @@ import (
 // ParsedJson holds a parsed JSON document. Safe to reuse via sync.Pool.
 type ParsedJson struct {
 	parser      C.simdjson_parser
+	tape        *Tape
 	copyStrings bool
 	useNumber   bool
 }
@@ -81,6 +82,12 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 	if res.ok == 0 {
 		return nil, fmt.Errorf("%s", C.GoString(res.error_msg))
 	}
+	// Extract tape pointers (zero-copy, just reads two pointers from C++)
+	tape, err := pj.extractTape()
+	if err != nil {
+		return nil, err
+	}
+	pj.tape = tape
 	return pj, nil
 }
 
@@ -89,7 +96,19 @@ func (pj *ParsedJson) Close() {
 	if pj.parser != nil {
 		C.simdjson_parser_free(pj.parser)
 		pj.parser = nil
+		pj.tape = nil
 	}
+}
+
+func (pj *ParsedJson) extractTape() (*Tape, error) {
+	tp, tpLen, sb, sbLen, err := getTapeRaw(pj)
+	if err != nil {
+		return nil, err
+	}
+	return &Tape{
+		data:    ptrToUint64Slice(tp, tpLen),
+		strings: ptrToByteSlice(sb, sbLen),
+	}, nil
 }
 
 // Type represents a JSON element type.

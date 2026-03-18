@@ -16,6 +16,8 @@ import (
 // Iter represents a position in the parsed JSON document.
 type Iter struct {
 	elem        C.simdjson_element
+	tape        *Tape
+	tapeIdx     int // position in tape, -1 if unknown
 	copyStrings bool
 	useNumber   bool
 }
@@ -40,7 +42,7 @@ func (pj *ParsedJson) Iter() (Iter, error) {
 	if rc != 0 {
 		return Iter{}, fmt.Errorf("no parsed document")
 	}
-	return Iter{elem: elem, copyStrings: pj.copyStrings, useNumber: pj.useNumber}, nil
+	return Iter{elem: elem, tape: pj.tape, tapeIdx: 1, copyStrings: pj.copyStrings, useNumber: pj.useNumber}, nil
 }
 
 // Type returns the JSON type of the current element.
@@ -269,7 +271,22 @@ func (a *Array) Count() (int, error) {
 // object → map[string]interface{}, array → []interface{},
 // string → string, int64/uint64 → int64/uint64, double → float64,
 // bool → bool, null → nil.
+// Interface converts the element to its Go native equivalent.
+// Uses the tape walker for performance (pure Go, zero CGo per element).
 func (i *Iter) Interface() (interface{}, error) {
+	if i.tape != nil && i.tapeIdx >= 0 {
+		if i.useNumber {
+			val, _, err := i.tape.readValueNum(i.tapeIdx)
+			return val, err
+		}
+		val, _, err := i.tape.readValue(i.tapeIdx)
+		return val, err
+	}
+	// Fallback to DOM-based Interface() if tape is not available
+	return i.interfaceDOM()
+}
+
+func (i *Iter) interfaceDOM() (interface{}, error) {
 	switch i.Type() {
 	case TypeObject:
 		var obj Object

@@ -51,17 +51,12 @@ type Tape struct {
 	strings []byte
 }
 
-// GetTape extracts the raw tape from a ParsedJson via a single CGo call.
-// Valid until the next Parse or Close on pj.
+// GetTape returns the tape extracted during Parse. Zero-cost after parse.
 func (pj *ParsedJson) GetTape() (*Tape, error) {
-	tape, tapeLen, sbuf, sbufLen, err := getTapeRaw(pj)
-	if err != nil {
-		return nil, err
+	if pj.tape == nil {
+		return nil, fmt.Errorf("no parsed document")
 	}
-	return &Tape{
-		data:    ptrToUint64Slice(tape, tapeLen),
-		strings: ptrToByteSlice(sbuf, sbufLen),
-	}, nil
+	return pj.tape, nil
 }
 
 // TapeInterface converts the entire document to Go native types via pure Go

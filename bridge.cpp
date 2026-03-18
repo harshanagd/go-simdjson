@@ -241,10 +241,19 @@ int simdjson_get_tape(simdjson_parser p,
     *tape = doc.tape.get();
     *tape_len = len;
     *sbuf = doc.string_buf.get();
-    // Use document capacity as upper bound for string buffer length.
-    // The actual used length may be smaller, but all string offsets
-    // in the tape are within this range.
-    *sbuf_len = doc.capacity();
+    // Compute actual string buffer usage by finding max string end in tape
+    size_t max_end = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t tag = doc.tape[i] >> 56;
+        if (tag == '"') {
+            uint64_t offset = doc.tape[i] & 0x00ffffffffffffff;
+            uint32_t slen;
+            memcpy(&slen, doc.string_buf.get() + offset, sizeof(uint32_t));
+            size_t end = offset + 4 + slen + 1;
+            if (end > max_end) max_end = end;
+        }
+    }
+    *sbuf_len = max_end;
     return 0;
 }
 
