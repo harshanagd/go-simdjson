@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,4 +74,57 @@ func BenchmarkParseFiles(b *testing.B) {
 		})
 		PutParser(pj)
 	}
+}
+
+// BenchmarkParseFilesParallel benchmarks parallel parsing
+// (adapted from minio/simdjson-go benchmarkFromFile nocopy-par).
+func BenchmarkParseFilesParallel(b *testing.B) {
+	for _, name := range benchmarkFiles {
+		data := loadTestFileB(b, name)
+		b.Run(name, func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				pj := GetParser()
+				defer PutParser(pj)
+				for pb.Next() {
+					pj, _ = Parse(data, pj)
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkStdlibUnmarshal benchmarks encoding/json for comparison
+// (adapted from minio/simdjson-go BenchmarkGoMarshalJSON).
+func BenchmarkStdlibUnmarshal(b *testing.B) {
+	for _, name := range benchmarkFiles {
+		data := loadTestFileB(b, name)
+		b.Run(name, func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var v interface{}
+				if err := json.Unmarshal(data, &v); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// loadTestFileB is the *testing.B variant of loadTestFile.
+func loadTestFileB(b *testing.B, name string) []byte {
+	b.Helper()
+	path := filepath.Join("testdata", name+".json.zst")
+	if _, err := os.Stat(path); err != nil {
+		b.Skipf("testdata/%s.json.zst not found", name)
+	}
+	out, err := exec.Command("zstd", "-d", path, "--stdout").Output()
+	if err != nil {
+		b.Fatalf("decompress %s: %v", name, err)
+	}
+	return out
 }
