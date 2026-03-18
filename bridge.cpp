@@ -16,6 +16,7 @@ struct parser_state {
     simdjson::dom::parser parser;
     simdjson::dom::element root;
     bool has_doc;
+    size_t string_buf_len; // tracked after parse
 };
 
 // Convert between C bridge type and C++ type via memcpy (safe, same size).
@@ -223,6 +224,27 @@ int simdjson_array_iter_next(simdjson_arr_iter* it, simdjson_element* out_val) {
     *out_val = to_c(*state.cur);
     ++state.cur;
     *it = arr_to_c(state);
+    return 0;
+}
+
+// --- Tape access ---
+
+int simdjson_get_tape(simdjson_parser p,
+                      const uint64_t** tape, size_t* tape_len,
+                      const uint8_t** sbuf, size_t* sbuf_len) {
+    auto* state = static_cast<parser_state*>(p);
+    if (!state->has_doc) return -1;
+    auto& doc = state->parser.doc;
+    // Tape length: first root entry payload points past the last entry
+    uint64_t first = doc.tape[0];
+    size_t len = (first & 0x00ffffffffffffff) + 1;
+    *tape = doc.tape.get();
+    *tape_len = len;
+    *sbuf = doc.string_buf.get();
+    // Use document capacity as upper bound for string buffer length.
+    // The actual used length may be smaller, but all string offsets
+    // in the tape are within this range.
+    *sbuf_len = doc.capacity();
     return 0;
 }
 

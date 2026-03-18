@@ -81,6 +81,11 @@ int simdjson_array_iter_next(simdjson_arr_iter* it, simdjson_element* out_val);
 // Serialize an element to its JSON string representation.
 int simdjson_element_to_string(simdjson_element e, const char** out, size_t* out_len);
 
+// Get raw tape and string buffer pointers (zero-copy).
+int simdjson_get_tape(simdjson_parser p,
+                      const uint64_t** tape, size_t* tape_len,
+                      const uint8_t** sbuf, size_t* sbuf_len);
+
 // Runtime info.
 const char* simdjson_active_implementation(void);
 

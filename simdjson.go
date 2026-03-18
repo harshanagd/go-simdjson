@@ -238,3 +238,26 @@ func SupportedCPU() bool {
 func ActiveImplementation() string {
 	return C.GoString(C.simdjson_active_implementation())
 }
+
+// getTapeRaw returns raw pointers to the C++ tape and string buffer.
+// The returned pointers are valid until the next Parse or Close.
+func getTapeRaw(pj *ParsedJson) (tape uintptr, tapeLen int, sbuf uintptr, sbufLen int, err error) {
+	var cTape *C.uint64_t
+	var cTapeLen C.size_t
+	var cSbuf *C.uint8_t
+	var cSbufLen C.size_t
+	rc := C.simdjson_get_tape(pj.parser, &cTape, &cTapeLen, &cSbuf, &cSbufLen)
+	if rc != 0 {
+		return 0, 0, 0, 0, fmt.Errorf("no parsed document")
+	}
+	return uintptr(unsafe.Pointer(cTape)), int(cTapeLen),
+		uintptr(unsafe.Pointer(cSbuf)), int(cSbufLen), nil
+}
+
+func ptrToUint64Slice(ptr uintptr, length int) []uint64 {
+	return unsafe.Slice((*uint64)(unsafe.Pointer(ptr)), length)
+}
+
+func ptrToByteSlice(ptr uintptr, length int) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(ptr)), length)
+}
