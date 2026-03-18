@@ -110,77 +110,91 @@ func (pj *ParsedJson) RootType() Type {
 }
 
 // FindString finds a string value by key in the root object.
+// Convenience method — equivalent to pj.Iter() → Object() → FindKey() → String().
 func (pj *ParsedJson) FindString(key string) (string, error) {
-	var outStr *C.char
-	var outLen C.size_t
-	rc := C.simdjson_find_string(pj.parser,
-		(*C.char)(unsafe.Pointer(unsafe.StringData(key))), C.size_t(len(key)),
-		&outStr, &outLen)
-	if rc != 0 {
+	iter, err := pj.Iter()
+	if err != nil {
+		return "", err
+	}
+	obj, err := iter.Object(nil)
+	if err != nil {
 		return "", fmt.Errorf("key %q not found or not a string", key)
 	}
-	return C.GoStringN(outStr, C.int(outLen)), nil
+	elem := obj.FindKey(key, nil)
+	if elem == nil {
+		return "", fmt.Errorf("key %q not found or not a string", key)
+	}
+	return elem.Iter.String()
 }
 
 // RootString returns the root element as a string.
 func (pj *ParsedJson) RootString() (string, error) {
-	var outStr *C.char
-	var outLen C.size_t
-	rc := C.simdjson_get_root_string(pj.parser, &outStr, &outLen)
-	if rc != 0 {
-		return "", fmt.Errorf("root is not a string")
+	iter, err := pj.Iter()
+	if err != nil {
+		return "", err
 	}
-	return C.GoStringN(outStr, C.int(outLen)), nil
+	return iter.String()
 }
 
 // RootInt64 returns the root element as an int64.
 func (pj *ParsedJson) RootInt64() (int64, error) {
-	var out C.int64_t
-	rc := C.simdjson_get_root_int64(pj.parser, &out)
-	if rc != 0 {
-		return 0, fmt.Errorf("root is not an int64")
+	iter, err := pj.Iter()
+	if err != nil {
+		return 0, err
 	}
-	return int64(out), nil
+	return iter.Int()
 }
 
 // RootUint64 returns the root element as a uint64.
 func (pj *ParsedJson) RootUint64() (uint64, error) {
-	var out C.uint64_t
-	rc := C.simdjson_get_root_uint64(pj.parser, &out)
-	if rc != 0 {
-		return 0, fmt.Errorf("root is not a uint64")
+	iter, err := pj.Iter()
+	if err != nil {
+		return 0, err
 	}
-	return uint64(out), nil
+	return iter.Uint()
 }
 
 // RootDouble returns the root element as a float64.
 func (pj *ParsedJson) RootDouble() (float64, error) {
-	var out C.double
-	rc := C.simdjson_get_root_double(pj.parser, &out)
-	if rc != 0 {
-		return 0, fmt.Errorf("root is not a double")
+	iter, err := pj.Iter()
+	if err != nil {
+		return 0, err
 	}
-	return float64(out), nil
+	return iter.Float()
 }
 
 // RootBool returns the root element as a bool.
 func (pj *ParsedJson) RootBool() (bool, error) {
-	var out C.int
-	rc := C.simdjson_get_root_bool(pj.parser, &out)
-	if rc != 0 {
-		return false, fmt.Errorf("root is not a bool")
+	iter, err := pj.Iter()
+	if err != nil {
+		return false, err
 	}
-	return out != 0, nil
+	return iter.Bool()
 }
 
 // RootCount returns the number of elements in a root array or keys in a root object.
 func (pj *ParsedJson) RootCount() (int, error) {
-	var out C.size_t
-	rc := C.simdjson_root_count(pj.parser, &out)
-	if rc != 0 {
+	iter, err := pj.Iter()
+	if err != nil {
+		return 0, err
+	}
+	switch iter.Type() {
+	case TypeObject:
+		obj, err := iter.Object(nil)
+		if err != nil {
+			return 0, err
+		}
+		return obj.Count()
+	case TypeArray:
+		var out C.size_t
+		rc := C.simdjson_array_get_count(iter.elem, &out)
+		if rc != 0 {
+			return 0, fmt.Errorf("failed to get array count")
+		}
+		return int(out), nil
+	default:
 		return 0, fmt.Errorf("root is not an array or object")
 	}
-	return int(out), nil
 }
 
 // SupportedCPU returns true if the CPU supports SIMD-accelerated JSON parsing.

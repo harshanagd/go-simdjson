@@ -14,6 +14,11 @@ extern "C" {
 // Opaque handle to a simdjson parser (reusable, poolable).
 typedef void* simdjson_parser;
 
+// simdjson_element is a value type (16 bytes) passed by value — no heap allocation.
+typedef struct {
+    uint64_t data[2];
+} simdjson_element;
+
 // Result from simdjson_parse. Contains error info if parsing failed.
 typedef struct {
     int ok;           // 1 on success, 0 on error
@@ -40,35 +45,31 @@ void simdjson_parser_free(simdjson_parser p);
 // Parse JSON. Parser retains ownership of internal data until next parse.
 simdjson_result simdjson_parse(simdjson_parser p, const char* buf, size_t len);
 
-// Root element type.
+// Root access.
+int simdjson_get_root(simdjson_parser p, simdjson_element* out);
 int simdjson_root_type(simdjson_parser p);
 
-// Find a string value by key in the root object.
-// Returns 0 on success, non-zero on error.
-// On success, *out_str and *out_len point into parser-owned memory.
-int simdjson_find_string(simdjson_parser p, const char* key, size_t key_len,
-                         const char** out_str, size_t* out_len);
+// Element type and value extraction.
+int simdjson_element_type(simdjson_element e);
+int simdjson_element_get_string(simdjson_element e, const char** out, size_t* out_len);
+int simdjson_element_get_int64(simdjson_element e, int64_t* out);
+int simdjson_element_get_uint64(simdjson_element e, uint64_t* out);
+int simdjson_element_get_double(simdjson_element e, double* out);
+int simdjson_element_get_bool(simdjson_element e, int* out);
 
-// Get the root element as a string (for string root documents).
-int simdjson_get_root_string(simdjson_parser p, const char** out_str, size_t* out_len);
+// Object navigation.
+int simdjson_object_find_key(simdjson_element obj_elem, const char* key, size_t key_len,
+                             simdjson_element* out);
+int simdjson_object_get_count(simdjson_element obj_elem, size_t* out);
+int simdjson_object_iter(simdjson_element obj_elem, size_t idx,
+                         const char** out_key, size_t* out_key_len,
+                         simdjson_element* out_val);
 
-// Get the root element as int64.
-int simdjson_get_root_int64(simdjson_parser p, int64_t* out);
+// Array navigation.
+int simdjson_array_get_count(simdjson_element arr_elem, size_t* out);
+int simdjson_array_at(simdjson_element arr_elem, size_t idx, simdjson_element* out);
 
-// Get the root element as uint64.
-int simdjson_get_root_uint64(simdjson_parser p, uint64_t* out);
-
-// Get the root element as double.
-int simdjson_get_root_double(simdjson_parser p, double* out);
-
-// Get the root element as bool.
-int simdjson_get_root_bool(simdjson_parser p, int* out);
-
-// Count elements in root array or keys in root object.
-int simdjson_root_count(simdjson_parser p, size_t* out);
-
-// Get the active SIMD implementation name (e.g. "haswell", "arm64", "fallback").
-// Returns a static string. Always succeeds.
+// Runtime info.
 const char* simdjson_active_implementation(void);
 
 #ifdef __cplusplus

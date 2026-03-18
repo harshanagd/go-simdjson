@@ -1,0 +1,158 @@
+package simdjson
+
+import "testing"
+
+func TestIterType(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if iter.Type() != TypeObject {
+		t.Fatalf("expected object, got %v", iter.Type())
+	}
+}
+
+func TestIterObject(t *testing.T) {
+	pj, err := Parse([]byte(`{"name":"simdjson","version":"4.0.1","count":42}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// FindKey string
+	elem := obj.FindKey("name", nil)
+	if elem == nil {
+		t.Fatal("FindKey('name') returned nil")
+	}
+	val, err := elem.Iter.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "simdjson" {
+		t.Fatalf("expected 'simdjson', got %q", val)
+	}
+
+	// FindKey missing
+	if obj.FindKey("missing", nil) != nil {
+		t.Fatal("expected nil for missing key")
+	}
+
+	// Count
+	n, err := obj.Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("expected 3 keys, got %d", n)
+	}
+}
+
+func TestIterValues(t *testing.T) {
+	pj, err := Parse([]byte(`{"s":"hello","i":-42,"u":99,"f":3.14,"b":true}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	t.Run("string", func(t *testing.T) {
+		e := obj.FindKey("s", nil)
+		v, err := e.Iter.String()
+		if err != nil || v != "hello" {
+			t.Fatalf("got %q, err=%v", v, err)
+		}
+	})
+
+	t.Run("int64", func(t *testing.T) {
+		e := obj.FindKey("i", nil)
+		v, err := e.Iter.Int()
+		if err != nil || v != -42 {
+			t.Fatalf("got %d, err=%v", v, err)
+		}
+	})
+
+	t.Run("uint64", func(t *testing.T) {
+		e := obj.FindKey("u", nil)
+		v, err := e.Iter.Uint()
+		if err != nil || v != 99 {
+			t.Fatalf("got %d, err=%v", v, err)
+		}
+	})
+
+	t.Run("float64", func(t *testing.T) {
+		e := obj.FindKey("f", nil)
+		v, err := e.Iter.Float()
+		if err != nil || v != 3.14 {
+			t.Fatalf("got %f, err=%v", v, err)
+		}
+	})
+
+	t.Run("bool", func(t *testing.T) {
+		e := obj.FindKey("b", nil)
+		v, err := e.Iter.Bool()
+		if err != nil || !v {
+			t.Fatalf("got %v, err=%v", v, err)
+		}
+	})
+}
+
+func TestObjectIteration(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1,"b":"two","c":true}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+	n, _ := obj.Count()
+
+	keys := make([]string, 0, n)
+	var dst Iter
+	for i := 0; i < n; i++ {
+		name, _, err := obj.NextElement(i, &dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, name)
+	}
+
+	expected := []string{"a", "b", "c"}
+	for i, k := range expected {
+		if keys[i] != k {
+			t.Fatalf("key[%d]: expected %q, got %q", i, k, keys[i])
+		}
+	}
+}
+
+func TestIterObjectOnNonObject(t *testing.T) {
+	pj, err := Parse([]byte(`[1,2,3]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	_, err = iter.Object(nil)
+	if err == nil {
+		t.Fatal("expected error calling Object() on array")
+	}
+}
