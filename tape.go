@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"unsafe"
 )
 
 const (
@@ -48,8 +49,9 @@ const (
 // Parse() call or freed on Close(). The Tape struct points directly into
 // this C memory — no copies are made.
 type Tape struct {
-	data    []uint64
-	strings []byte
+	data        []uint64
+	strings     []byte
+	copyStrings bool
 }
 
 // GetTape returns the tape extracted during Parse. Zero-cost after parse.
@@ -473,7 +475,10 @@ func (t *Tape) readString(offset uint64) (string, error) {
 	if start+slen > len(t.strings) {
 		return "", fmt.Errorf("string length %d at offset %d out of bounds", slen, off)
 	}
-	return string(t.strings[start : start+slen]), nil
+	if t.copyStrings {
+		return string(t.strings[start : start+slen]), nil
+	}
+	return unsafe.String(&t.strings[start], slen), nil
 }
 
 func (t *Tape) readValueNum(idx int) (interface{}, int, error) {

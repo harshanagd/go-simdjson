@@ -25,13 +25,16 @@ typedef struct {
 simdjson_parser simdjson_parser_new(void);
 void simdjson_parser_free(simdjson_parser p);
 
-// Parse JSON. Parser retains ownership of internal data until next parse.
-simdjson_result simdjson_parse(simdjson_parser p, const char* buf, size_t len);
+// Parse and extract tape in a single CGo call.
+typedef struct {
+    simdjson_result result;
+    const uint64_t* tape;
+    size_t tape_len;
+    const uint8_t* sbuf;
+    size_t sbuf_len;
+} simdjson_parse_result;
 
-// Get raw tape and string buffer pointers (zero-copy).
-int simdjson_get_tape(simdjson_parser p,
-                      const uint64_t** tape, size_t* tape_len,
-                      const uint8_t** sbuf, size_t* sbuf_len);
+simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char* buf, size_t len);
 
 // Runtime info.
 const char* simdjson_active_implementation(void);

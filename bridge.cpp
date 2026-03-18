@@ -23,34 +23,32 @@ void simdjson_parser_free(simdjson_parser p) {
     delete static_cast<parser_state*>(p);
 }
 
-simdjson_result simdjson_parse(simdjson_parser p, const char* buf, size_t len) {
+simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char* buf, size_t len) {
+    simdjson_parse_result r = {};
     auto* state = static_cast<parser_state*>(p);
     state->has_doc = false;
     auto error = state->parser.parse(buf, len).get(state->root);
     if (error) {
-        return {0, static_cast<int>(error), simdjson::error_message(error)};
+        r.result = {0, static_cast<int>(error), simdjson::error_message(error)};
+        return r;
     }
     state->has_doc = true;
-    return {1, 0, nullptr};
-}
+    r.result = {1, 0, nullptr};
 
-// --- Tape access ---
-
-int simdjson_get_tape(simdjson_parser p,
-                      const uint64_t** tape, size_t* tape_len,
-                      const uint8_t** sbuf, size_t* sbuf_len) {
-    auto* state = static_cast<parser_state*>(p);
-    if (!state->has_doc) return -1;
     auto& doc = state->parser.doc;
-    // Tape length: first root entry payload points past the last entry
+    if (!doc.tape) return r;
+
     uint64_t first = doc.tape[0];
-    size_t len = (first & 0x00ffffffffffffff) + 1;
-    *tape = doc.tape.get();
-    *tape_len = len;
-    *sbuf = doc.string_buf.get();
-    // Compute actual string buffer usage by finding max string end in tape
+    size_t tape_len_val = (first & 0x00ffffffffffffff) + 1;
+    r.tape = doc.tape.get();
+    r.tape_len = tape_len_val;
+    r.sbuf = doc.string_buf.get();
+    if (!r.sbuf) {
+        r.sbuf_len = 0;
+        return r;
+    }
     size_t max_end = 0;
-    for (size_t i = 0; i < len; i++) {
+    for (size_t i = 0; i < tape_len_val; i++) {
         uint8_t tag = doc.tape[i] >> 56;
         if (tag == '"') {
             uint64_t offset = doc.tape[i] & 0x00ffffffffffffff;
@@ -60,8 +58,8 @@ int simdjson_get_tape(simdjson_parser p,
             if (end > max_end) max_end = end;
         }
     }
-    *sbuf_len = max_end;
-    return 0;
+    r.sbuf_len = max_end;
+    return r;
 }
 
 // --- Runtime info ---

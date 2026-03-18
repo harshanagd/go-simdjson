@@ -78,16 +78,16 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 	if len(b) == 0 {
 		return nil, fmt.Errorf("empty input")
 	}
-	res := C.simdjson_parse(pj.parser, (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b)))
-	if res.ok == 0 {
-		return nil, fmt.Errorf("%s", C.GoString(res.error_msg))
+	// Single CGo call: parse + extract tape pointers
+	res := C.simdjson_parse_and_get_tape(pj.parser, (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b)))
+	if res.result.ok == 0 {
+		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
-	// Extract tape pointers (zero-copy, just reads two pointers from C++)
-	tape, err := pj.extractTape()
-	if err != nil {
-		return nil, err
+	pj.tape = &Tape{
+		data:        ptrToUint64Slice(uintptr(unsafe.Pointer(res.tape)), int(res.tape_len)),
+		strings:     ptrToByteSlice(uintptr(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
+		copyStrings: pj.copyStrings,
 	}
-	pj.tape = tape
 	return pj, nil
 }
 
@@ -98,17 +98,6 @@ func (pj *ParsedJson) Close() {
 		pj.parser = nil
 		pj.tape = nil
 	}
-}
-
-func (pj *ParsedJson) extractTape() (*Tape, error) {
-	tp, tpLen, sb, sbLen, err := getTapeRaw(pj)
-	if err != nil {
-		return nil, err
-	}
-	return &Tape{
-		data:    ptrToUint64Slice(tp, tpLen),
-		strings: ptrToByteSlice(sb, sbLen),
-	}, nil
 }
 
 // Type represents a JSON element type.
@@ -258,25 +247,16 @@ func ActiveImplementation() string {
 	return C.GoString(C.simdjson_active_implementation())
 }
 
-// getTapeRaw returns raw pointers to the C++ tape and string buffer.
-// The returned pointers are valid until the next Parse or Close.
-func getTapeRaw(pj *ParsedJson) (tape uintptr, tapeLen int, sbuf uintptr, sbufLen int, err error) {
-	var cTape *C.uint64_t
-	var cTapeLen C.size_t
-	var cSbuf *C.uint8_t
-	var cSbufLen C.size_t
-	rc := C.simdjson_get_tape(pj.parser, &cTape, &cTapeLen, &cSbuf, &cSbufLen)
-	if rc != 0 {
-		return 0, 0, 0, 0, fmt.Errorf("no parsed document")
-	}
-	return uintptr(unsafe.Pointer(cTape)), int(cTapeLen),
-		uintptr(unsafe.Pointer(cSbuf)), int(cSbufLen), nil
-}
-
 func ptrToUint64Slice(ptr uintptr, length int) []uint64 {
+	if ptr == 0 || length == 0 {
+		return nil
+	}
 	return unsafe.Slice((*uint64)(unsafe.Pointer(ptr)), length)
 }
 
 func ptrToByteSlice(ptr uintptr, length int) []byte {
+	if ptr == 0 || length == 0 {
+		return nil
+	}
 	return unsafe.Slice((*byte)(unsafe.Pointer(ptr)), length)
 }
