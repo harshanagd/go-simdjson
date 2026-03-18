@@ -106,7 +106,11 @@ func (t Type) String() string {
 
 // RootType returns the type of the root JSON element.
 func (pj *ParsedJson) RootType() Type {
-	return Type(C.simdjson_root_type(pj.parser))
+	iter, err := pj.Iter()
+	if err != nil {
+		return Type(-1)
+	}
+	return iter.Type()
 }
 
 // FindString finds a string value by key in the root object.
@@ -118,11 +122,11 @@ func (pj *ParsedJson) FindString(key string) (string, error) {
 	}
 	obj, err := iter.Object(nil)
 	if err != nil {
-		return "", fmt.Errorf("key %q not found or not a string", key)
+		return "", fmt.Errorf("root is not an object")
 	}
 	elem := obj.FindKey(key, nil)
 	if elem == nil {
-		return "", fmt.Errorf("key %q not found or not a string", key)
+		return "", fmt.Errorf("key %q not found", key)
 	}
 	return elem.Iter.String()
 }

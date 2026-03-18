@@ -47,7 +47,6 @@ simdjson_result simdjson_parse(simdjson_parser p, const char* buf, size_t len);
 
 // Root access.
 int simdjson_get_root(simdjson_parser p, simdjson_element* out);
-int simdjson_root_type(simdjson_parser p);
 
 // Element type and value extraction.
 int simdjson_element_type(simdjson_element e);

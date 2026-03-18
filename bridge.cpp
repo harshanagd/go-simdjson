@@ -31,6 +31,10 @@ static inline simdjson_element to_c(simdjson::dom::element e) {
     return out;
 }
 
+static inline bool is_null_element(simdjson_element e) {
+    return e.data[0] == 0 && e.data[1] == 0;
+}
+
 extern "C" {
 
 // --- Parser lifecycle ---
@@ -63,19 +67,15 @@ int simdjson_get_root(simdjson_parser p, simdjson_element* out) {
     return 0;
 }
 
-int simdjson_root_type(simdjson_parser p) {
-    auto* state = static_cast<parser_state*>(p);
-    if (!state->has_doc) return -1;
-    return static_cast<int>(state->root.type());
-}
-
 // --- Element type and value extraction ---
 
 int simdjson_element_type(simdjson_element e) {
+    if (is_null_element(e)) return -1;
     return static_cast<int>(to_cpp(e).type());
 }
 
 int simdjson_element_get_string(simdjson_element e, const char** out, size_t* out_len) {
+    if (is_null_element(e)) return -1;
     std::string_view val;
     auto error = to_cpp(e).get(val);
     if (error) return static_cast<int>(error);
@@ -85,24 +85,28 @@ int simdjson_element_get_string(simdjson_element e, const char** out, size_t* ou
 }
 
 int simdjson_element_get_int64(simdjson_element e, int64_t* out) {
+    if (is_null_element(e)) return -1;
     auto error = to_cpp(e).get(*out);
     if (error) return static_cast<int>(error);
     return 0;
 }
 
 int simdjson_element_get_uint64(simdjson_element e, uint64_t* out) {
+    if (is_null_element(e)) return -1;
     auto error = to_cpp(e).get(*out);
     if (error) return static_cast<int>(error);
     return 0;
 }
 
 int simdjson_element_get_double(simdjson_element e, double* out) {
+    if (is_null_element(e)) return -1;
     auto error = to_cpp(e).get(*out);
     if (error) return static_cast<int>(error);
     return 0;
 }
 
 int simdjson_element_get_bool(simdjson_element e, int* out) {
+    if (is_null_element(e)) return -1;
     bool val;
     auto error = to_cpp(e).get(val);
     if (error) return static_cast<int>(error);
@@ -114,6 +118,7 @@ int simdjson_element_get_bool(simdjson_element e, int* out) {
 
 int simdjson_object_find_key(simdjson_element obj_elem, const char* key, size_t key_len,
                              simdjson_element* out) {
+    if (is_null_element(obj_elem)) return -1;
     simdjson::dom::object obj;
     auto error = to_cpp(obj_elem).get(obj);
     if (error) return static_cast<int>(error);
@@ -125,6 +130,7 @@ int simdjson_object_find_key(simdjson_element obj_elem, const char* key, size_t 
 }
 
 int simdjson_object_get_count(simdjson_element obj_elem, size_t* out) {
+    if (is_null_element(obj_elem)) return -1;
     simdjson::dom::object obj;
     auto error = to_cpp(obj_elem).get(obj);
     if (error) return static_cast<int>(error);
@@ -135,6 +141,7 @@ int simdjson_object_get_count(simdjson_element obj_elem, size_t* out) {
 int simdjson_object_iter(simdjson_element obj_elem, size_t idx,
                          const char** out_key, size_t* out_key_len,
                          simdjson_element* out_val) {
+    if (is_null_element(obj_elem)) return -1;
     simdjson::dom::object obj;
     auto error = to_cpp(obj_elem).get(obj);
     if (error) return static_cast<int>(error);
@@ -154,6 +161,7 @@ int simdjson_object_iter(simdjson_element obj_elem, size_t idx,
 // --- Array navigation ---
 
 int simdjson_array_get_count(simdjson_element arr_elem, size_t* out) {
+    if (is_null_element(arr_elem)) return -1;
     simdjson::dom::array arr;
     auto error = to_cpp(arr_elem).get(arr);
     if (error) return static_cast<int>(error);
@@ -162,6 +170,7 @@ int simdjson_array_get_count(simdjson_element arr_elem, size_t* out) {
 }
 
 int simdjson_array_at(simdjson_element arr_elem, size_t idx, simdjson_element* out) {
+    if (is_null_element(arr_elem)) return -1;
     simdjson::dom::array arr;
     auto error = to_cpp(arr_elem).get(arr);
     if (error) return static_cast<int>(error);
