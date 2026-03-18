@@ -1,0 +1,184 @@
+// Copyright 2026 harshanagd
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE file for details.
+
+// Package simdjson provides Go bindings for the simdjson C++ library via CGo.
+// It supports x86_64 (AVX2/SSE4.2) and ARM64 (NEON) with automatic runtime detection.
+package simdjson
+
+// #cgo CXXFLAGS: -std=c++17 -O2 -DNDEBUG
+// #cgo LDFLAGS: -lstdc++ -lm
+// #include "bridge.h"
+import "C"
+
+import (
+	"fmt"
+	"sync"
+	"unsafe"
+)
+
+// ParsedJson holds a parsed JSON document. Safe to reuse via sync.Pool.
+type ParsedJson struct {
+	parser C.simdjson_parser
+}
+
+// parserPool pools C++ parser instances to reduce allocations.
+var parserPool = sync.Pool{
+	New: func() interface{} {
+		return &ParsedJson{parser: C.simdjson_parser_new()}
+	},
+}
+
+// GetParser returns a ParsedJson from the pool. Call PutParser when done.
+func GetParser() *ParsedJson {
+	return parserPool.Get().(*ParsedJson)
+}
+
+// PutParser returns a ParsedJson to the pool for reuse.
+func PutParser(pj *ParsedJson) {
+	if pj != nil && pj.parser != nil {
+		parserPool.Put(pj)
+	}
+}
+
+// Parse parses JSON bytes using the provided ParsedJson (or a new one if nil).
+// The returned ParsedJson owns the parsed data until the next Parse call.
+func Parse(b []byte, reuse *ParsedJson) (*ParsedJson, error) {
+	pj := reuse
+	if pj == nil {
+		pj = &ParsedJson{parser: C.simdjson_parser_new()}
+	}
+	if len(b) == 0 {
+		return nil, fmt.Errorf("empty input")
+	}
+	res := C.simdjson_parse(pj.parser, (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b)))
+	if res.ok == 0 {
+		return nil, fmt.Errorf("%s", C.GoString(res.error_msg))
+	}
+	return pj, nil
+}
+
+// Close frees the underlying C++ parser. The ParsedJson must not be used after Close.
+func (pj *ParsedJson) Close() {
+	if pj.parser != nil {
+		C.simdjson_parser_free(pj.parser)
+		pj.parser = nil
+	}
+}
+
+// Type represents a JSON element type.
+type Type int
+
+const (
+	TypeArray  Type = '['
+	TypeObject Type = '{'
+	TypeInt64  Type = 'l'
+	TypeUint64 Type = 'u'
+	TypeDouble Type = 'd'
+	TypeString Type = '"'
+	TypeBool   Type = 't'
+	TypeNull   Type = 'n'
+)
+
+// String returns the type name.
+func (t Type) String() string {
+	switch t {
+	case TypeArray:
+		return "array"
+	case TypeObject:
+		return "object"
+	case TypeInt64:
+		return "int64"
+	case TypeUint64:
+		return "uint64"
+	case TypeDouble:
+		return "double"
+	case TypeString:
+		return "string"
+	case TypeBool:
+		return "bool"
+	case TypeNull:
+		return "null"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(t))
+	}
+}
+
+// RootType returns the type of the root JSON element.
+func (pj *ParsedJson) RootType() Type {
+	return Type(C.simdjson_root_type(pj.parser))
+}
+
+// FindString finds a string value by key in the root object.
+func (pj *ParsedJson) FindString(key string) (string, error) {
+	var outStr *C.char
+	var outLen C.size_t
+	rc := C.simdjson_find_string(pj.parser,
+		(*C.char)(unsafe.Pointer(unsafe.StringData(key))), C.size_t(len(key)),
+		&outStr, &outLen)
+	if rc != 0 {
+		return "", fmt.Errorf("key %q not found or not a string", key)
+	}
+	return C.GoStringN(outStr, C.int(outLen)), nil
+}
+
+// RootString returns the root element as a string.
+func (pj *ParsedJson) RootString() (string, error) {
+	var outStr *C.char
+	var outLen C.size_t
+	rc := C.simdjson_get_root_string(pj.parser, &outStr, &outLen)
+	if rc != 0 {
+		return "", fmt.Errorf("root is not a string")
+	}
+	return C.GoStringN(outStr, C.int(outLen)), nil
+}
+
+// RootInt64 returns the root element as an int64.
+func (pj *ParsedJson) RootInt64() (int64, error) {
+	var out C.int64_t
+	rc := C.simdjson_get_root_int64(pj.parser, &out)
+	if rc != 0 {
+		return 0, fmt.Errorf("root is not an int64")
+	}
+	return int64(out), nil
+}
+
+// RootUint64 returns the root element as a uint64.
+func (pj *ParsedJson) RootUint64() (uint64, error) {
+	var out C.uint64_t
+	rc := C.simdjson_get_root_uint64(pj.parser, &out)
+	if rc != 0 {
+		return 0, fmt.Errorf("root is not a uint64")
+	}
+	return uint64(out), nil
+}
+
+// RootDouble returns the root element as a float64.
+func (pj *ParsedJson) RootDouble() (float64, error) {
+	var out C.double
+	rc := C.simdjson_get_root_double(pj.parser, &out)
+	if rc != 0 {
+		return 0, fmt.Errorf("root is not a double")
+	}
+	return float64(out), nil
+}
+
+// RootBool returns the root element as a bool.
+func (pj *ParsedJson) RootBool() (bool, error) {
+	var out C.int
+	rc := C.simdjson_get_root_bool(pj.parser, &out)
+	if rc != 0 {
+		return false, fmt.Errorf("root is not a bool")
+	}
+	return out != 0, nil
+}
+
+// RootCount returns the number of elements in a root array or keys in a root object.
+func (pj *ParsedJson) RootCount() (int, error) {
+	var out C.size_t
+	rc := C.simdjson_root_count(pj.parser, &out)
+	if rc != 0 {
+		return 0, fmt.Errorf("root is not an array or object")
+	}
+	return int(out), nil
+}
