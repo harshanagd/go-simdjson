@@ -60,13 +60,23 @@ int simdjson_element_get_bool(simdjson_element e, int* out);
 int simdjson_object_find_key(simdjson_element obj_elem, const char* key, size_t key_len,
                              simdjson_element* out);
 int simdjson_object_get_count(simdjson_element obj_elem, size_t* out);
-int simdjson_object_iter(simdjson_element obj_elem, size_t idx,
-                         const char** out_key, size_t* out_key_len,
-                         simdjson_element* out_val);
+
+// Object iteration (O(1) per step).
+// Opaque handle to an object/array iterator.
+typedef struct { uint64_t data[4]; } simdjson_obj_iter;
+typedef struct { uint64_t data[4]; } simdjson_arr_iter;
+
+int simdjson_object_iter_begin(simdjson_element obj_elem, simdjson_obj_iter* out);
+int simdjson_object_iter_next(simdjson_obj_iter* it,
+                              const char** out_key, size_t* out_key_len,
+                              simdjson_element* out_val);
 
 // Array navigation.
 int simdjson_array_get_count(simdjson_element arr_elem, size_t* out);
-int simdjson_array_at(simdjson_element arr_elem, size_t idx, simdjson_element* out);
+
+// Array iteration (O(1) per step).
+int simdjson_array_iter_begin(simdjson_element arr_elem, simdjson_arr_iter* out);
+int simdjson_array_iter_next(simdjson_arr_iter* it, simdjson_element* out_val);
 
 // Runtime info.
 const char* simdjson_active_implementation(void);

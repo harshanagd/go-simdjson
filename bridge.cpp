@@ -138,27 +138,66 @@ int simdjson_object_get_count(simdjson_element obj_elem, size_t* out) {
     return 0;
 }
 
-int simdjson_object_iter(simdjson_element obj_elem, size_t idx,
-                         const char** out_key, size_t* out_key_len,
-                         simdjson_element* out_val) {
+// Object iterator: stores {current, end} as two 16-byte C++ iterators.
+struct obj_iter_state {
+    simdjson::dom::object::iterator cur;
+    simdjson::dom::object::iterator end;
+};
+static_assert(sizeof(obj_iter_state) == sizeof(simdjson_obj_iter), "obj_iter size mismatch");
+
+static inline obj_iter_state obj_to_cpp(simdjson_obj_iter it) {
+    obj_iter_state s;
+    memcpy(&s, &it, sizeof(s));
+    return s;
+}
+
+static inline simdjson_obj_iter obj_to_c(obj_iter_state s) {
+    simdjson_obj_iter out;
+    memcpy(&out, &s, sizeof(out));
+    return out;
+}
+
+int simdjson_object_iter_begin(simdjson_element obj_elem, simdjson_obj_iter* out) {
     if (is_null_element(obj_elem)) return -1;
     simdjson::dom::object obj;
     auto error = to_cpp(obj_elem).get(obj);
     if (error) return static_cast<int>(error);
-    size_t i = 0;
-    for (auto field : obj) {
-        if (i == idx) {
-            *out_key = field.key.data();
-            *out_key_len = field.key.size();
-            *out_val = to_c(field.value);
-            return 0;
-        }
-        i++;
-    }
-    return -1;
+    *out = obj_to_c({obj.begin(), obj.end()});
+    return 0;
 }
 
-// --- Array navigation ---
+int simdjson_object_iter_next(simdjson_obj_iter* it,
+                              const char** out_key, size_t* out_key_len,
+                              simdjson_element* out_val) {
+    auto state = obj_to_cpp(*it);
+    if (state.cur == state.end) return 1; // done
+    auto field = *state.cur;
+    *out_key = field.key.data();
+    *out_key_len = field.key.size();
+    *out_val = to_c(field.value);
+    ++state.cur;
+    *it = obj_to_c(state);
+    return 0;
+}
+
+// Array iterator: stores {current, end} as two 16-byte C++ iterators.
+struct arr_iter_state {
+    simdjson::dom::array::iterator cur;
+    simdjson::dom::array::iterator end;
+};
+static_assert(sizeof(arr_iter_state) == sizeof(simdjson_arr_iter), "arr_iter size mismatch");
+
+static inline arr_iter_state arr_to_cpp(simdjson_arr_iter it) {
+    arr_iter_state s;
+    memcpy(&s, &it, sizeof(s));
+    return s;
+}
+
+static inline simdjson_arr_iter arr_to_c(arr_iter_state s) {
+    simdjson_arr_iter out;
+    memcpy(&out, &s, sizeof(out));
+    return out;
+}
 
 int simdjson_array_get_count(simdjson_element arr_elem, size_t* out) {
     if (is_null_element(arr_elem)) return -1;
@@ -169,15 +208,21 @@ int simdjson_array_get_count(simdjson_element arr_elem, size_t* out) {
     return 0;
 }
 
-int simdjson_array_at(simdjson_element arr_elem, size_t idx, simdjson_element* out) {
+int simdjson_array_iter_begin(simdjson_element arr_elem, simdjson_arr_iter* out) {
     if (is_null_element(arr_elem)) return -1;
     simdjson::dom::array arr;
     auto error = to_cpp(arr_elem).get(arr);
     if (error) return static_cast<int>(error);
-    simdjson::dom::element val;
-    error = arr.at(idx).get(val);
-    if (error) return static_cast<int>(error);
-    *out = to_c(val);
+    *out = arr_to_c({arr.begin(), arr.end()});
+    return 0;
+}
+
+int simdjson_array_iter_next(simdjson_arr_iter* it, simdjson_element* out_val) {
+    auto state = arr_to_cpp(*it);
+    if (state.cur == state.end) return 1; // done
+    *out_val = to_c(*state.cur);
+    ++state.cur;
+    *it = arr_to_c(state);
     return 0;
 }
 

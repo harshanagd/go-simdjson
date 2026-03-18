@@ -122,22 +122,29 @@ func (o *Object) FindKey(key string, reuse *Element) *Element {
 	return &Element{Iter: Iter{elem: out}}
 }
 
-// NextElement iterates over object key-value pairs.
-// Call with idx 0..Count()-1.
-func (o *Object) NextElement(idx int, dst *Iter) (name string, t Type, err error) {
+// ForEach iterates over all key-value pairs in O(n) time.
+func (o *Object) ForEach(fn func(key string, i Iter) error) error {
+	var it C.simdjson_obj_iter
+	rc := C.simdjson_object_iter_begin(o.elem, &it)
+	if rc != 0 {
+		return fmt.Errorf("element is not an object")
+	}
 	var outKey *C.char
 	var outKeyLen C.size_t
 	var outVal C.simdjson_element
-	rc := C.simdjson_object_iter(o.elem, C.size_t(idx), &outKey, &outKeyLen, &outVal)
-	if rc != 0 {
-		return "", TypeNull, fmt.Errorf("index %d out of range", idx)
+	for {
+		rc = C.simdjson_object_iter_next(&it, &outKey, &outKeyLen, &outVal)
+		if rc == 1 {
+			return nil
+		}
+		if rc != 0 {
+			return fmt.Errorf("iteration error")
+		}
+		key := C.GoStringN(outKey, C.int(outKeyLen))
+		if err := fn(key, Iter{elem: outVal}); err != nil {
+			return err
+		}
 	}
-	if dst != nil {
-		dst.elem = outVal
-	}
-	key := C.GoStringN(outKey, C.int(outKeyLen))
-	typ := Type(C.simdjson_element_type(outVal))
-	return key, typ, nil
 }
 
 // Count returns the number of key-value pairs in the object.
@@ -146,6 +153,55 @@ func (o *Object) Count() (int, error) {
 	rc := C.simdjson_object_get_count(o.elem, &out)
 	if rc != 0 {
 		return 0, fmt.Errorf("element is not an object")
+	}
+	return int(out), nil
+}
+
+// Array represents a JSON array for element access.
+type Array struct {
+	elem C.simdjson_element
+}
+
+// Array returns the element as an Array.
+func (i *Iter) Array(reuse *Array) (*Array, error) {
+	if i.Type() != TypeArray {
+		return nil, fmt.Errorf("element is not an array")
+	}
+	if reuse != nil {
+		reuse.elem = i.elem
+		return reuse, nil
+	}
+	return &Array{elem: i.elem}, nil
+}
+
+// ForEach iterates over all elements in O(n) time.
+func (a *Array) ForEach(fn func(i Iter) error) error {
+	var it C.simdjson_arr_iter
+	rc := C.simdjson_array_iter_begin(a.elem, &it)
+	if rc != 0 {
+		return fmt.Errorf("element is not an array")
+	}
+	var outVal C.simdjson_element
+	for {
+		rc = C.simdjson_array_iter_next(&it, &outVal)
+		if rc == 1 {
+			return nil
+		}
+		if rc != 0 {
+			return fmt.Errorf("iteration error")
+		}
+		if err := fn(Iter{elem: outVal}); err != nil {
+			return err
+		}
+	}
+}
+
+// Count returns the number of elements in the array.
+func (a *Array) Count() (int, error) {
+	var out C.size_t
+	rc := C.simdjson_array_get_count(a.elem, &out)
+	if rc != 0 {
+		return 0, fmt.Errorf("element is not an array")
 	}
 	return int(out), nil
 }

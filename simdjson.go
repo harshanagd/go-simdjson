@@ -190,12 +190,11 @@ func (pj *ParsedJson) RootCount() (int, error) {
 		}
 		return obj.Count()
 	case TypeArray:
-		var out C.size_t
-		rc := C.simdjson_array_get_count(iter.elem, &out)
-		if rc != 0 {
-			return 0, fmt.Errorf("failed to get array count")
+		arr, err := iter.Array(nil)
+		if err != nil {
+			return 0, err
 		}
-		return int(out), nil
+		return arr.Count()
 	default:
 		return 0, fmt.Errorf("root is not an array or object")
 	}

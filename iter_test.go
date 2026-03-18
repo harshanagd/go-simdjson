@@ -123,16 +123,14 @@ func TestObjectIteration(t *testing.T) {
 
 	iter, _ := pj.Iter()
 	obj, _ := iter.Object(nil)
-	n, _ := obj.Count()
 
-	keys := make([]string, 0, n)
-	var dst Iter
-	for i := 0; i < n; i++ {
-		name, _, err := obj.NextElement(i, &dst)
-		if err != nil {
-			t.Fatal(err)
-		}
-		keys = append(keys, name)
+	keys := make([]string, 0)
+	err = obj.ForEach(func(key string, i Iter) error {
+		keys = append(keys, key)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	expected := []string{"a", "b", "c"}
@@ -140,6 +138,55 @@ func TestObjectIteration(t *testing.T) {
 		if keys[i] != k {
 			t.Fatalf("key[%d]: expected %q, got %q", i, k, keys[i])
 		}
+	}
+}
+
+func TestArrayIteration(t *testing.T) {
+	pj, err := Parse([]byte(`[10,20,30]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, err := iter.Array(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, _ := arr.Count()
+	if n != 3 {
+		t.Fatalf("expected 3 elements, got %d", n)
+	}
+
+	var vals []int64
+	err = arr.ForEach(func(i Iter) error {
+		v, err := i.Int()
+		if err != nil {
+			return err
+		}
+		vals = append(vals, v)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vals) != 3 || vals[0] != 10 || vals[1] != 20 || vals[2] != 30 {
+		t.Fatalf("expected [10,20,30], got %v", vals)
+	}
+}
+
+func TestArrayOnNonArray(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	_, err = iter.Array(nil)
+	if err == nil {
+		t.Fatal("expected error calling Array() on object")
 	}
 }
 
