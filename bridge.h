@@ -67,6 +67,10 @@ int simdjson_get_root_bool(simdjson_parser p, int* out);
 // Count elements in root array or keys in root object.
 int simdjson_root_count(simdjson_parser p, size_t* out);
 
+// Get the active SIMD implementation name (e.g. "haswell", "arm64", "fallback").
+// Returns a static string. Always succeeds.
+const char* simdjson_active_implementation(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -182,3 +182,16 @@ func (pj *ParsedJson) RootCount() (int, error) {
 	}
 	return int(out), nil
 }
+
+// SupportedCPU returns true if the CPU supports SIMD-accelerated JSON parsing.
+// C++ simdjson always has a fallback implementation, so this always returns true.
+// Use ActiveImplementation() to check which SIMD backend is in use.
+func SupportedCPU() bool {
+	return true
+}
+
+// ActiveImplementation returns the name of the active SIMD implementation
+// detected at runtime (e.g. "haswell", "westmere", "arm64", "fallback").
+func ActiveImplementation() string {
+	return C.GoString(C.simdjson_active_implementation())
+}

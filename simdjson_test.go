@@ -223,6 +223,20 @@ func TestTypeString(t *testing.T) {
 	}
 }
 
+func TestSupportedCPU(t *testing.T) {
+	if !SupportedCPU() {
+		t.Fatal("SupportedCPU() returned false")
+	}
+}
+
+func TestActiveImplementation(t *testing.T) {
+	impl := ActiveImplementation()
+	if impl == "" {
+		t.Fatal("ActiveImplementation() returned empty string")
+	}
+	t.Logf("active SIMD implementation: %s", impl)
+}
+
 func BenchmarkParse(b *testing.B) {
 	data := []byte(`{"key":"value","number":42,"array":[1,2,3],"nested":{"a":"b"}}`)
 	pj := GetParser()

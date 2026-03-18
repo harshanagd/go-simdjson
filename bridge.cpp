@@ -122,3 +122,7 @@ int simdjson_root_count(simdjson_parser p, size_t* out) {
 }
 
 } // extern "C"
+
+extern "C" const char* simdjson_active_implementation(void) {
+    return simdjson::get_active_implementation()->name().data();
+}
