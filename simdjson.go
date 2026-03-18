@@ -9,10 +9,12 @@ package simdjson
 // #cgo CXXFLAGS: -std=c++17 -O2 -DNDEBUG
 // #cgo LDFLAGS: -lstdc++ -lm
 // #include "bridge.h"
+// #include <string.h>
 import "C"
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"unsafe"
 )
@@ -46,10 +48,18 @@ func UseNumber() ParserOption {
 	}
 }
 
+func newParsedJson() *ParsedJson {
+	pj := &ParsedJson{parser: C.simdjson_parser_new(), copyStrings: true}
+	runtime.SetFinalizer(pj, func(p *ParsedJson) {
+		p.Close()
+	})
+	return pj
+}
+
 // parserPool pools C++ parser instances to reduce allocations.
 var parserPool = sync.Pool{
 	New: func() interface{} {
-		return &ParsedJson{parser: C.simdjson_parser_new(), copyStrings: true}
+		return newParsedJson()
 	},
 }
 
@@ -70,7 +80,7 @@ func PutParser(pj *ParsedJson) {
 func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, error) {
 	pj := reuse
 	if pj == nil {
-		pj = &ParsedJson{parser: C.simdjson_parser_new(), copyStrings: true}
+		pj = newParsedJson()
 	}
 	for _, opt := range opts {
 		opt(pj)
@@ -84,8 +94,8 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
 	pj.tape = &Tape{
-		data:        ptrToUint64Slice(uintptr(unsafe.Pointer(res.tape)), int(res.tape_len)),
-		strings:     ptrToByteSlice(uintptr(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
+		data:        copyUint64Slice(uintptr(unsafe.Pointer(res.tape)), int(res.tape_len)),
+		strings:     copyByteSlice(uintptr(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
 		copyStrings: pj.copyStrings,
 	}
 	return pj, nil
@@ -247,16 +257,20 @@ func ActiveImplementation() string {
 	return C.GoString(C.simdjson_active_implementation())
 }
 
-func ptrToUint64Slice(ptr uintptr, length int) []uint64 {
+func copyUint64Slice(ptr uintptr, length int) []uint64 {
 	if ptr == 0 || length == 0 {
 		return nil
 	}
-	return unsafe.Slice((*uint64)(unsafe.Pointer(ptr)), length)
+	dst := make([]uint64, length)
+	C.memcpy(unsafe.Pointer(&dst[0]), unsafe.Pointer(ptr), C.size_t(length*8))
+	return dst
 }
 
-func ptrToByteSlice(ptr uintptr, length int) []byte {
+func copyByteSlice(ptr uintptr, length int) []byte {
 	if ptr == 0 || length == 0 {
 		return nil
 	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(ptr)), length)
+	dst := make([]byte, length)
+	C.memcpy(unsafe.Pointer(&dst[0]), unsafe.Pointer(ptr), C.size_t(length))
+	return dst
 }
