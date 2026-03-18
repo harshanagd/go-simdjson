@@ -14,12 +14,14 @@ import (
 
 // Iter represents a position in the parsed JSON document.
 type Iter struct {
-	elem C.simdjson_element
+	elem        C.simdjson_element
+	copyStrings bool
 }
 
 // Object represents a JSON object for key-value access.
 type Object struct {
-	elem C.simdjson_element
+	elem        C.simdjson_element
+	copyStrings bool
 }
 
 // Element is a key-value pair result from object lookup.
@@ -34,7 +36,7 @@ func (pj *ParsedJson) Iter() (Iter, error) {
 	if rc != 0 {
 		return Iter{}, fmt.Errorf("no parsed document")
 	}
-	return Iter{elem: elem}, nil
+	return Iter{elem: elem, copyStrings: pj.copyStrings}, nil
 }
 
 // Type returns the JSON type of the current element.
@@ -43,6 +45,8 @@ func (i *Iter) Type() Type {
 }
 
 // String extracts a string value from the current element.
+// If WithCopyStrings(false) was set, the string points into parser-owned
+// memory and is only valid until the next Parse call or Close.
 func (i *Iter) String() (string, error) {
 	var out *C.char
 	var outLen C.size_t
@@ -50,7 +54,23 @@ func (i *Iter) String() (string, error) {
 	if rc != 0 {
 		return "", fmt.Errorf("element is not a string")
 	}
-	return C.GoStringN(out, C.int(outLen)), nil
+	if i.copyStrings {
+		return C.GoStringN(out, C.int(outLen)), nil
+	}
+	return unsafe.String((*byte)(unsafe.Pointer(out)), int(outLen)), nil
+}
+
+// StringRef extracts a string value without copying.
+// The returned string points into parser-owned memory and is only valid
+// until the next Parse call or Close.
+func (i *Iter) StringRef() (string, error) {
+	var out *C.char
+	var outLen C.size_t
+	rc := C.simdjson_element_get_string(i.elem, &out, &outLen)
+	if rc != 0 {
+		return "", fmt.Errorf("element is not a string")
+	}
+	return unsafe.String((*byte)(unsafe.Pointer(out)), int(outLen)), nil
 }
 
 // Int returns the element value as int64.
@@ -100,9 +120,10 @@ func (i *Iter) Object(reuse *Object) (*Object, error) {
 	}
 	if reuse != nil {
 		reuse.elem = i.elem
+		reuse.copyStrings = i.copyStrings
 		return reuse, nil
 	}
-	return &Object{elem: i.elem}, nil
+	return &Object{elem: i.elem, copyStrings: i.copyStrings}, nil
 }
 
 // FindKey finds a key in the object and returns an Element.
@@ -117,9 +138,10 @@ func (o *Object) FindKey(key string, reuse *Element) *Element {
 	}
 	if reuse != nil {
 		reuse.Iter.elem = out
+		reuse.Iter.copyStrings = o.copyStrings
 		return reuse
 	}
-	return &Element{Iter: Iter{elem: out}}
+	return &Element{Iter: Iter{elem: out, copyStrings: o.copyStrings}}
 }
 
 // ForEach iterates over all key-value pairs in O(n) time.
@@ -140,8 +162,11 @@ func (o *Object) ForEach(fn func(key string, i Iter) error) error {
 		if rc != 0 {
 			return fmt.Errorf("iteration error")
 		}
-		key := C.GoStringN(outKey, C.int(outKeyLen))
-		if err := fn(key, Iter{elem: outVal}); err != nil {
+		key := unsafe.String((*byte)(unsafe.Pointer(outKey)), int(outKeyLen))
+		if o.copyStrings {
+			key = C.GoStringN(outKey, C.int(outKeyLen))
+		}
+		if err := fn(key, Iter{elem: outVal, copyStrings: o.copyStrings}); err != nil {
 			return err
 		}
 	}
@@ -159,7 +184,8 @@ func (o *Object) Count() (int, error) {
 
 // Array represents a JSON array for element access.
 type Array struct {
-	elem C.simdjson_element
+	elem        C.simdjson_element
+	copyStrings bool
 }
 
 // Array returns the element as an Array.
@@ -169,9 +195,10 @@ func (i *Iter) Array(reuse *Array) (*Array, error) {
 	}
 	if reuse != nil {
 		reuse.elem = i.elem
+		reuse.copyStrings = i.copyStrings
 		return reuse, nil
 	}
-	return &Array{elem: i.elem}, nil
+	return &Array{elem: i.elem, copyStrings: i.copyStrings}, nil
 }
 
 // ForEach iterates over all elements in O(n) time.
@@ -190,7 +217,7 @@ func (a *Array) ForEach(fn func(i Iter) error) error {
 		if rc != 0 {
 			return fmt.Errorf("iteration error")
 		}
-		if err := fn(Iter{elem: outVal}); err != nil {
+		if err := fn(Iter{elem: outVal, copyStrings: a.copyStrings}); err != nil {
 			return err
 		}
 	}
@@ -213,19 +240,16 @@ func (a *Array) Count() (int, error) {
 func (i *Iter) Interface() (interface{}, error) {
 	switch i.Type() {
 	case TypeObject:
-		obj, err := i.Object(nil)
-		if err != nil {
-			return nil, err
-		}
+		var obj Object
+		obj.elem = i.elem
+		obj.copyStrings = i.copyStrings
 		return obj.Map(nil)
 	case TypeArray:
-		arr, err := i.Array(nil)
-		if err != nil {
-			return nil, err
-		}
-		n, _ := arr.Count()
-		result := make([]interface{}, 0, n)
-		err = arr.ForEach(func(elem Iter) error {
+		var arr Array
+		arr.elem = i.elem
+		arr.copyStrings = i.copyStrings
+		var result []interface{}
+		err := arr.ForEach(func(elem Iter) error {
 			v, err := elem.Interface()
 			if err != nil {
 				return err

@@ -19,13 +19,27 @@ import (
 
 // ParsedJson holds a parsed JSON document. Safe to reuse via sync.Pool.
 type ParsedJson struct {
-	parser C.simdjson_parser
+	parser      C.simdjson_parser
+	copyStrings bool
+}
+
+// ParserOption configures parsing behavior.
+type ParserOption func(*ParsedJson)
+
+// WithCopyStrings controls whether string values are copied from C memory.
+// When true (default), strings are copied and safe to retain indefinitely.
+// When false, strings point into parser-owned memory and are only valid
+// until the next Parse call or Close — same semantics as simdjson-go.
+func WithCopyStrings(copy bool) ParserOption {
+	return func(pj *ParsedJson) {
+		pj.copyStrings = copy
+	}
 }
 
 // parserPool pools C++ parser instances to reduce allocations.
 var parserPool = sync.Pool{
 	New: func() interface{} {
-		return &ParsedJson{parser: C.simdjson_parser_new()}
+		return &ParsedJson{parser: C.simdjson_parser_new(), copyStrings: true}
 	},
 }
 
@@ -43,10 +57,13 @@ func PutParser(pj *ParsedJson) {
 
 // Parse parses JSON bytes using the provided ParsedJson (or a new one if nil).
 // The returned ParsedJson owns the parsed data until the next Parse call.
-func Parse(b []byte, reuse *ParsedJson) (*ParsedJson, error) {
+func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, error) {
 	pj := reuse
 	if pj == nil {
-		pj = &ParsedJson{parser: C.simdjson_parser_new()}
+		pj = &ParsedJson{parser: C.simdjson_parser_new(), copyStrings: true}
+	}
+	for _, opt := range opts {
+		opt(pj)
 	}
 	if len(b) == 0 {
 		return nil, fmt.Errorf("empty input")

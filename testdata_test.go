@@ -128,3 +128,22 @@ func loadTestFileB(b *testing.B, name string) []byte {
 	}
 	return out
 }
+
+// BenchmarkInterfaceNoCopy benchmarks Interface() with WithCopyStrings(false).
+func BenchmarkInterfaceNoCopy(b *testing.B) {
+	for _, name := range benchmarkFiles {
+		data := loadTestFileB(b, name)
+		b.Run(name, func(b *testing.B) {
+			pj := GetParser()
+			defer PutParser(pj)
+			pj, _ = Parse(data, pj, WithCopyStrings(false))
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				iter, _ := pj.Iter()
+				_, _ = iter.Interface()
+			}
+		})
+	}
+}
