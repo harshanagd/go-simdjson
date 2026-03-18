@@ -190,6 +190,117 @@ func TestArrayOnNonArray(t *testing.T) {
 	}
 }
 
+func TestIterInterface(t *testing.T) {
+	input := `{"name":"test","count":42,"tags":["a","b"],"nested":{"x":true,"y":null},"pi":3.14}`
+	pj, err := Parse([]byte(input), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	v, err := iter.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map, got %T", v)
+	}
+	if m["name"] != "test" {
+		t.Fatalf("name: expected 'test', got %v", m["name"])
+	}
+	if m["count"] != int64(42) {
+		t.Fatalf("count: expected 42, got %v (%T)", m["count"], m["count"])
+	}
+	tags, ok := m["tags"].([]interface{})
+	if !ok || len(tags) != 2 || tags[0] != "a" || tags[1] != "b" {
+		t.Fatalf("tags: expected [a,b], got %v", m["tags"])
+	}
+	nested, ok := m["nested"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("nested: expected map, got %T", m["nested"])
+	}
+	if nested["x"] != true {
+		t.Fatalf("nested.x: expected true, got %v", nested["x"])
+	}
+	if nested["y"] != nil {
+		t.Fatalf("nested.y: expected nil, got %v", nested["y"])
+	}
+	if m["pi"] != 3.14 {
+		t.Fatalf("pi: expected 3.14, got %v", m["pi"])
+	}
+}
+
+func TestIterInterfaceArray(t *testing.T) {
+	pj, err := Parse([]byte(`[1,"two",true,null,[3.14]]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	v, err := iter.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	arr, ok := v.([]interface{})
+	if !ok {
+		t.Fatalf("expected []interface{}, got %T", v)
+	}
+	if len(arr) != 5 {
+		t.Fatalf("expected 5 elements, got %d", len(arr))
+	}
+	if arr[0] != int64(1) {
+		t.Fatalf("[0]: expected int64(1), got %v (%T)", arr[0], arr[0])
+	}
+	if arr[1] != "two" {
+		t.Fatalf("[1]: expected 'two', got %v", arr[1])
+	}
+	if arr[2] != true {
+		t.Fatalf("[2]: expected true, got %v", arr[2])
+	}
+	if arr[3] != nil {
+		t.Fatalf("[3]: expected nil, got %v", arr[3])
+	}
+	inner, ok := arr[4].([]interface{})
+	if !ok || len(inner) != 1 || inner[0] != 3.14 {
+		t.Fatalf("[4]: expected [3.14], got %v", arr[4])
+	}
+}
+
+func TestObjectMap(t *testing.T) {
+	pj, err := Parse([]byte(demo_json), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+	m, err := obj.Map(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	img, ok := m["Image"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Image: expected map, got %T", m["Image"])
+	}
+	if img["Width"] != int64(800) {
+		t.Fatalf("Width: expected 800, got %v", img["Width"])
+	}
+	if img["Animated"] != false {
+		t.Fatalf("Animated: expected false, got %v", img["Animated"])
+	}
+	ids, ok := img["IDs"].([]interface{})
+	if !ok || len(ids) != 4 {
+		t.Fatalf("IDs: expected 4-element array, got %v", img["IDs"])
+	}
+}
+
 func TestIterObjectOnNonObject(t *testing.T) {
 	pj, err := Parse([]byte(`[1,2,3]`), nil)
 	if err != nil {

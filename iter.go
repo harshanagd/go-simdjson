@@ -205,3 +205,66 @@ func (a *Array) Count() (int, error) {
 	}
 	return int(out), nil
 }
+
+// Interface converts the element to its Go native equivalent:
+// object → map[string]interface{}, array → []interface{},
+// string → string, int64/uint64 → int64/uint64, double → float64,
+// bool → bool, null → nil.
+func (i *Iter) Interface() (interface{}, error) {
+	switch i.Type() {
+	case TypeObject:
+		obj, err := i.Object(nil)
+		if err != nil {
+			return nil, err
+		}
+		return obj.Map(nil)
+	case TypeArray:
+		arr, err := i.Array(nil)
+		if err != nil {
+			return nil, err
+		}
+		n, _ := arr.Count()
+		result := make([]interface{}, 0, n)
+		err = arr.ForEach(func(elem Iter) error {
+			v, err := elem.Interface()
+			if err != nil {
+				return err
+			}
+			result = append(result, v)
+			return nil
+		})
+		return result, err
+	case TypeString:
+		return i.String()
+	case TypeInt64:
+		return i.Int()
+	case TypeUint64:
+		return i.Uint()
+	case TypeDouble:
+		return i.Float()
+	case TypeBool:
+		return i.Bool()
+	case TypeNull:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unknown type %v", i.Type())
+	}
+}
+
+// Map converts the object to a map[string]interface{}.
+// If dst is non-nil it is reused (cleared first).
+func (o *Object) Map(dst map[string]interface{}) (map[string]interface{}, error) {
+	if dst == nil {
+		n, _ := o.Count()
+		dst = make(map[string]interface{}, n)
+	}
+	err := o.ForEach(func(key string, val Iter) error {
+		v, err := val.Interface()
+		if err != nil {
+			return err
+		}
+		dst[key] = v
+		return nil
+	})
+	return dst, err
+}
