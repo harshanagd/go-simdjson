@@ -23,6 +23,7 @@ type Iter struct {
 // Object represents a JSON object for key-value access.
 type Object struct {
 	elem        C.simdjson_element
+	it          C.simdjson_obj_iter
 	copyStrings bool
 	useNumber   bool
 }
@@ -146,9 +147,12 @@ func (i *Iter) Object(reuse *Object) (*Object, error) {
 		reuse.elem = i.elem
 		reuse.copyStrings = i.copyStrings
 		reuse.useNumber = i.useNumber
+		C.simdjson_object_iter_begin(i.elem, &reuse.it)
 		return reuse, nil
 	}
-	return &Object{elem: i.elem, copyStrings: i.copyStrings, useNumber: i.useNumber}, nil
+	o := &Object{elem: i.elem, copyStrings: i.copyStrings, useNumber: i.useNumber}
+	C.simdjson_object_iter_begin(i.elem, &o.it)
+	return o, nil
 }
 
 // FindKey finds a key in the object and returns an Element.
@@ -333,4 +337,161 @@ func (o *Object) Map(dst map[string]interface{}) (map[string]interface{}, error)
 		return nil
 	})
 	return dst, err
+}
+
+// StringBytes extracts a string value as []byte.
+// Respects WithCopyStrings setting.
+func (i *Iter) StringBytes() ([]byte, error) {
+	s, err := i.String()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(s), nil
+}
+
+// FindPath navigates a dot-separated path of object keys from the current element.
+func (o *Object) FindPath(reuse *Element, path ...string) (*Element, error) {
+	if len(path) == 0 {
+		return nil, fmt.Errorf("empty path")
+	}
+	elem := o.FindKey(path[0], reuse)
+	if elem == nil {
+		return nil, fmt.Errorf("key %q not found", path[0])
+	}
+	for _, key := range path[1:] {
+		obj, err := elem.Iter.Object(nil)
+		if err != nil {
+			return nil, fmt.Errorf("key %q: %w", key, err)
+		}
+		elem = obj.FindKey(key, reuse)
+		if elem == nil {
+			return nil, fmt.Errorf("key %q not found", key)
+		}
+	}
+	return elem, nil
+}
+
+// FindElement navigates a path of object keys from the root.
+func (i *Iter) FindElement(reuse *Element, path ...string) (*Element, error) {
+	obj, err := i.Object(nil)
+	if err != nil {
+		return nil, err
+	}
+	return obj.FindPath(reuse, path...)
+}
+
+// NextElement returns the next key-value pair. Initialize the iterator by
+// calling Object() first. Returns empty name when done.
+func (o *Object) NextElement(dst *Iter) (name string, t Type, err error) {
+	var outKey *C.char
+	var outKeyLen C.size_t
+	var outVal C.simdjson_element
+	rc := C.simdjson_object_iter_next(&o.it, &outKey, &outKeyLen, &outVal)
+	if rc == 1 {
+		return "", TypeNull, nil
+	}
+	if rc != 0 {
+		return "", TypeNull, fmt.Errorf("iteration error")
+	}
+	if dst != nil {
+		dst.elem = outVal
+		dst.copyStrings = o.copyStrings
+		dst.useNumber = o.useNumber
+	}
+	if o.copyStrings {
+		name = C.GoStringN(outKey, C.int(outKeyLen))
+	} else {
+		name = unsafe.String((*byte)(unsafe.Pointer(outKey)), int(outKeyLen))
+	}
+	t = Type(C.simdjson_element_type(outVal))
+	return name, t, nil
+}
+
+// Interface returns the array as []interface{}.
+func (a *Array) Interface() ([]interface{}, error) {
+	var result []interface{}
+	err := a.ForEach(func(elem Iter) error {
+		v, err := elem.Interface()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
+// AsFloat returns all elements as []float64.
+func (a *Array) AsFloat() ([]float64, error) {
+	n, _ := a.Count()
+	result := make([]float64, 0, n)
+	err := a.ForEach(func(elem Iter) error {
+		v, err := elem.Float()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
+// AsInteger returns all elements as []int64.
+func (a *Array) AsInteger() ([]int64, error) {
+	n, _ := a.Count()
+	result := make([]int64, 0, n)
+	err := a.ForEach(func(elem Iter) error {
+		v, err := elem.Int()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
+// AsUint64 returns all elements as []uint64.
+func (a *Array) AsUint64() ([]uint64, error) {
+	n, _ := a.Count()
+	result := make([]uint64, 0, n)
+	err := a.ForEach(func(elem Iter) error {
+		v, err := elem.Uint()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
+// AsString returns all elements as []string.
+func (a *Array) AsString() ([]string, error) {
+	n, _ := a.Count()
+	result := make([]string, 0, n)
+	err := a.ForEach(func(elem Iter) error {
+		v, err := elem.String()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
+// AsStringCvt returns all elements converted to strings via StringCvt.
+func (a *Array) AsStringCvt() ([]string, error) {
+	n, _ := a.Count()
+	result := make([]string, 0, n)
+	err := a.ForEach(func(elem Iter) error {
+		v, err := elem.StringCvt()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
 }

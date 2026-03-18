@@ -358,3 +358,111 @@ func BenchmarkInterface(b *testing.B) {
 		})
 	}
 }
+
+// TestFindPathCompat is adapted from minio/simdjson-go TestObject_FindPath.
+func TestFindPathCompat(t *testing.T) {
+	input := `{
+    "Image":
+    {
+        "Animated": false,
+        "Height": 600,
+        "IDs": [116, 943, 234, 38793],
+        "Thumbnail":
+        {
+            "Height": 125,
+            "Url": "http://www.example.com/image/481989943",
+            "Width": 100
+        },
+        "Title": "View from 15th Floor",
+        "Width": 800
+    },
+    "Alt": "Image of city"
+}`
+	tests := []struct {
+		name     string
+		path     []string
+		wantType Type
+		wantErr  bool
+	}{
+		{"top", []string{"Alt"}, TypeString, false},
+		{"nested-1", []string{"Image", "Animated"}, TypeBool, false},
+		{"nested-2", []string{"Image", "Thumbnail", "Url"}, TypeString, false},
+		{"int", []string{"Image", "Height"}, TypeInt64, false},
+		{"obj", []string{"Image", "Thumbnail"}, TypeObject, false},
+		{"array", []string{"Image", "IDs"}, TypeArray, false},
+		{"404", []string{"Image", "NonEx"}, TypeNull, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pj, err := Parse([]byte(input), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pj.Close()
+
+			iter, _ := pj.Iter()
+			obj, _ := iter.Object(nil)
+			elem, err := obj.FindPath(nil, tt.path...)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if elem.Iter.Type() != tt.wantType {
+				t.Errorf("want type %v, got %v", tt.wantType, elem.Iter.Type())
+			}
+		})
+	}
+
+	// Value checks
+	pj, _ := Parse([]byte(input), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	// String value
+	elem, _ := obj.FindPath(nil, "Alt")
+	v, _ := elem.Iter.String()
+	if v != "Image of city" {
+		t.Errorf("Alt: want 'Image of city', got %q", v)
+	}
+
+	// Bool value
+	elem, _ = obj.FindPath(nil, "Image", "Animated")
+	b, _ := elem.Iter.Bool()
+	if b != false {
+		t.Errorf("Animated: want false, got %v", b)
+	}
+
+	// Int value
+	elem, _ = obj.FindPath(nil, "Image", "Height")
+	n, _ := elem.Iter.Int()
+	if n != 600 {
+		t.Errorf("Height: want 600, got %d", n)
+	}
+
+	// Nested string
+	elem, _ = obj.FindPath(nil, "Image", "Thumbnail", "Url")
+	url, _ := elem.Iter.String()
+	if url != "http://www.example.com/image/481989943" {
+		t.Errorf("Url: want example.com URL, got %q", url)
+	}
+
+	// Array values
+	elem, _ = obj.FindPath(nil, "Image", "IDs")
+	arr, _ := elem.Iter.Array(nil)
+	ids, _ := arr.AsInteger()
+	expected := []int64{116, 943, 234, 38793}
+	if len(ids) != len(expected) {
+		t.Fatalf("IDs: want %v, got %v", expected, ids)
+	}
+	for i, id := range expected {
+		if ids[i] != id {
+			t.Errorf("IDs[%d]: want %d, got %d", i, id, ids[i])
+		}
+	}
+}

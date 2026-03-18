@@ -385,3 +385,217 @@ func TestUseNumber(t *testing.T) {
 		t.Fatalf("big: expected '9223372036854775807', got %q", n.String())
 	}
 }
+
+func TestStringBytes(t *testing.T) {
+	pj, err := Parse([]byte(`"hello"`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	b, err := iter.StringBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "hello" {
+		t.Fatalf("expected 'hello', got %q", b)
+	}
+}
+
+func TestFindPath(t *testing.T) {
+	pj, err := Parse([]byte(demo_json), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	t.Run("nested", func(t *testing.T) {
+		elem, err := obj.FindPath(nil, "Image", "Thumbnail", "Url")
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, _ := elem.Iter.String()
+		if v != "http://www.example.com/image/481989943" {
+			t.Fatalf("expected URL, got %q", v)
+		}
+	})
+
+	t.Run("single", func(t *testing.T) {
+		elem, err := obj.FindPath(nil, "Image")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if elem.Iter.Type() != TypeObject {
+			t.Fatalf("expected object, got %v", elem.Iter.Type())
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		_, err := obj.FindPath(nil, "Image", "Missing")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestFindElement(t *testing.T) {
+	pj, err := Parse([]byte(demo_json), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	elem, err := iter.FindElement(nil, "Image", "Width")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _ := elem.Iter.Int()
+	if v != 800 {
+		t.Fatalf("expected 800, got %d", v)
+	}
+}
+
+func TestNextElement(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1,"b":"two","c":true}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	var dst Iter
+	name, typ, err := obj.NextElement(&dst)
+	if err != nil || name != "a" || typ != TypeInt64 {
+		t.Fatalf("first: name=%q type=%v err=%v", name, typ, err)
+	}
+
+	name, typ, err = obj.NextElement(&dst)
+	if err != nil || name != "b" || typ != TypeString {
+		t.Fatalf("second: name=%q type=%v err=%v", name, typ, err)
+	}
+
+	name, typ, err = obj.NextElement(&dst)
+	if err != nil || name != "c" || typ != TypeBool {
+		t.Fatalf("third: name=%q type=%v err=%v", name, typ, err)
+	}
+
+	// Done
+	name, _, err = obj.NextElement(&dst)
+	if err != nil || name != "" {
+		t.Fatalf("expected done, got name=%q err=%v", name, err)
+	}
+}
+
+func TestArrayInterface(t *testing.T) {
+	pj, err := Parse([]byte(`[1,"two",true]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	v, err := arr.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 3 || v[0] != int64(1) || v[1] != "two" || v[2] != true {
+		t.Fatalf("expected [1,two,true], got %v", v)
+	}
+}
+
+func TestArrayAsFloat(t *testing.T) {
+	pj, err := Parse([]byte(`[1.1, 2.2, 3.3]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	v, err := arr.AsFloat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 3 || v[0] != 1.1 || v[1] != 2.2 || v[2] != 3.3 {
+		t.Fatalf("expected [1.1,2.2,3.3], got %v", v)
+	}
+}
+
+func TestArrayAsInteger(t *testing.T) {
+	pj, err := Parse([]byte(`[10, -20, 30]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	v, err := arr.AsInteger()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 3 || v[0] != 10 || v[1] != -20 || v[2] != 30 {
+		t.Fatalf("expected [10,-20,30], got %v", v)
+	}
+}
+
+func TestArrayAsUint64(t *testing.T) {
+	pj, err := Parse([]byte(`[1, 2, 18446744073709551615]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	v, err := arr.AsUint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 3 || v[0] != 1 || v[1] != 2 || v[2] != 18446744073709551615 {
+		t.Fatalf("got %v", v)
+	}
+}
+
+func TestArrayAsString(t *testing.T) {
+	pj, err := Parse([]byte(`["a", "b", "c"]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	v, err := arr.AsString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 3 || v[0] != "a" || v[1] != "b" || v[2] != "c" {
+		t.Fatalf("expected [a,b,c], got %v", v)
+	}
+}
+
+func TestArrayAsStringCvt(t *testing.T) {
+	pj, err := Parse([]byte(`[1, "two", true, null]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	v, err := arr.AsStringCvt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 4 || v[0] != "1" || v[1] != "two" || v[2] != "true" || v[3] != "null" {
+		t.Fatalf("expected [1,two,true,null], got %v", v)
+	}
+}
