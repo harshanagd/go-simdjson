@@ -174,47 +174,51 @@ go test -bench=BenchmarkParseFilesParallel -benchmem ./...
 golangci-lint run ./...
 ```
 
+## Architecture
+
+go-simdjson uses a two-phase approach:
+
+1. **Parse (CGo)**: A single CGo call invokes C++ simdjson which SIMD-parses the JSON into a tape (flat `[]uint64` array) and string buffer. This is the only CGo call.
+2. **Navigate (pure Go)**: All navigation — `Type()`, `String()`, `FindKey()`, `ForEach()`, `Interface()` — is pure Go pointer arithmetic on the tape. Zero CGo overhead per element.
+
 ## Benchmarks
 
 Measured on Intel Xeon Platinum 8259CL @ 2.50GHz (x86_64, AVX2).
-All go-simdjson benchmarks show **0 allocations**.
 
-### Parse: go-simdjson vs encoding/json
+### Parse Only: go-simdjson vs encoding/json
 
-| File | go-simdjson | encoding/json | Speedup | Allocs (stdlib) |
-|------|------------|---------------|---------|-----------------|
-| twitter.json (632KB) | 347µs (1822 MB/s) | 8.9ms (71 MB/s) | **25.7x** | 32,125 |
-| canada.json (2.3MB) | 3.8ms (597 MB/s) | 46.1ms (49 MB/s) | **12.2x** | 392,515 |
-| citm_catalog.json (1.7MB) | 878µs (1968 MB/s) | 21.3ms (81 MB/s) | **24.3x** | 95,865 |
-| github_events.json (65KB) | 27µs (2445 MB/s) | 748µs (87 MB/s) | **28.1x** | 3,366 |
-| apache_builds.json (127KB) | 62µs (2065 MB/s) | 1.6ms (82 MB/s) | **25.2x** | 9,720 |
-| instruments.json (220KB) | 142µs (1547 MB/s) | 3.3ms (67 MB/s) | **23.1x** | 13,710 |
-| mesh.json (724KB) | 1.3ms (550 MB/s) | 20.7ms (35 MB/s) | **15.7x** | 149,496 |
-| numbers.json (150KB) | 247µs (609 MB/s) | 2.6ms (58 MB/s) | **10.5x** | 20,024 |
-| random.json (510KB) | 456µs (1120 MB/s) | 9.8ms (52 MB/s) | **21.6x** | 68,020 |
-| update-center.json (533KB) | 361µs (1476 MB/s) | 9.8ms (54 MB/s) | **27.2x** | 50,811 |
+Parse benchmarks show **4 allocations** (parser + tape struct) regardless of document size.
+
+| File | go-simdjson | encoding/json | Speedup |
+|------|------------|---------------|---------|
+| twitter.json (632KB) | 411µs (1538 MB/s) | 7.8ms (81 MB/s) | **19x** |
+| canada.json (2.3MB) | 4.0ms (569 MB/s) | 42.8ms (53 MB/s) | **10.8x** |
+| citm_catalog.json (1.7MB) | 1.0ms (1701 MB/s) | 19.9ms (87 MB/s) | **19.6x** |
+| github_events.json (65KB) | 32µs (2043 MB/s) | 704µs (92 MB/s) | **22.1x** |
+| apache_builds.json (127KB) | 68µs (1866 MB/s) | 1.5ms (87 MB/s) | **21.4x** |
+| mesh.json (724KB) | 1.5ms (486 MB/s) | 16.9ms (43 MB/s) | **11.3x** |
+
+### Full Materialization: Interface() vs encoding/json Unmarshal
+
+`Interface()` converts the entire document to Go native types (`map[string]interface{}`, etc.)
+using the pure Go tape walker — no CGo per element.
+
+| File | go-simdjson Interface() | encoding/json Unmarshal | Speedup |
+|------|------------------------|------------------------|---------|
+| twitter.json | 2.0ms, 28K allocs | 7.8ms, 32K allocs | **3.9x** |
+| canada.json | 7.8ms, 223K allocs | 42.8ms, 393K allocs | **5.5x** |
+| citm_catalog.json | 5.0ms, 76K allocs | 19.9ms, 96K allocs | **4.0x** |
+| github_events.json | 190µs, 3K allocs | 704µs, 3K allocs | **3.7x** |
+| mesh.json | 2.3ms, 74K allocs | 16.9ms, 150K allocs | **7.4x** |
+| numbers.json | 215µs, 10K allocs | 2.4ms, 20K allocs | **11.1x** |
 
 ### Throughput Summary
 
 | Metric | go-simdjson | encoding/json |
 |--------|-----------|---------------|
-| Peak throughput | 2.4 GB/s | 87 MB/s |
-| Average speedup | **~20x** | baseline |
-| Allocations | 0 | thousands |
-
-### Interface() — Full Materialization
-
-`Interface()` converts the entire document to Go native types (`map[string]interface{}`, etc.).
-This crosses the CGo boundary per element, so the speedup is smaller than parse-only.
-Use targeted navigation (`FindKey`, `ForEach`) for best performance.
-
-| File | go-simdjson Interface() | encoding/json Unmarshal |
-|------|------------------------|------------------------|
-| twitter.json | 7.4ms (55K allocs) | 7.9ms (32K allocs) |
-| github_events.json | 686µs (6K allocs) | 708µs (3K allocs) |
-| mesh.json | 27.2ms (238K allocs) | 16.9ms (150K allocs) |
-
-For full materialization, `encoding/json` is comparable or faster because `Interface()` incurs CGo overhead per element. The strength of go-simdjson is **parse + selective access** — parsing is 20x faster, and targeted key lookups avoid materializing the entire document.
+| Peak parse throughput | 2.0 GB/s | 92 MB/s |
+| Parse allocations | 4 | thousands |
+| Interface() speedup | **3.7x–11x** | baseline |
 
 ## Roadmap
 

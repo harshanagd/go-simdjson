@@ -4,28 +4,23 @@
 
 package simdjson
 
-// #include "bridge.h"
-import "C"
-
 import (
-	"encoding/json"
 	"fmt"
-	"unsafe"
+	"strconv"
 )
 
 // Iter represents a position in the parsed JSON document.
 type Iter struct {
-	elem        C.simdjson_element
 	tape        *Tape
-	tapeIdx     int // position in tape, -1 if unknown
+	tapeIdx     int
 	copyStrings bool
 	useNumber   bool
 }
 
 // Object represents a JSON object for key-value access.
 type Object struct {
-	elem        C.simdjson_element
-	it          C.simdjson_obj_iter
+	tobj        *TapeObject
+	iterPos     int // current position for NextElement
 	copyStrings bool
 	useNumber   bool
 }
@@ -37,234 +32,165 @@ type Element struct {
 
 // Iter returns an Iter positioned at the root of the parsed document.
 func (pj *ParsedJson) Iter() (Iter, error) {
-	var elem C.simdjson_element
-	rc := C.simdjson_get_root(pj.parser, &elem)
-	if rc != 0 {
+	if pj.tape == nil {
 		return Iter{}, fmt.Errorf("no parsed document")
 	}
-	return Iter{elem: elem, tape: pj.tape, tapeIdx: 1, copyStrings: pj.copyStrings, useNumber: pj.useNumber}, nil
+	return Iter{tape: pj.tape, tapeIdx: 1, copyStrings: pj.copyStrings, useNumber: pj.useNumber}, nil
 }
 
 // Type returns the JSON type of the current element.
 func (i *Iter) Type() Type {
-	return Type(C.simdjson_element_type(i.elem))
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.Type()
 }
 
 // String extracts a string value from the current element.
 // If WithCopyStrings(false) was set, the string points into parser-owned
 // memory and is only valid until the next Parse call or Close.
 func (i *Iter) String() (string, error) {
-	var out *C.char
-	var outLen C.size_t
-	rc := C.simdjson_element_get_string(i.elem, &out, &outLen)
-	if rc != 0 {
-		return "", fmt.Errorf("element is not a string")
-	}
-	if i.copyStrings {
-		return C.GoStringN(out, C.int(outLen)), nil
-	}
-	return unsafe.String((*byte)(unsafe.Pointer(out)), int(outLen)), nil
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.String()
 }
 
 // StringRef extracts a string value without copying.
 // The returned string points into parser-owned memory and is only valid
 // until the next Parse call or Close.
 func (i *Iter) StringRef() (string, error) {
-	var out *C.char
-	var outLen C.size_t
-	rc := C.simdjson_element_get_string(i.elem, &out, &outLen)
-	if rc != 0 {
-		return "", fmt.Errorf("element is not a string")
-	}
-	return unsafe.String((*byte)(unsafe.Pointer(out)), int(outLen)), nil
+	return i.String() // tape strings already point into C memory
 }
 
 // StringCvt converts any scalar value to its JSON string representation
 // using simdjson's native serialization — no float precision loss.
 func (i *Iter) StringCvt() (string, error) {
-	if i.Type() == TypeObject || i.Type() == TypeArray {
-		return "", fmt.Errorf("cannot convert %v to string", i.Type())
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	switch ti.Type() {
+	case TypeObject, TypeArray:
+		return "", fmt.Errorf("cannot convert %v to string", ti.Type())
+	case TypeString:
+		return ti.String()
+	case TypeInt64:
+		v, _ := ti.Int()
+		return strconv.FormatInt(v, 10), nil
+	case TypeUint64:
+		v, _ := ti.Uint()
+		return strconv.FormatUint(v, 10), nil
+	case TypeDouble:
+		v, _ := ti.Float()
+		return strconv.FormatFloat(v, 'g', -1, 64), nil
+	case TypeBool:
+		v, _ := ti.Bool()
+		if v {
+			return "true", nil
+		}
+		return "false", nil
+	case TypeNull:
+		return "null", nil
+	default:
+		return "", fmt.Errorf("unknown type %v", ti.Type())
 	}
-	// For string type, delegate to String() which respects copyStrings.
-	if i.Type() == TypeString {
-		return i.String()
-	}
-	// For non-string scalars, result comes from a thread-local buffer
-	// that is overwritten on the next StringCvt() call — always copy.
-	var out *C.char
-	var outLen C.size_t
-	rc := C.simdjson_element_to_string(i.elem, &out, &outLen)
-	if rc != 0 {
-		return "", fmt.Errorf("serialization failed")
-	}
-	return C.GoStringN(out, C.int(outLen)), nil
 }
 
 // Int returns the element value as int64.
 func (i *Iter) Int() (int64, error) {
-	var out C.int64_t
-	rc := C.simdjson_element_get_int64(i.elem, &out)
-	if rc != 0 {
-		return 0, fmt.Errorf("element is not an int64")
-	}
-	return int64(out), nil
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.Int()
 }
 
 // Uint returns the element value as uint64.
 func (i *Iter) Uint() (uint64, error) {
-	var out C.uint64_t
-	rc := C.simdjson_element_get_uint64(i.elem, &out)
-	if rc != 0 {
-		return 0, fmt.Errorf("element is not a uint64")
-	}
-	return uint64(out), nil
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.Uint()
 }
 
 // Float returns the element value as float64.
 func (i *Iter) Float() (float64, error) {
-	var out C.double
-	rc := C.simdjson_element_get_double(i.elem, &out)
-	if rc != 0 {
-		return 0, fmt.Errorf("element is not a double")
-	}
-	return float64(out), nil
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.Float()
 }
 
 // Bool returns the element value as bool.
 func (i *Iter) Bool() (bool, error) {
-	var out C.int
-	rc := C.simdjson_element_get_bool(i.elem, &out)
-	if rc != 0 {
-		return false, fmt.Errorf("element is not a bool")
-	}
-	return out != 0, nil
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.Bool()
 }
 
 // Object returns the element as an Object for key-value access.
 func (i *Iter) Object(reuse *Object) (*Object, error) {
-	if i.Type() != TypeObject {
-		return nil, fmt.Errorf("element is not an object")
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tobj, err := ti.Object()
+	if err != nil {
+		return nil, err
 	}
 	if reuse != nil {
-		reuse.elem = i.elem
+		reuse.tobj = tobj
+		reuse.iterPos = tobj.startIdx
 		reuse.copyStrings = i.copyStrings
 		reuse.useNumber = i.useNumber
-		C.simdjson_object_iter_begin(i.elem, &reuse.it)
 		return reuse, nil
 	}
-	o := &Object{elem: i.elem, copyStrings: i.copyStrings, useNumber: i.useNumber}
-	C.simdjson_object_iter_begin(i.elem, &o.it)
-	return o, nil
+	return &Object{tobj: tobj, iterPos: tobj.startIdx, copyStrings: i.copyStrings, useNumber: i.useNumber}, nil
 }
 
 // FindKey finds a key in the object and returns an Element.
 // Returns nil if the key is not found.
 func (o *Object) FindKey(key string, reuse *Element) *Element {
-	var out C.simdjson_element
-	rc := C.simdjson_object_find_key(o.elem,
-		(*C.char)(unsafe.Pointer(unsafe.StringData(key))), C.size_t(len(key)),
-		&out)
-	if rc != 0 {
+	ti := o.tobj.FindKey(key)
+	if ti == nil {
 		return nil
 	}
+	iter := Iter{tape: ti.tape, tapeIdx: ti.idx, copyStrings: o.copyStrings, useNumber: o.useNumber}
 	if reuse != nil {
-		reuse.Iter.elem = out
-		reuse.Iter.copyStrings = o.copyStrings
-		reuse.Iter.useNumber = o.useNumber
+		reuse.Iter = iter
 		return reuse
 	}
-	return &Element{Iter: Iter{elem: out, copyStrings: o.copyStrings, useNumber: o.useNumber}}
+	return &Element{Iter: iter}
 }
 
 // ForEach iterates over all key-value pairs in O(n) time.
 func (o *Object) ForEach(fn func(key string, i Iter) error) error {
-	var it C.simdjson_obj_iter
-	rc := C.simdjson_object_iter_begin(o.elem, &it)
-	if rc != 0 {
-		return fmt.Errorf("element is not an object")
-	}
-	var outKey *C.char
-	var outKeyLen C.size_t
-	var outVal C.simdjson_element
-	for {
-		rc = C.simdjson_object_iter_next(&it, &outKey, &outKeyLen, &outVal)
-		if rc == 1 {
-			return nil
-		}
-		if rc != 0 {
-			return fmt.Errorf("iteration error")
-		}
-		key := unsafe.String((*byte)(unsafe.Pointer(outKey)), int(outKeyLen))
-		if o.copyStrings {
-			key = C.GoStringN(outKey, C.int(outKeyLen))
-		}
-		if err := fn(key, Iter{elem: outVal, copyStrings: o.copyStrings, useNumber: o.useNumber}); err != nil {
-			return err
-		}
-	}
+	return o.tobj.ForEach(func(key string, val TapeIter) error {
+		return fn(key, Iter{tape: val.tape, tapeIdx: val.idx, copyStrings: o.copyStrings, useNumber: o.useNumber})
+	})
 }
 
 // Count returns the number of key-value pairs in the object.
 func (o *Object) Count() (int, error) {
-	var out C.size_t
-	rc := C.simdjson_object_get_count(o.elem, &out)
-	if rc != 0 {
-		return 0, fmt.Errorf("element is not an object")
-	}
-	return int(out), nil
+	return o.tobj.Count(), nil
 }
 
 // Array represents a JSON array for element access.
 type Array struct {
-	elem        C.simdjson_element
+	tarr        *TapeArray
 	copyStrings bool
 	useNumber   bool
 }
 
 // Array returns the element as an Array.
 func (i *Iter) Array(reuse *Array) (*Array, error) {
-	if i.Type() != TypeArray {
-		return nil, fmt.Errorf("element is not an array")
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tarr, err := ti.Array()
+	if err != nil {
+		return nil, err
 	}
 	if reuse != nil {
-		reuse.elem = i.elem
+		reuse.tarr = tarr
 		reuse.copyStrings = i.copyStrings
 		reuse.useNumber = i.useNumber
 		return reuse, nil
 	}
-	return &Array{elem: i.elem, copyStrings: i.copyStrings, useNumber: i.useNumber}, nil
+	return &Array{tarr: tarr, copyStrings: i.copyStrings, useNumber: i.useNumber}, nil
 }
 
 // ForEach iterates over all elements in O(n) time.
 func (a *Array) ForEach(fn func(i Iter) error) error {
-	var it C.simdjson_arr_iter
-	rc := C.simdjson_array_iter_begin(a.elem, &it)
-	if rc != 0 {
-		return fmt.Errorf("element is not an array")
-	}
-	var outVal C.simdjson_element
-	for {
-		rc = C.simdjson_array_iter_next(&it, &outVal)
-		if rc == 1 {
-			return nil
-		}
-		if rc != 0 {
-			return fmt.Errorf("iteration error")
-		}
-		if err := fn(Iter{elem: outVal, copyStrings: a.copyStrings, useNumber: a.useNumber}); err != nil {
-			return err
-		}
-	}
+	return a.tarr.ForEach(func(val TapeIter) error {
+		return fn(Iter{tape: val.tape, tapeIdx: val.idx, copyStrings: a.copyStrings, useNumber: a.useNumber})
+	})
 }
 
 // Count returns the number of elements in the array.
 func (a *Array) Count() (int, error) {
-	var out C.size_t
-	rc := C.simdjson_array_get_count(a.elem, &out)
-	if rc != 0 {
-		return 0, fmt.Errorf("element is not an array")
-	}
-	return int(out), nil
+	return a.tarr.Count(), nil
 }
 
 // Interface converts the element to its Go native equivalent:
@@ -273,87 +199,20 @@ func (a *Array) Count() (int, error) {
 // bool → bool, null → nil.
 // Interface converts the element to its Go native equivalent.
 // Uses the tape walker for performance (pure Go, zero CGo per element).
+// Interface converts the element to its Go native equivalent.
+// Uses the tape walker (pure Go, zero CGo per element).
 func (i *Iter) Interface() (interface{}, error) {
-	if i.tape != nil && i.tapeIdx >= 0 {
-		if i.useNumber {
-			val, _, err := i.tape.readValueNum(i.tapeIdx)
-			return val, err
-		}
-		val, _, err := i.tape.readValue(i.tapeIdx)
+	if i.useNumber {
+		val, _, err := i.tape.readValueNum(i.tapeIdx)
 		return val, err
 	}
-	// Fallback to DOM-based Interface() if tape is not available
-	return i.interfaceDOM()
-}
-
-func (i *Iter) interfaceDOM() (interface{}, error) {
-	switch i.Type() {
-	case TypeObject:
-		var obj Object
-		obj.elem = i.elem
-		obj.copyStrings = i.copyStrings
-		obj.useNumber = i.useNumber
-		return obj.Map(nil)
-	case TypeArray:
-		var arr Array
-		arr.elem = i.elem
-		arr.copyStrings = i.copyStrings
-		arr.useNumber = i.useNumber
-		var result []interface{}
-		err := arr.ForEach(func(elem Iter) error {
-			v, err := elem.Interface()
-			if err != nil {
-				return err
-			}
-			result = append(result, v)
-			return nil
-		})
-		return result, err
-	case TypeString:
-		return i.String()
-	case TypeInt64:
-		if i.useNumber {
-			s, _ := i.StringCvt()
-			return json.Number(s), nil
-		}
-		return i.Int()
-	case TypeUint64:
-		if i.useNumber {
-			s, _ := i.StringCvt()
-			return json.Number(s), nil
-		}
-		return i.Uint()
-	case TypeDouble:
-		if i.useNumber {
-			s, _ := i.StringCvt()
-			return json.Number(s), nil
-		}
-		return i.Float()
-	case TypeBool:
-		return i.Bool()
-	case TypeNull:
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("unknown type %v", i.Type())
-	}
+	val, _, err := i.tape.readValue(i.tapeIdx)
+	return val, err
 }
 
 // Map converts the object to a map[string]interface{}.
-// If dst is non-nil it is reused (cleared first).
 func (o *Object) Map(dst map[string]interface{}) (map[string]interface{}, error) {
-	if dst == nil {
-		n, _ := o.Count()
-		dst = make(map[string]interface{}, n)
-	}
-	err := o.ForEach(func(key string, val Iter) error {
-		v, err := val.Interface()
-		if err != nil {
-			return err
-		}
-		dst[key] = v
-		return nil
-	})
-	return dst, err
+	return o.tobj.Map(dst)
 }
 
 // StringBytes extracts a string value as []byte.
@@ -400,27 +259,26 @@ func (i *Iter) FindElement(reuse *Element, path ...string) (*Element, error) {
 // NextElement returns the next key-value pair. Initialize the iterator by
 // calling Object() first. Returns empty name when done.
 func (o *Object) NextElement(dst *Iter) (name string, t Type, err error) {
-	var outKey *C.char
-	var outKeyLen C.size_t
-	var outVal C.simdjson_element
-	rc := C.simdjson_object_iter_next(&o.it, &outKey, &outKeyLen, &outVal)
-	if rc == 1 {
+	if o.iterPos >= o.tobj.endIdx {
+		return "", TypeNull, nil // done
+	}
+	keyEntry := o.tobj.tape.data[o.iterPos]
+	if byte(keyEntry>>56) != tagString {
 		return "", TypeNull, nil
 	}
-	if rc != 0 {
-		return "", TypeNull, fmt.Errorf("iteration error")
-	}
+	name, _ = o.tobj.tape.readString(keyEntry & payloadMask)
+	valIdx := o.iterPos + 1
 	if dst != nil {
-		dst.elem = outVal
+		dst.tape = o.tobj.tape
+		dst.tapeIdx = valIdx
 		dst.copyStrings = o.copyStrings
 		dst.useNumber = o.useNumber
 	}
-	if o.copyStrings {
-		name = C.GoStringN(outKey, C.int(outKeyLen))
-	} else {
-		name = unsafe.String((*byte)(unsafe.Pointer(outKey)), int(outKeyLen))
+	t = Type(o.tobj.tape.data[valIdx] >> 56)
+	if byte(t) == tagFalse {
+		t = TypeBool
 	}
-	t = Type(C.simdjson_element_type(outVal))
+	o.iterPos = o.tobj.tape.skipValue(valIdx)
 	return name, t, nil
 }
 

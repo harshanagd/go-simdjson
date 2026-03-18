@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 )
 
 const (
@@ -128,18 +129,32 @@ func (ti *TapeIter) Int() (int64, error) {
 
 // Uint returns the uint64 value at the current position.
 func (ti *TapeIter) Uint() (uint64, error) {
-	if ti.tag() != tagUint64 {
-		return 0, fmt.Errorf("element is not a uint64")
+	tag := ti.tag()
+	if tag == tagUint64 {
+		return ti.tape.data[ti.idx+1], nil
 	}
-	return ti.tape.data[ti.idx+1], nil
+	if tag == tagInt64 {
+		v := int64(ti.tape.data[ti.idx+1])
+		if v >= 0 {
+			return uint64(v), nil
+		}
+	}
+	return 0, fmt.Errorf("element is not a uint64")
 }
 
 // Float returns the float64 value at the current position.
 func (ti *TapeIter) Float() (float64, error) {
-	if ti.tag() != tagDouble {
-		return 0, fmt.Errorf("element is not a double")
+	tag := ti.tag()
+	if tag == tagDouble {
+		return math.Float64frombits(ti.tape.data[ti.idx+1]), nil
 	}
-	return math.Float64frombits(ti.tape.data[ti.idx+1]), nil
+	if tag == tagInt64 {
+		return float64(int64(ti.tape.data[ti.idx+1])), nil
+	}
+	if tag == tagUint64 {
+		return float64(ti.tape.data[ti.idx+1]), nil
+	}
+	return 0, fmt.Errorf("element is not a double")
 }
 
 // Bool returns the bool value at the current position.
@@ -474,11 +489,11 @@ func (t *Tape) readValueNum(idx int) (interface{}, int, error) {
 		s, err := t.readString(payload)
 		return s, idx + 1, err
 	case tagInt64:
-		return json.Number(fmt.Sprintf("%d", int64(t.data[idx+1]))), idx + 2, nil
+		return json.Number(strconv.FormatInt(int64(t.data[idx+1]), 10)), idx + 2, nil
 	case tagUint64:
-		return json.Number(fmt.Sprintf("%d", t.data[idx+1])), idx + 2, nil
+		return json.Number(strconv.FormatUint(t.data[idx+1], 10)), idx + 2, nil
 	case tagDouble:
-		return json.Number(fmt.Sprintf("%v", math.Float64frombits(t.data[idx+1]))), idx + 2, nil
+		return json.Number(strconv.FormatFloat(math.Float64frombits(t.data[idx+1]), 'g', -1, 64)), idx + 2, nil
 	case tagTrue:
 		return true, idx + 1, nil
 	case tagFalse:
