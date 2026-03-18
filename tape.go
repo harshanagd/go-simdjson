@@ -91,6 +91,274 @@ func (t *Tape) RootType() Type {
 	return Type(t.data[1] >> 56)
 }
 
+// Iter returns a TapeIter positioned at the root element.
+func (t *Tape) Iter() TapeIter {
+	return TapeIter{tape: t, idx: 1}
+}
+
+// TapeIter navigates the tape. Pure Go, zero CGo calls.
+type TapeIter struct {
+	tape *Tape
+	idx  int
+}
+
+// Type returns the JSON type at the current position.
+func (ti *TapeIter) Type() Type {
+	if ti.idx >= len(ti.tape.data) {
+		return Type(-1)
+	}
+	tag := byte(ti.tape.data[ti.idx] >> 56)
+	// Normalize: 'f' (false) → 't' (bool)
+	if tag == tagFalse {
+		return TypeBool
+	}
+	return Type(tag)
+}
+
+// String returns the string value at the current position.
+func (ti *TapeIter) String() (string, error) {
+	if ti.tag() != tagString {
+		return "", fmt.Errorf("element is not a string")
+	}
+	return ti.tape.readString(ti.payload())
+}
+
+// Int returns the int64 value at the current position.
+func (ti *TapeIter) Int() (int64, error) {
+	if ti.tag() != tagInt64 {
+		return 0, fmt.Errorf("element is not an int64")
+	}
+	return int64(ti.tape.data[ti.idx+1]), nil
+}
+
+// Uint returns the uint64 value at the current position.
+func (ti *TapeIter) Uint() (uint64, error) {
+	if ti.tag() != tagUint64 {
+		return 0, fmt.Errorf("element is not a uint64")
+	}
+	return ti.tape.data[ti.idx+1], nil
+}
+
+// Float returns the float64 value at the current position.
+func (ti *TapeIter) Float() (float64, error) {
+	if ti.tag() != tagDouble {
+		return 0, fmt.Errorf("element is not a double")
+	}
+	return math.Float64frombits(ti.tape.data[ti.idx+1]), nil
+}
+
+// Bool returns the bool value at the current position.
+func (ti *TapeIter) Bool() (bool, error) {
+	tag := ti.tag()
+	if tag == tagTrue {
+		return true, nil
+	}
+	if tag == tagFalse {
+		return false, nil
+	}
+	return false, fmt.Errorf("element is not a bool")
+}
+
+// Object returns a TapeObject for key-value access.
+func (ti *TapeIter) Object() (*TapeObject, error) {
+	if ti.tag() != tagObject {
+		return nil, fmt.Errorf("element is not an object")
+	}
+	entry := ti.tape.data[ti.idx]
+	endIdx := int(entry & 0xffffffff)
+	return &TapeObject{tape: ti.tape, startIdx: ti.idx + 1, endIdx: endIdx - 1}, nil
+}
+
+// Array returns a TapeArray for element access.
+func (ti *TapeIter) Array() (*TapeArray, error) {
+	if ti.tag() != tagArray {
+		return nil, fmt.Errorf("element is not an array")
+	}
+	entry := ti.tape.data[ti.idx]
+	endIdx := int(entry & 0xffffffff)
+	return &TapeArray{tape: ti.tape, startIdx: ti.idx + 1, endIdx: endIdx - 1}, nil
+}
+
+// Interface converts the element to its Go native equivalent.
+func (ti *TapeIter) Interface() (interface{}, error) {
+	val, _, err := ti.tape.readValue(ti.idx)
+	return val, err
+}
+
+func (ti *TapeIter) tag() byte   { return byte(ti.tape.data[ti.idx] >> 56) }
+func (ti *TapeIter) payload() uint64 { return ti.tape.data[ti.idx] & payloadMask }
+
+// skipValue returns the tape index after the value at idx.
+func (t *Tape) skipValue(idx int) int {
+	tag := byte(t.data[idx] >> 56)
+	switch tag {
+	case tagObject, tagArray:
+		return int(t.data[idx] & 0xffffffff) // end index (past closing tag)
+	case tagInt64, tagUint64, tagDouble:
+		return idx + 2
+	default:
+		return idx + 1
+	}
+}
+
+// TapeObject provides key-value access over the tape.
+type TapeObject struct {
+	tape     *Tape
+	startIdx int // first key index
+	endIdx   int // index of closing '}'
+}
+
+// FindKey finds a key in the object. Returns nil if not found.
+func (o *TapeObject) FindKey(key string) *TapeIter {
+	pos := o.startIdx
+	for pos < o.endIdx {
+		keyEntry := o.tape.data[pos]
+		if byte(keyEntry>>56) != tagString {
+			break
+		}
+		k, _ := o.tape.readString(keyEntry & payloadMask)
+		valIdx := pos + 1
+		if k == key {
+			return &TapeIter{tape: o.tape, idx: valIdx}
+		}
+		pos = o.tape.skipValue(valIdx)
+	}
+	return nil
+}
+
+// ForEach iterates over all key-value pairs.
+func (o *TapeObject) ForEach(fn func(key string, val TapeIter) error) error {
+	pos := o.startIdx
+	for pos < o.endIdx {
+		keyEntry := o.tape.data[pos]
+		if byte(keyEntry>>56) != tagString {
+			break
+		}
+		key, _ := o.tape.readString(keyEntry & payloadMask)
+		valIdx := pos + 1
+		if err := fn(key, TapeIter{tape: o.tape, idx: valIdx}); err != nil {
+			return err
+		}
+		pos = o.tape.skipValue(valIdx)
+	}
+	return nil
+}
+
+// Map converts the object to map[string]interface{}.
+func (o *TapeObject) Map(dst map[string]interface{}) (map[string]interface{}, error) {
+	if dst == nil {
+		dst = make(map[string]interface{}, 8)
+	}
+	pos := o.startIdx
+	for pos < o.endIdx {
+		keyEntry := o.tape.data[pos]
+		if byte(keyEntry>>56) != tagString {
+			break
+		}
+		key, _ := o.tape.readString(keyEntry & payloadMask)
+		val, nextPos, err := o.tape.readValue(pos + 1)
+		if err != nil {
+			return nil, err
+		}
+		dst[key] = val
+		pos = nextPos
+	}
+	return dst, nil
+}
+
+// Count returns the number of key-value pairs.
+func (o *TapeObject) Count() int {
+	return int((o.tape.data[o.startIdx-1] >> 32) & 0xffffff)
+}
+
+// FindPath navigates a path of nested keys.
+func (o *TapeObject) FindPath(path ...string) *TapeIter {
+	if len(path) == 0 {
+		return nil
+	}
+	iter := o.FindKey(path[0])
+	if iter == nil {
+		return nil
+	}
+	for _, key := range path[1:] {
+		obj, err := iter.Object()
+		if err != nil {
+			return nil
+		}
+		iter = obj.FindKey(key)
+		if iter == nil {
+			return nil
+		}
+	}
+	return iter
+}
+
+// TapeArray provides element access over the tape.
+type TapeArray struct {
+	tape     *Tape
+	startIdx int // first element index
+	endIdx   int // index of closing ']'
+}
+
+// ForEach iterates over all elements.
+func (a *TapeArray) ForEach(fn func(val TapeIter) error) error {
+	pos := a.startIdx
+	for pos < a.endIdx {
+		if err := fn(TapeIter{tape: a.tape, idx: pos}); err != nil {
+			return err
+		}
+		pos = a.tape.skipValue(pos)
+	}
+	return nil
+}
+
+// Count returns the number of elements.
+func (a *TapeArray) Count() int {
+	return int((a.tape.data[a.startIdx-1] >> 32) & 0xffffff)
+}
+
+// AsInteger returns all elements as []int64.
+func (a *TapeArray) AsInteger() ([]int64, error) {
+	result := make([]int64, 0, a.Count())
+	err := a.ForEach(func(val TapeIter) error {
+		v, err := val.Int()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
+// AsFloat returns all elements as []float64.
+func (a *TapeArray) AsFloat() ([]float64, error) {
+	result := make([]float64, 0, a.Count())
+	err := a.ForEach(func(val TapeIter) error {
+		v, err := val.Float()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
+// AsString returns all elements as []string.
+func (a *TapeArray) AsString() ([]string, error) {
+	result := make([]string, 0, a.Count())
+	err := a.ForEach(func(val TapeIter) error {
+		v, err := val.String()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
 // Interface converts the entire document to Go native types.
 func (t *Tape) Interface() (interface{}, error) {
 	if len(t.data) < 2 {

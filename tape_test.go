@@ -76,3 +76,164 @@ func TestTapeUseNumber(t *testing.T) {
 		t.Fatalf("f: expected json.Number '3.14', got %v (%T)", m["f"], m["f"])
 	}
 }
+
+func TestTapeIter(t *testing.T) {
+	pj, _ := Parse([]byte(`{"name":"test","count":42,"pi":3.14,"ok":true,"nil":null}`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+
+	if iter.Type() != TypeObject {
+		t.Fatalf("expected object, got %v", iter.Type())
+	}
+
+	obj, _ := iter.Object()
+
+	t.Run("FindKey string", func(t *testing.T) {
+		v := obj.FindKey("name")
+		if v == nil {
+			t.Fatal("not found")
+		}
+		s, _ := v.String()
+		if s != "test" {
+			t.Fatalf("expected 'test', got %q", s)
+		}
+	})
+
+	t.Run("FindKey int", func(t *testing.T) {
+		v := obj.FindKey("count")
+		n, _ := v.Int()
+		if n != 42 {
+			t.Fatalf("expected 42, got %d", n)
+		}
+	})
+
+	t.Run("FindKey float", func(t *testing.T) {
+		v := obj.FindKey("pi")
+		f, _ := v.Float()
+		if f != 3.14 {
+			t.Fatalf("expected 3.14, got %f", f)
+		}
+	})
+
+	t.Run("FindKey bool", func(t *testing.T) {
+		v := obj.FindKey("ok")
+		b, _ := v.Bool()
+		if !b {
+			t.Fatal("expected true")
+		}
+	})
+
+	t.Run("FindKey missing", func(t *testing.T) {
+		if obj.FindKey("missing") != nil {
+			t.Fatal("expected nil")
+		}
+	})
+
+	t.Run("Count", func(t *testing.T) {
+		if obj.Count() != 5 {
+			t.Fatalf("expected 5, got %d", obj.Count())
+		}
+	})
+}
+
+func TestTapeObjectForEach(t *testing.T) {
+	pj, _ := Parse([]byte(`{"a":1,"b":"two","c":true}`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	obj, _ := iter.Object()
+
+	var keys []string
+	err := obj.ForEach(func(key string, val TapeIter) error {
+		keys = append(keys, key)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 3 || keys[0] != "a" || keys[1] != "b" || keys[2] != "c" {
+		t.Fatalf("expected [a,b,c], got %v", keys)
+	}
+}
+
+func TestTapeObjectMap(t *testing.T) {
+	pj, _ := Parse([]byte(demo_json), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	obj, _ := iter.Object()
+
+	m, err := obj.Map(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := m["Image"].(map[string]interface{})
+	if img["Width"] != int64(800) {
+		t.Fatalf("Width: expected 800, got %v", img["Width"])
+	}
+}
+
+func TestTapeFindPath(t *testing.T) {
+	pj, _ := Parse([]byte(demo_json), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	obj, _ := iter.Object()
+
+	v := obj.FindPath("Image", "Thumbnail", "Url")
+	if v == nil {
+		t.Fatal("not found")
+	}
+	s, _ := v.String()
+	if s != "http://www.example.com/image/481989943" {
+		t.Fatalf("expected URL, got %q", s)
+	}
+
+	if obj.FindPath("Image", "Missing") != nil {
+		t.Fatal("expected nil for missing path")
+	}
+}
+
+func TestTapeArray(t *testing.T) {
+	pj, _ := Parse([]byte(`[10,20,30]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+
+	if arr.Count() != 3 {
+		t.Fatalf("expected 3, got %d", arr.Count())
+	}
+
+	vals, _ := arr.AsInteger()
+	if len(vals) != 3 || vals[0] != 10 || vals[1] != 20 || vals[2] != 30 {
+		t.Fatalf("expected [10,20,30], got %v", vals)
+	}
+}
+
+func TestTapeArrayAsString(t *testing.T) {
+	pj, _ := Parse([]byte(`["a","b","c"]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+
+	vals, _ := arr.AsString()
+	if len(vals) != 3 || vals[0] != "a" || vals[1] != "b" || vals[2] != "c" {
+		t.Fatalf("expected [a,b,c], got %v", vals)
+	}
+}
+
+func TestTapeArrayAsFloat(t *testing.T) {
+	pj, _ := Parse([]byte(`[1.1,2.2,3.3]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+
+	vals, _ := arr.AsFloat()
+	if len(vals) != 3 || vals[0] != 1.1 || vals[1] != 2.2 || vals[2] != 3.3 {
+		t.Fatalf("expected [1.1,2.2,3.3], got %v", vals)
+	}
+}
