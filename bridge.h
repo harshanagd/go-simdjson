@@ -78,6 +78,9 @@ int simdjson_array_get_count(simdjson_element arr_elem, size_t* out);
 int simdjson_array_iter_begin(simdjson_element arr_elem, simdjson_arr_iter* out);
 int simdjson_array_iter_next(simdjson_arr_iter* it, simdjson_element* out_val);
 
+// Serialize an element to its JSON string representation.
+int simdjson_element_to_string(simdjson_element e, const char** out, size_t* out_len);
+
 // Runtime info.
 const char* simdjson_active_implementation(void);
 

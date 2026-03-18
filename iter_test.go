@@ -1,6 +1,9 @@
 package simdjson
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestIterType(t *testing.T) {
 	pj, err := Parse([]byte(`{"a":1}`), nil)
@@ -312,5 +315,73 @@ func TestIterObjectOnNonObject(t *testing.T) {
 	_, err = iter.Object(nil)
 	if err == nil {
 		t.Fatal("expected error calling Object() on array")
+	}
+}
+
+func TestStringCvt(t *testing.T) {
+	pj, err := Parse([]byte(`{"s":"hello","i":42,"f":3.14,"b":true,"n":null}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"s", "hello"},
+		{"i", "42"},
+		{"f", "3.14"},
+		{"b", "true"},
+		{"n", "null"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			e := obj.FindKey(tt.key, nil)
+			got, err := e.Iter.StringCvt()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("expected %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestUseNumber(t *testing.T) {
+	pj, err := Parse([]byte(`{"i":42,"f":3.14,"big":9223372036854775807}`), nil, UseNumber())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	v, err := iter.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := v.(map[string]interface{})
+
+	if n, ok := m["i"].(json.Number); !ok {
+		t.Fatalf("i: expected json.Number, got %T", m["i"])
+	} else if n.String() != "42" {
+		t.Fatalf("i: expected '42', got %q", n.String())
+	}
+
+	if n, ok := m["f"].(json.Number); !ok {
+		t.Fatalf("f: expected json.Number, got %T", m["f"])
+	} else if n.String() != "3.14" {
+		t.Fatalf("f: expected '3.14', got %q", n.String())
+	}
+
+	if n, ok := m["big"].(json.Number); !ok {
+		t.Fatalf("big: expected json.Number, got %T", m["big"])
+	} else if n.String() != "9223372036854775807" {
+		t.Fatalf("big: expected '9223372036854775807', got %q", n.String())
 	}
 }

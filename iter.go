@@ -8,6 +8,7 @@ package simdjson
 import "C"
 
 import (
+	"encoding/json"
 	"fmt"
 	"unsafe"
 )
@@ -16,12 +17,14 @@ import (
 type Iter struct {
 	elem        C.simdjson_element
 	copyStrings bool
+	useNumber   bool
 }
 
 // Object represents a JSON object for key-value access.
 type Object struct {
 	elem        C.simdjson_element
 	copyStrings bool
+	useNumber   bool
 }
 
 // Element is a key-value pair result from object lookup.
@@ -36,7 +39,7 @@ func (pj *ParsedJson) Iter() (Iter, error) {
 	if rc != 0 {
 		return Iter{}, fmt.Errorf("no parsed document")
 	}
-	return Iter{elem: elem, copyStrings: pj.copyStrings}, nil
+	return Iter{elem: elem, copyStrings: pj.copyStrings, useNumber: pj.useNumber}, nil
 }
 
 // Type returns the JSON type of the current element.
@@ -71,6 +74,27 @@ func (i *Iter) StringRef() (string, error) {
 		return "", fmt.Errorf("element is not a string")
 	}
 	return unsafe.String((*byte)(unsafe.Pointer(out)), int(outLen)), nil
+}
+
+// StringCvt converts any scalar value to its JSON string representation
+// using simdjson's native serialization — no float precision loss.
+func (i *Iter) StringCvt() (string, error) {
+	if i.Type() == TypeObject || i.Type() == TypeArray {
+		return "", fmt.Errorf("cannot convert %v to string", i.Type())
+	}
+	// For string type, delegate to String() which respects copyStrings.
+	if i.Type() == TypeString {
+		return i.String()
+	}
+	// For non-string scalars, result comes from a thread-local buffer
+	// that is overwritten on the next StringCvt() call — always copy.
+	var out *C.char
+	var outLen C.size_t
+	rc := C.simdjson_element_to_string(i.elem, &out, &outLen)
+	if rc != 0 {
+		return "", fmt.Errorf("serialization failed")
+	}
+	return C.GoStringN(out, C.int(outLen)), nil
 }
 
 // Int returns the element value as int64.
@@ -121,9 +145,10 @@ func (i *Iter) Object(reuse *Object) (*Object, error) {
 	if reuse != nil {
 		reuse.elem = i.elem
 		reuse.copyStrings = i.copyStrings
+		reuse.useNumber = i.useNumber
 		return reuse, nil
 	}
-	return &Object{elem: i.elem, copyStrings: i.copyStrings}, nil
+	return &Object{elem: i.elem, copyStrings: i.copyStrings, useNumber: i.useNumber}, nil
 }
 
 // FindKey finds a key in the object and returns an Element.
@@ -139,9 +164,10 @@ func (o *Object) FindKey(key string, reuse *Element) *Element {
 	if reuse != nil {
 		reuse.Iter.elem = out
 		reuse.Iter.copyStrings = o.copyStrings
+		reuse.Iter.useNumber = o.useNumber
 		return reuse
 	}
-	return &Element{Iter: Iter{elem: out, copyStrings: o.copyStrings}}
+	return &Element{Iter: Iter{elem: out, copyStrings: o.copyStrings, useNumber: o.useNumber}}
 }
 
 // ForEach iterates over all key-value pairs in O(n) time.
@@ -166,7 +192,7 @@ func (o *Object) ForEach(fn func(key string, i Iter) error) error {
 		if o.copyStrings {
 			key = C.GoStringN(outKey, C.int(outKeyLen))
 		}
-		if err := fn(key, Iter{elem: outVal, copyStrings: o.copyStrings}); err != nil {
+		if err := fn(key, Iter{elem: outVal, copyStrings: o.copyStrings, useNumber: o.useNumber}); err != nil {
 			return err
 		}
 	}
@@ -186,6 +212,7 @@ func (o *Object) Count() (int, error) {
 type Array struct {
 	elem        C.simdjson_element
 	copyStrings bool
+	useNumber   bool
 }
 
 // Array returns the element as an Array.
@@ -196,9 +223,10 @@ func (i *Iter) Array(reuse *Array) (*Array, error) {
 	if reuse != nil {
 		reuse.elem = i.elem
 		reuse.copyStrings = i.copyStrings
+		reuse.useNumber = i.useNumber
 		return reuse, nil
 	}
-	return &Array{elem: i.elem, copyStrings: i.copyStrings}, nil
+	return &Array{elem: i.elem, copyStrings: i.copyStrings, useNumber: i.useNumber}, nil
 }
 
 // ForEach iterates over all elements in O(n) time.
@@ -217,7 +245,7 @@ func (a *Array) ForEach(fn func(i Iter) error) error {
 		if rc != 0 {
 			return fmt.Errorf("iteration error")
 		}
-		if err := fn(Iter{elem: outVal, copyStrings: a.copyStrings}); err != nil {
+		if err := fn(Iter{elem: outVal, copyStrings: a.copyStrings, useNumber: a.useNumber}); err != nil {
 			return err
 		}
 	}
@@ -243,11 +271,13 @@ func (i *Iter) Interface() (interface{}, error) {
 		var obj Object
 		obj.elem = i.elem
 		obj.copyStrings = i.copyStrings
+		obj.useNumber = i.useNumber
 		return obj.Map(nil)
 	case TypeArray:
 		var arr Array
 		arr.elem = i.elem
 		arr.copyStrings = i.copyStrings
+		arr.useNumber = i.useNumber
 		var result []interface{}
 		err := arr.ForEach(func(elem Iter) error {
 			v, err := elem.Interface()
@@ -261,10 +291,22 @@ func (i *Iter) Interface() (interface{}, error) {
 	case TypeString:
 		return i.String()
 	case TypeInt64:
+		if i.useNumber {
+			s, _ := i.StringCvt()
+			return json.Number(s), nil
+		}
 		return i.Int()
 	case TypeUint64:
+		if i.useNumber {
+			s, _ := i.StringCvt()
+			return json.Number(s), nil
+		}
 		return i.Uint()
 	case TypeDouble:
+		if i.useNumber {
+			s, _ := i.StringCvt()
+			return json.Number(s), nil
+		}
 		return i.Float()
 	case TypeBool:
 		return i.Bool()

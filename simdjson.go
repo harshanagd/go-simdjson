@@ -21,6 +21,7 @@ import (
 type ParsedJson struct {
 	parser      C.simdjson_parser
 	copyStrings bool
+	useNumber   bool
 }
 
 // ParserOption configures parsing behavior.
@@ -33,6 +34,14 @@ type ParserOption func(*ParsedJson)
 func WithCopyStrings(copy bool) ParserOption {
 	return func(pj *ParsedJson) {
 		pj.copyStrings = copy
+	}
+}
+
+// UseNumber causes Interface() to return json.Number instead of int64/uint64/float64
+// for numeric values, preserving the exact string representation.
+func UseNumber() ParserOption {
+	return func(pj *ParsedJson) {
+		pj.useNumber = true
 	}
 }
 

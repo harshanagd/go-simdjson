@@ -226,6 +226,19 @@ int simdjson_array_iter_next(simdjson_arr_iter* it, simdjson_element* out_val) {
     return 0;
 }
 
+// --- Serialization ---
+
+// Thread-local buffer for element serialization.
+static thread_local std::string serialize_buf;
+
+int simdjson_element_to_string(simdjson_element e, const char** out, size_t* out_len) {
+    if (is_null_element(e)) return -1;
+    serialize_buf = simdjson::minify(to_cpp(e));
+    *out = serialize_buf.data();
+    *out_len = serialize_buf.size();
+    return 0;
+}
+
 // --- Runtime info ---
 
 const char* simdjson_active_implementation(void) {
