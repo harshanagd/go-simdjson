@@ -556,3 +556,111 @@ func (t *Tape) readArrayNum(idx int) ([]interface{}, int, error) {
 	}
 	return result, endIdx, nil
 }
+
+// Advance moves the iterator to the next sibling element.
+func (ti *TapeIter) Advance() Type {
+	ti.idx = ti.tape.skipValue(ti.idx)
+	if ti.idx >= len(ti.tape.data) {
+		return Type(-1)
+	}
+	return ti.Type()
+}
+
+// PeekNext returns the type of the next sibling without advancing.
+func (ti *TapeIter) PeekNext() Type {
+	next := ti.tape.skipValue(ti.idx)
+	if next >= len(ti.tape.data) {
+		return Type(-1)
+	}
+	tag := byte(ti.tape.data[next] >> 56)
+	if tag == tagFalse {
+		return TypeBool
+	}
+	return Type(tag)
+}
+
+// AdvanceInto steps into a container (object/array), positioning at the first child.
+func (ti *TapeIter) AdvanceInto() Type {
+	tag := ti.tag()
+	if tag != tagObject && tag != tagArray {
+		return Type(-1)
+	}
+	ti.idx++
+	if ti.idx >= len(ti.tape.data) {
+		return Type(-1)
+	}
+	return ti.Type()
+}
+
+// FindElement navigates a path of object keys from the current element.
+func (ti *TapeIter) FindElement(path ...string) *TapeIter {
+	if len(path) == 0 {
+		return nil
+	}
+	obj, err := ti.Object()
+	if err != nil {
+		return nil
+	}
+	return obj.FindPath(path...)
+}
+
+// StringCvt converts any scalar to its string representation.
+func (ti *TapeIter) StringCvt() (string, error) {
+	switch ti.Type() {
+	case TypeString:
+		return ti.String()
+	case TypeInt64:
+		v, _ := ti.Int()
+		return strconv.FormatInt(v, 10), nil
+	case TypeUint64:
+		v, _ := ti.Uint()
+		return strconv.FormatUint(v, 10), nil
+	case TypeDouble:
+		v, _ := ti.Float()
+		return strconv.FormatFloat(v, 'g', -1, 64), nil
+	case TypeBool:
+		v, _ := ti.Bool()
+		return strconv.FormatBool(v), nil
+	case TypeNull:
+		return "null", nil
+	default:
+		return "", fmt.Errorf("cannot convert %v to string", ti.Type())
+	}
+}
+
+// Iter returns a TapeIter at the first element of the array.
+func (a *TapeArray) Iter() TapeIter {
+	return TapeIter{tape: a.tape, idx: a.startIdx}
+}
+
+// FirstType returns the type of the first element, or Type(-1) if empty.
+func (a *TapeArray) FirstType() Type {
+	if a.startIdx >= a.endIdx {
+		return Type(-1)
+	}
+	tag := byte(a.tape.data[a.startIdx] >> 56)
+	if tag == tagFalse {
+		return TypeBool
+	}
+	return Type(tag)
+}
+
+// Interface returns the array as []interface{}.
+func (a *TapeArray) Interface() ([]interface{}, error) {
+	result := make([]interface{}, 0, a.Count())
+	pos := a.startIdx
+	for pos < a.endIdx {
+		val, nextPos, err := a.tape.readValue(pos)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, val)
+		pos = nextPos
+	}
+	return result, nil
+}
+
+// Iter returns a TapeIter at the first key of the object.
+func (o *TapeObject) Iter() TapeIter {
+	return TapeIter{tape: o.tape, idx: o.startIdx}
+}

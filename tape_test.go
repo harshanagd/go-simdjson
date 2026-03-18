@@ -313,3 +313,119 @@ func TestLargeNumberUseNumber(t *testing.T) {
 		t.Fatalf("expected '18446744073709551615', got %q", n.String())
 	}
 }
+
+func TestTapeAdvance(t *testing.T) {
+	pj, _ := Parse([]byte(`[1,"two",true]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+	ai := arr.Iter()
+
+	if ai.Type() != TypeInt64 {
+		t.Fatalf("first: expected int64, got %v", ai.Type())
+	}
+	if ai.Advance() != TypeString {
+		t.Fatal("second: expected string")
+	}
+	if ai.Advance() != TypeBool {
+		t.Fatal("third: expected bool")
+	}
+}
+
+func TestTapePeekNext(t *testing.T) {
+	pj, _ := Parse([]byte(`[1,"two"]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+	ai := arr.Iter()
+
+	if ai.PeekNext() != TypeString {
+		t.Fatalf("peek: expected string, got %v", ai.PeekNext())
+	}
+	if ai.Type() != TypeInt64 {
+		t.Fatal("should still be at int64")
+	}
+}
+
+func TestTapeAdvanceInto(t *testing.T) {
+	pj, _ := Parse([]byte(`{"a":1,"b":2}`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+
+	typ := iter.AdvanceInto()
+	if typ != TypeString {
+		t.Fatalf("expected string (first key), got %v", typ)
+	}
+	s, _ := iter.String()
+	if s != "a" {
+		t.Fatalf("expected 'a', got %q", s)
+	}
+}
+
+func TestTapeFindElement(t *testing.T) {
+	pj, _ := Parse([]byte(demo_json), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+
+	v := iter.FindElement("Image", "Width")
+	if v == nil {
+		t.Fatal("not found")
+	}
+	n, _ := v.Int()
+	if n != 800 {
+		t.Fatalf("expected 800, got %d", n)
+	}
+}
+
+func TestTapeStringCvt(t *testing.T) {
+	pj, _ := Parse([]byte(`[42, 3.14, true, null, "hi"]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+	ai := arr.Iter()
+
+	tests := []string{"42", "3.14", "true", "null", "hi"}
+	for i, want := range tests {
+		s, err := ai.StringCvt()
+		if err != nil {
+			t.Fatalf("[%d] err: %v", i, err)
+		}
+		if s != want {
+			t.Fatalf("[%d] expected %q, got %q", i, want, s)
+		}
+		if i < len(tests)-1 {
+			ai.Advance()
+		}
+	}
+}
+
+func TestTapeArrayFirstType(t *testing.T) {
+	pj, _ := Parse([]byte(`[true, 1]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+	if arr.FirstType() != TypeBool {
+		t.Fatalf("expected bool, got %v", arr.FirstType())
+	}
+}
+
+func TestTapeArrayInterface(t *testing.T) {
+	pj, _ := Parse([]byte(`[1,"two",true]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+	v, err := arr.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 3 || v[0] != int64(1) || v[1] != "two" || v[2] != true {
+		t.Fatalf("expected [1,two,true], got %v", v)
+	}
+}
