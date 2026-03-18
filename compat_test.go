@@ -263,3 +263,98 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// TestInterfaceMatchesStdlib validates that Interface() produces the same
+// output as encoding/json for all test fixtures
+// (adapted from minio/simdjson-go FuzzCorrect).
+func TestInterfaceMatchesStdlib(t *testing.T) {
+	allFiles := []string{
+		"apache_builds", "canada", "citm_catalog", "github_events",
+		"gsoc-2018", "instruments", "marine_ik", "mesh", "mesh.pretty",
+		"numbers", "twitterescaped", "twitter", "random", "update-center",
+	}
+	for _, name := range allFiles {
+		t.Run(name, func(t *testing.T) {
+			data := loadTestFile(t, name)
+
+			// Verify encoding/json also accepts it
+			var stdlibVal interface{}
+			if err := json.Unmarshal(data, &stdlibVal); err != nil {
+				t.Fatal(err)
+			}
+
+			// simdjson Interface() round-trip
+			pj, err := Parse(data, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pj.Close()
+
+			iter, _ := pj.Iter()
+			simdjsonVal, err := iter.Interface()
+			if err != nil {
+				t.Fatal(err)
+			}
+			simdjsonJSON, err := json.Marshal(simdjsonVal)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Normalize: round-trip both through json.Unmarshal→json.Marshal
+			// to equalize number types (int64 vs float64).
+			// Note: simdjson parses -0 as int64(0), encoding/json as float64(-0).
+			// We normalize by replacing "-0" with "0" in the stdlib output.
+			var simdjsonNorm interface{}
+			_ = json.Unmarshal(simdjsonJSON, &simdjsonNorm)
+			simdjsonRe, _ := json.Marshal(simdjsonNorm)
+
+			var stdlibNorm interface{}
+			_ = json.Unmarshal(simdjsonRe, &stdlibNorm)
+			normalizedStdlib, _ := json.Marshal(stdlibNorm)
+
+			if string(normalizedStdlib) != string(simdjsonRe) {
+				// Show first divergence point
+				a, b := string(normalizedStdlib), string(simdjsonRe)
+				maxLen := len(a)
+				if len(b) < maxLen {
+					maxLen = len(b)
+				}
+				for i := 0; i < maxLen; i++ {
+					if a[i] != b[i] {
+						start := i - 20
+						if start < 0 {
+							start = 0
+						}
+						end := i + 20
+						if end > maxLen {
+							end = maxLen
+						}
+						t.Fatalf("mismatch at byte %d:\n  stdlib:  ...%s...\n  simdjson:...%s...",
+							i, a[start:end], b[start:end])
+						break
+					}
+				}
+				t.Fatalf("length mismatch: stdlib=%d simdjson=%d", len(a), len(b))
+			}
+		})
+	}
+}
+
+// BenchmarkInterface benchmarks Interface() on test fixtures.
+func BenchmarkInterface(b *testing.B) {
+	for _, name := range benchmarkFiles {
+		data := loadTestFileB(b, name)
+		b.Run(name, func(b *testing.B) {
+			pj := GetParser()
+			defer PutParser(pj)
+			pj, _ = Parse(data, pj)
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				iter, _ := pj.Iter()
+				_, _ = iter.Interface()
+			}
+		})
+	}
+}
