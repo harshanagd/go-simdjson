@@ -572,3 +572,119 @@ func TestNumberIsValid(t *testing.T) {
 		}
 	}
 }
+
+func TestIterAdvance(t *testing.T) {
+	pj, _ := Parse([]byte(`[1,"two",true]`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	ai := arr.tarr.Iter()
+	it := Iter{tape: ai.tape, tapeIdx: ai.idx, copyStrings: true}
+
+	if it.Type() != TypeInt64 {
+		t.Fatalf("expected int64, got %v", it.Type())
+	}
+	if it.Advance() != TypeString {
+		t.Fatal("expected string")
+	}
+	if it.Advance() != TypeBool {
+		t.Fatal("expected bool")
+	}
+}
+
+func TestIterAdvanceIter(t *testing.T) {
+	pj, _ := Parse([]byte(`[10,20]`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	ai := arr.tarr.Iter()
+	src := Iter{tape: ai.tape, tapeIdx: ai.idx, copyStrings: true}
+
+	var dst Iter
+	typ, err := src.AdvanceIter(&dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != TypeInt64 {
+		t.Fatalf("expected int64, got %v", typ)
+	}
+}
+
+func TestIterPeekNextTag(t *testing.T) {
+	pj, _ := Parse([]byte(`[1,"hi"]`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	ai := arr.tarr.Iter()
+	it := Iter{tape: ai.tape, tapeIdx: ai.idx, copyStrings: true}
+
+	tag := it.PeekNextTag()
+	if tag != TagString {
+		t.Fatalf("expected TagString, got %v", tag)
+	}
+	// Should not have advanced
+	if it.Type() != TypeInt64 {
+		t.Fatal("should still be at int64")
+	}
+}
+
+func TestIterRoot(t *testing.T) {
+	pj, _ := Parse([]byte(`{"a":1}`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+
+	var dst Iter
+	typ, got, err := iter.Root(&dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != TypeObject {
+		t.Fatalf("expected object, got %v", typ)
+	}
+	if got == nil {
+		t.Fatal("dst is nil")
+	}
+}
+
+func TestIterFloatFlags(t *testing.T) {
+	pj, _ := Parse([]byte(`3.14`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+
+	v, flags, err := iter.FloatFlags()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 3.14 {
+		t.Fatalf("expected 3.14, got %v", v)
+	}
+	if flags.Contains(FloatOverflowedInteger) {
+		t.Fatal("should not have overflow flag")
+	}
+}
+
+func TestIterFloatFlagsFromInt(t *testing.T) {
+	pj, _ := Parse([]byte(`42`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+
+	v, _, err := iter.FloatFlags()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 42.0 {
+		t.Fatalf("expected 42, got %v", v)
+	}
+}
+
+func TestTagType(t *testing.T) {
+	if TagString.Type() != TypeString {
+		t.Fatal("TagString.Type() mismatch")
+	}
+	if TagBoolFalse.Type() != TypeBool {
+		t.Fatal("TagBoolFalse.Type() mismatch")
+	}
+	if TagEnd.Type() != Type(-1) {
+		t.Fatal("TagEnd.Type() mismatch")
+	}
+}

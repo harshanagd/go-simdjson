@@ -13,22 +13,52 @@ import (
 	"unsafe"
 )
 
+// Tag is the raw tape tag byte. Compatible with simdjson-go's Tag type.
+type Tag uint8
+
 const (
-	tagRoot   = 'r'
-	tagObject = '{'
-	tagObjEnd = '}'
-	tagArray  = '['
-	tagArrEnd = ']'
-	tagString = '"'
-	tagInt64  = 'l'
-	tagUint64 = 'u'
-	tagDouble = 'd'
-	tagTrue   = 't'
-	tagFalse  = 'f'
-	tagNull   = 'n'
+	TagString      = Tag('"')
+	TagInteger     = Tag('l')
+	TagUint        = Tag('u')
+	TagFloat       = Tag('d')
+	TagNull        = Tag('n')
+	TagBoolTrue    = Tag('t')
+	TagBoolFalse   = Tag('f')
+	TagObjectStart = Tag('{')
+	TagObjectEnd   = Tag('}')
+	TagArrayStart  = Tag('[')
+	TagArrayEnd    = Tag(']')
+	TagRoot        = Tag('r')
+	TagEnd         = Tag(0)
 
 	payloadMask = 0x00ffffffffffffff
+
+	// Internal byte aliases for tape walking.
+	tagRoot   = byte(TagRoot)
+	tagObject = byte(TagObjectStart)
+	tagObjEnd = byte(TagObjectEnd)
+	tagArray  = byte(TagArrayStart)
+	tagArrEnd = byte(TagArrayEnd)
+	tagString = byte(TagString)
+	tagInt64  = byte(TagInteger)
+	tagUint64 = byte(TagUint)
+	tagDouble = byte(TagFloat)
+	tagTrue   = byte(TagBoolTrue)
+	tagFalse  = byte(TagBoolFalse)
+	tagNull   = byte(TagNull)
 )
+
+// Type converts a Tag to its corresponding Type.
+func (tag Tag) Type() Type {
+	switch tag {
+	case TagBoolFalse:
+		return TypeBool
+	case TagEnd:
+		return Type(-1)
+	default:
+		return Type(tag)
+	}
+}
 
 // Tape holds the raw tape and string buffer from a parsed JSON document.
 //

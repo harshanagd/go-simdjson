@@ -9,6 +9,23 @@ import (
 	"strconv"
 )
 
+// FloatFlags records metadata about parsed floats.
+type FloatFlags uint64
+
+// FloatFlag is a single flag recorded when parsing floats.
+type FloatFlag uint64
+
+const (
+	// FloatOverflowedInteger is set when a JSON integer overflowed int64/uint64
+	// and was parsed as float instead.
+	FloatOverflowedInteger FloatFlag = 1 << iota
+)
+
+// Contains returns whether f contains the specified flag.
+func (f FloatFlags) Contains(flag FloatFlag) bool {
+	return FloatFlag(f)&flag == flag
+}
+
 // Iter represents a position in the parsed JSON document.
 type Iter struct {
 	tape        *Tape
@@ -254,6 +271,82 @@ func (i *Iter) FindElement(reuse *Element, path ...string) (*Element, error) {
 		return nil, err
 	}
 	return obj.FindPath(reuse, path...)
+}
+
+// Advance moves to the next sibling element and returns its type.
+// Returns Type(-1) at end.
+func (i *Iter) Advance() Type {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	t := ti.Advance()
+	i.tapeIdx = ti.idx
+	return t
+}
+
+// AdvanceIter advances and copies the current element into dst.
+// Returns the type of the element and an error if past end.
+func (i *Iter) AdvanceIter(dst *Iter) (Type, error) {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	t := ti.Advance()
+	if int(t) == -1 {
+		return Type(-1), nil
+	}
+	i.tapeIdx = ti.idx
+	if dst != i {
+		*dst = *i
+	}
+	// Position dst at the element we just advanced to
+	dst.tapeIdx = ti.idx
+	return t, nil
+}
+
+// PeekNext returns the type of the next sibling without advancing.
+func (i *Iter) PeekNext() Type {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.PeekNext()
+}
+
+// PeekNextTag returns the raw Tag of the next sibling without advancing.
+// Returns TagEnd at end.
+func (i *Iter) PeekNextTag() Tag {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	next := i.tape.skipValue(ti.idx)
+	if next >= len(i.tape.data) {
+		return TagEnd
+	}
+	return Tag(i.tape.data[next] >> 56)
+}
+
+// Root returns an Iter positioned at the root element's value.
+func (i *Iter) Root(dst *Iter) (Type, *Iter, error) {
+	if dst == nil {
+		c := *i
+		dst = &c
+	} else {
+		*dst = *i
+	}
+	// Position at the first element after root tag (index 1)
+	dst.tapeIdx = 1
+	return dst.Type(), dst, nil
+}
+
+// FloatFlags returns the float value and associated flags.
+// Also accepts int64/uint64 values (returns them as float64 with no flags).
+func (i *Iter) FloatFlags() (float64, FloatFlags, error) {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tag := ti.tag()
+	switch tag {
+	case tagDouble:
+		v, err := ti.Float()
+		return v, 0, err
+	case tagInt64:
+		v, err := ti.Int()
+		return float64(v), 0, err
+	case tagUint64:
+		v, err := ti.Uint()
+		return float64(v), 0, err
+	default:
+		return 0, 0, fmt.Errorf("cannot convert %v to float", ti.Type())
+	}
 }
 
 // NextElement returns the next key-value pair. Initialize the iterator by
