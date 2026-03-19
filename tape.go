@@ -56,10 +56,19 @@ type Tape struct {
 
 // GetTape returns the tape extracted during Parse. Zero-cost after parse.
 func (pj *ParsedJson) GetTape() (*Tape, error) {
-	if pj.tape == nil {
+	if !pj.hasTape {
 		return nil, fmt.Errorf("no parsed document")
 	}
-	return pj.tape, nil
+	return &pj.tape, nil
+}
+
+// Clone returns a deep copy of the tape and string buffer.
+func (t *Tape) Clone() *Tape {
+	d := make([]uint64, len(t.data))
+	copy(d, t.data)
+	s := make([]byte, len(t.strings))
+	copy(s, t.strings)
+	return &Tape{data: d, strings: s, copyStrings: t.copyStrings}
 }
 
 // TapeInterface converts the entire document to Go native types via pure Go

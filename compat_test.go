@@ -466,3 +466,109 @@ func TestFindPathCompat(t *testing.T) {
 		}
 	}
 }
+
+func TestParsedJsonForEach(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	called := 0
+	err = pj.ForEach(func(i Iter) error {
+		called++
+		if i.Type() != TypeObject {
+			t.Fatalf("expected object, got %v", i.Type())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 {
+		t.Fatalf("expected 1 call, got %d", called)
+	}
+}
+
+func TestParsedJsonReset(t *testing.T) {
+	pj, _ := Parse([]byte(`[1,2,3]`), nil)
+	defer pj.Close()
+
+	pj.Reset()
+	_, err := pj.Iter()
+	if err == nil {
+		t.Fatal("expected error after Reset")
+	}
+
+	// Re-parse should work
+	pj2, err := Parse([]byte(`{"x":true}`), pj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pj2.RootType() != TypeObject {
+		t.Fatalf("expected object after re-parse, got %v", pj2.RootType())
+	}
+}
+
+func TestParsedJsonClone(t *testing.T) {
+	pj, _ := Parse([]byte(`{"key":"value"}`), nil)
+	defer pj.Close()
+
+	clone := pj.Clone(nil)
+	// Close original — clone should still work
+	pj.Close()
+
+	iter, err := clone.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elem := obj.FindKey("key", nil)
+	if elem == nil {
+		t.Fatal("key not found in clone")
+	}
+	s, _ := elem.Iter.String()
+	if s != "value" {
+		t.Fatalf("expected 'value', got %q", s)
+	}
+}
+
+// TestNumberIsValid validates number parsing edge cases.
+// (adapted from minio/simdjson-go TestNumberIsValid)
+func TestNumberIsValid(t *testing.T) {
+	validTests := []string{
+		"0", "-0", "1", "-1", "0.1", "-0.1",
+		"1234", "-1234", "12.34", "-12.34",
+		"12E0", "12E1", "12e34", "12E-0", "12e+1", "12e-34",
+		"-12E0", "-12E1", "-12e34", "-12E-0", "-12e+1", "-12e-34",
+		"1.2E0", "1.2E1", "1.2e34", "1.2E-0", "1.2e+1", "1.2e-34",
+		"-1.2E0", "-1.2E1", "-1.2e34", "-1.2E-0", "-1.2e+1", "-1.2e-34",
+		"0E0", "0E1", "0e34", "0E-0", "0e+1", "0e-34",
+		"-0E0", "-0E1", "-0e34", "-0E-0", "-0e+1", "-0e-34",
+	}
+	for _, num := range validTests {
+		pj, err := Parse([]byte(num), nil)
+		if err != nil {
+			t.Errorf("%s should be valid, got: %v", num, err)
+			continue
+		}
+		pj.Close()
+	}
+
+	invalidTests := []string{
+		"", "invalid", "1.0.1", "1..1", "-1-2",
+		"012a42", "01.2", "012", "12E12.12", "1e2e3",
+		"1e+-2", "1e--23", "1e", "e1", "1e+",
+		"1ea", "1a", "1.a", "1.", "01", "1.e1",
+	}
+	for _, num := range invalidTests {
+		pj, err := Parse([]byte(num), nil)
+		if err == nil {
+			pj.Close()
+			t.Errorf("%s should be invalid", num)
+		}
+	}
+}

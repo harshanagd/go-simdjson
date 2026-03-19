@@ -32,10 +32,10 @@ type Element struct {
 
 // Iter returns an Iter positioned at the root of the parsed document.
 func (pj *ParsedJson) Iter() (Iter, error) {
-	if pj.tape == nil {
+	if !pj.hasTape {
 		return Iter{}, fmt.Errorf("no parsed document")
 	}
-	return Iter{tape: pj.tape, tapeIdx: 1, copyStrings: pj.copyStrings, useNumber: pj.useNumber}, nil
+	return Iter{tape: &pj.tape, tapeIdx: 1, copyStrings: pj.copyStrings, useNumber: pj.useNumber}, nil
 }
 
 // Type returns the JSON type of the current element.

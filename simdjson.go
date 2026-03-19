@@ -22,7 +22,8 @@ import (
 // ParsedJson holds a parsed JSON document. Safe to reuse via sync.Pool.
 type ParsedJson struct {
 	parser      C.simdjson_parser
-	tape        *Tape
+	tape        Tape
+	hasTape     bool
 	copyStrings bool
 	useNumber   bool
 }
@@ -93,11 +94,12 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 	if res.result.ok == 0 {
 		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
-	pj.tape = &Tape{
+	pj.tape = Tape{
 		data:        copyUint64Slice(uintptr(unsafe.Pointer(res.tape)), int(res.tape_len)),
 		strings:     copyByteSlice(uintptr(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
 		copyStrings: pj.copyStrings,
 	}
+	pj.hasTape = true
 	return pj, nil
 }
 
@@ -106,8 +108,42 @@ func (pj *ParsedJson) Close() {
 	if pj.parser != nil {
 		C.simdjson_parser_free(pj.parser)
 		pj.parser = nil
-		pj.tape = nil
+		pj.hasTape = false
 	}
+}
+
+// Reset clears the parsed tape, allowing the ParsedJson to be reused.
+func (pj *ParsedJson) Reset() {
+	pj.hasTape = false
+	pj.tape = Tape{}
+}
+
+// Clone returns a deep copy of the ParsedJson tape data.
+// The clone has no C++ parser — it can only be used for reading, not re-parsing.
+// If dst is non-nil, it is reused.
+func (pj *ParsedJson) Clone(dst *ParsedJson) *ParsedJson {
+	if !pj.hasTape {
+		return dst
+	}
+	if dst == nil {
+		dst = &ParsedJson{}
+	}
+	dst.copyStrings = pj.copyStrings
+	dst.useNumber = pj.useNumber
+	dst.tape = *pj.tape.Clone()
+	dst.hasTape = true
+	return dst
+}
+
+// ForEach calls fn for each root element in the parsed document.
+// For standard JSON this calls fn exactly once. Compatible with simdjson-go's
+// ndjson ForEach pattern.
+func (pj *ParsedJson) ForEach(fn func(i Iter) error) error {
+	iter, err := pj.Iter()
+	if err != nil {
+		return err
+	}
+	return fn(iter)
 }
 
 // Type represents a JSON element type.
