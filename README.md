@@ -322,6 +322,34 @@ Zero-copy string access eliminates string allocations (strings point into Go-own
 
 NoCopy has no effect on numeric-heavy files (canada, mesh, numbers) since they have few strings.
 
+### Targeted Access Benchmarks
+
+These show the cost of individual API calls (twitter.json, 632KB, pre-parsed):
+
+| Operation | Time | Allocs | Bytes |
+|-----------|------|--------|-------|
+| `Elements.Lookup` | 18ns | 0 | 0 |
+| `TapeIter.Advance` (tape cursor) | 42ns | 1 | 24 |
+| `NextElementBytes` (key as `[]byte`) | 56ns | 2 | 48 |
+| `NextElement` (key as `string`) | 62ns | 2 | 48 |
+| `Object.ForEach` | 92ns | 4 | 72 |
+| `Object.FindKey` | 114ns | 5 | 120 |
+| `Object.FindPath` (2 levels) | 399ns | 17 | 320 |
+| `Array.ForEach` (243 elements) | 1.1µs | 11 | 224 |
+| `AsFloat` (numbers.json) | 68µs | 3 | 82KB |
+| `AsInteger` (10K ints) | 67µs | 3 | 82KB |
+| `Clone` (full document) | 172µs | 2 | 713KB |
+
+Use `reuse` parameters to eliminate `Object`/`Array`/`Element` heap allocations in hot loops:
+
+```go
+var obj *simdjson.Object
+for {
+    obj, _ = iter.Object(obj) // reuses obj, zero alloc
+    // ...
+}
+```
+
 ### Allocation Profile
 
 | Operation | Allocations | Notes |
@@ -329,6 +357,9 @@ NoCopy has no effect on numeric-heavy files (canada, mesh, numbers) since they h
 | Parse | 2 | tape `[]uint64` + string buffer `[]byte` |
 | Interface() | O(elements) | Unavoidable: `interface{}` boxing, map/slice creation |
 | Interface() NoCopy | ~64% fewer | Eliminates string copies |
+| Targeted access | 0–5 per call | Use `reuse` params to minimize |
+| Elements.Lookup | 0 | Zero-alloc after initial `Object.Parse` |
+| AsFloat/AsInteger | 3 | Single slice allocation for result |
 
 ## Roadmap
 
