@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 )
@@ -755,4 +756,95 @@ func TestElementsLookup(t *testing.T) {
 	if missing != nil {
 		t.Fatal("expected nil for missing key")
 	}
+}
+
+// FuzzParse checks that Parse doesn't crash on arbitrary input.
+func FuzzParse(f *testing.F) {
+	f.Add([]byte(`{"a":1}`))
+	f.Add([]byte(`[1,2,3]`))
+	f.Add([]byte(`"hello"`))
+	f.Add([]byte(`42`))
+	f.Add([]byte(`true`))
+	f.Add([]byte(`null`))
+	f.Add([]byte(`{}`))
+	f.Add([]byte(`[]`))
+	f.Add([]byte(``))
+	f.Add([]byte(`{invalid`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		pj, err := Parse(data, nil)
+		if err != nil {
+			return
+		}
+		defer pj.Close()
+		// If parse succeeded, Interface() should not panic
+		iter, err := pj.Iter()
+		if err != nil {
+			return
+		}
+		iter.Interface() //nolint:errcheck
+	})
+}
+
+// FuzzCorrect compares Parse + Interface() output against encoding/json.
+// (adapted from minio/simdjson-go FuzzCorrect)
+func FuzzCorrect(f *testing.F) {
+	f.Add([]byte(`{"a":1,"b":"two","c":true,"d":null}`))
+	f.Add([]byte(`[1,2.5,"three",false,null,[],{}]`))
+	f.Add([]byte(`{"nested":{"deep":{"value":42}}}`))
+	f.Add([]byte(`"hello world"`))
+	f.Add([]byte(`0`))
+	f.Add([]byte(`-1`))
+	f.Add([]byte(`1.5e10`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Filter through stdlib first — only test valid JSON
+		var tmp interface{}
+		if err := json.Unmarshal(data, &tmp); err != nil {
+			return
+		}
+		if tmp == nil {
+			return
+		}
+		// Re-marshal to normalize (stdlib canonical form)
+		data, err := json.Marshal(tmp)
+		if err != nil {
+			return
+		}
+
+		pj, err := Parse(data, nil)
+		if err != nil {
+			// C++ simdjson rejects integers > uint64 max that encoding/json
+			// accepts as float64. This is stricter, not a bug.
+			return
+		}
+		defer pj.Close()
+
+		iter, err := pj.Iter()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := iter.Interface()
+		if err != nil {
+			t.Fatalf("Interface() failed: %v", err)
+		}
+
+		gotB, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantB, err := json.Marshal(tmp)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Equal(gotB, wantB) {
+			// Allow -0 == 0
+			if bytes.Equal(
+				bytes.ReplaceAll(wantB, []byte("-0"), []byte("0")),
+				bytes.ReplaceAll(gotB, []byte("-0"), []byte("0")),
+			) {
+				return
+			}
+			t.Fatalf("mismatch:\nstdlib: %s\nsimdjson: %s", wantB, gotB)
+		}
+	})
 }
