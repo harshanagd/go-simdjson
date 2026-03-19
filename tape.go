@@ -505,19 +505,27 @@ func (t *Tape) readArray(idx int) ([]interface{}, int, error) {
 }
 
 func (t *Tape) readString(offset uint64) (string, error) {
+	b, err := t.readStringBytes(offset)
+	if err != nil {
+		return "", err
+	}
+	if t.copyStrings {
+		return string(b), nil
+	}
+	return unsafe.String(&b[0], len(b)), nil
+}
+
+func (t *Tape) readStringBytes(offset uint64) ([]byte, error) {
 	off := int(offset)
 	if off+4 > len(t.strings) {
-		return "", fmt.Errorf("string offset %d out of bounds", off)
+		return nil, fmt.Errorf("string offset %d out of bounds", off)
 	}
 	slen := int(binary.LittleEndian.Uint32(t.strings[off : off+4]))
 	start := off + 4
 	if start+slen > len(t.strings) {
-		return "", fmt.Errorf("string length %d at offset %d out of bounds", slen, off)
+		return nil, fmt.Errorf("string length %d at offset %d out of bounds", slen, off)
 	}
-	if t.copyStrings {
-		return string(t.strings[start : start+slen]), nil
-	}
-	return unsafe.String(&t.strings[start], slen), nil
+	return t.strings[start : start+slen], nil
 }
 
 func (t *Tape) readValueNum(idx int) (interface{}, int, error) {

@@ -44,6 +44,8 @@ type Object struct {
 
 // Element is a key-value pair result from object lookup.
 type Element struct {
+	Name string
+	Type Type
 	Iter Iter
 }
 
@@ -235,11 +237,8 @@ func (o *Object) Map(dst map[string]interface{}) (map[string]interface{}, error)
 // StringBytes extracts a string value as []byte.
 // Respects WithCopyStrings setting.
 func (i *Iter) StringBytes() ([]byte, error) {
-	s, err := i.String()
-	if err != nil {
-		return nil, err
-	}
-	return []byte(s), nil
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.tape.readStringBytes(ti.payload())
 }
 
 // FindPath navigates a dot-separated path of object keys from the current element.
@@ -352,14 +351,21 @@ func (i *Iter) FloatFlags() (float64, FloatFlags, error) {
 // NextElement returns the next key-value pair. Initialize the iterator by
 // calling Object() first. Returns empty name when done.
 func (o *Object) NextElement(dst *Iter) (name string, t Type, err error) {
+	n, t, err := o.NextElementBytes(dst)
+	return string(n), t, err
+}
+
+// NextElementBytes is like NextElement but returns the key as []byte,
+// avoiding a string allocation. Returns nil name when done.
+func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
 	if o.iterPos >= o.tobj.endIdx {
-		return "", TypeNull, nil // done
+		return nil, TypeNull, nil
 	}
 	keyEntry := o.tobj.tape.data[o.iterPos]
 	if byte(keyEntry>>56) != tagString {
-		return "", TypeNull, nil
+		return nil, TypeNull, nil
 	}
-	name, _ = o.tobj.tape.readString(keyEntry & payloadMask)
+	s, _ := o.tobj.tape.readStringBytes(keyEntry & payloadMask)
 	valIdx := o.iterPos + 1
 	if dst != nil {
 		dst.tape = o.tobj.tape
@@ -372,7 +378,57 @@ func (o *Object) NextElement(dst *Iter) (name string, t Type, err error) {
 		t = TypeBool
 	}
 	o.iterPos = o.tobj.tape.skipValue(valIdx)
-	return name, t, nil
+	return s, t, nil
+}
+
+// Elements contains all key-value pairs of an object, kept in original order.
+type Elements struct {
+	Elements []Element
+	Index    map[string]int
+}
+
+// Lookup returns the element with the given key, or nil if not found.
+func (e Elements) Lookup(key string) *Element {
+	idx, ok := e.Index[key]
+	if !ok {
+		return nil
+	}
+	return &e.Elements[idx]
+}
+
+// Parse collects all key-value pairs into an Elements collection.
+// If dst is non-nil it is reused.
+func (o *Object) Parse(dst *Elements) (*Elements, error) {
+	if dst == nil {
+		dst = &Elements{
+			Elements: make([]Element, 0, o.tobj.Count()),
+			Index:    make(map[string]int, o.tobj.Count()),
+		}
+	} else {
+		dst.Elements = dst.Elements[:0]
+		for k := range dst.Index {
+			delete(dst.Index, k)
+		}
+	}
+	// Reset iteration position to start of object
+	o.iterPos = o.tobj.startIdx
+	var tmp Iter
+	for {
+		name, t, err := o.NextElement(&tmp)
+		if err != nil {
+			return dst, err
+		}
+		if name == "" && t == TypeNull {
+			break
+		}
+		dst.Index[name] = len(dst.Elements)
+		dst.Elements = append(dst.Elements, Element{
+			Name: name,
+			Type: t,
+			Iter: tmp,
+		})
+	}
+	return dst, nil
 }
 
 // Interface returns the array as []interface{}.

@@ -688,3 +688,71 @@ func TestTagType(t *testing.T) {
 		t.Fatal("TagEnd.Type() mismatch")
 	}
 }
+
+func TestNextElementBytes(t *testing.T) {
+	pj, _ := Parse([]byte(`{"a":1,"b":"two"}`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	var dst Iter
+	name, typ, err := obj.NextElementBytes(&dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(name) != "a" || typ != TypeInt64 {
+		t.Fatalf("expected a/int64, got %s/%v", name, typ)
+	}
+	name, typ, err = obj.NextElementBytes(&dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(name) != "b" || typ != TypeString {
+		t.Fatalf("expected b/string, got %s/%v", name, typ)
+	}
+	name, _, _ = obj.NextElementBytes(&dst)
+	if name != nil {
+		t.Fatalf("expected nil at end, got %s", name)
+	}
+}
+
+func TestObjectParse(t *testing.T) {
+	pj, _ := Parse([]byte(demo_json), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	elems, err := obj.Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(elems.Elements) != 1 {
+		t.Fatalf("expected 1 element, got %d", len(elems.Elements))
+	}
+	if elems.Elements[0].Name != "Image" {
+		t.Fatalf("expected 'Image', got %q", elems.Elements[0].Name)
+	}
+}
+
+func TestElementsLookup(t *testing.T) {
+	pj, _ := Parse([]byte(`{"x":10,"y":20,"z":30}`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	elems, _ := obj.Parse(nil)
+
+	y := elems.Lookup("y")
+	if y == nil {
+		t.Fatal("y not found")
+	}
+	v, _ := y.Iter.Int()
+	if v != 20 {
+		t.Fatalf("expected 20, got %d", v)
+	}
+
+	missing := elems.Lookup("w")
+	if missing != nil {
+		t.Fatal("expected nil for missing key")
+	}
+}
