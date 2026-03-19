@@ -73,7 +73,8 @@ simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char*
 // --- Runtime info ---
 
 const char* simdjson_active_implementation(void) {
-    return simdjson::get_active_implementation()->name().data();
+    static std::string name = simdjson::get_active_implementation()->name();
+    return name.c_str();
 }
 
 } // extern "C"
