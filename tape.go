@@ -298,7 +298,7 @@ func (o *TapeObject) ForEach(fn func(key string, val TapeIter) error) error {
 // Map converts the object to map[string]interface{}.
 func (o *TapeObject) Map(dst map[string]interface{}) (map[string]interface{}, error) {
 	if dst == nil {
-		dst = make(map[string]interface{}, 8)
+		dst = make(map[string]interface{}, o.Count())
 	}
 	pos := o.startIdx
 	for pos < o.endIdx {
@@ -508,6 +508,9 @@ func (t *Tape) readString(offset uint64) (string, error) {
 	b, err := t.readStringBytes(offset)
 	if err != nil {
 		return "", err
+	}
+	if len(b) == 0 {
+		return "", nil
 	}
 	if t.copyStrings {
 		return string(b), nil
