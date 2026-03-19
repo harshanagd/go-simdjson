@@ -1,0 +1,61 @@
+name: Check simdjson updates
+on:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new simdjson release
+        id: check
+        run: |
+          CURRENT=$(grep '^VERSION=' SIMDJSON_VERSION | cut -d= -f2)
+          LATEST=$(curl -s https://api.github.com/repos/simdjson/simdjson/releases/latest | jq -r .tag_name | tr -d v)
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT, Latest: $LATEST"
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create issue if update available
+        if: steps.check.outputs.update == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const current = '${{ steps.check.outputs.current }}';
+            const latest = '${{ steps.check.outputs.latest }}';
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'dependency-update',
+              state: 'open'
+            });
+            if (issues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Update vendored C++ simdjson to v${latest}`,
+                labels: ['dependency-update'],
+                body: [
+                  `A new version of C++ simdjson is available.`,
+                  ``,
+                  `| | Version |`,
+                  `|---|---|`,
+                  `| Current | ${current} |`,
+                  `| Latest | ${latest} |`,
+                  ``,
+                  `**Release notes**: https://github.com/simdjson/simdjson/releases/tag/v${latest}`,
+                  ``,
+                  `### Update steps`,
+                  `1. Download \`simdjson.h\` and \`simdjson.cpp\` from the release`,
+                  `2. Replace the vendored files in the repo root`,
+                  `3. Update \`SIMDJSON_VERSION\``,
+                  `4. Run \`make release\` to verify`,
+                ].join('\n')
+              });
+            }
