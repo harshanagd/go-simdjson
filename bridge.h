@@ -36,6 +36,20 @@ typedef struct {
 
 simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char* buf, size_t len);
 
+// --- NDJSON via parse_many ---
+// Parses newline-delimited JSON using C++ simdjson's parse_many.
+// Returns a combined tape + string buffer for all documents.
+
+typedef struct {
+    simdjson_result result;
+    const uint64_t* tape;
+    size_t tape_len;
+    const uint8_t* sbuf;
+    size_t sbuf_len;
+} simdjson_nd_result;
+
+simdjson_nd_result simdjson_parse_many(simdjson_parser p, const char* buf, size_t len);
+
 // Runtime info.
 const char* simdjson_active_implementation(void);
 

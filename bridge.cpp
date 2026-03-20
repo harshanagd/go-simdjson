@@ -70,6 +70,112 @@ simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char*
     return r;
 }
 
+// --- On Demand tape ---
+// (reserved for future use)
+
+// --- NDJSON via parse_many ---
+
+simdjson_nd_result simdjson_parse_many(simdjson_parser p, const char* buf, size_t len) {
+    simdjson_nd_result r = {};
+    auto* state = static_cast<parser_state*>(p);
+
+    auto padded = simdjson::padded_string(buf, len);
+    simdjson::dom::document_stream docs;
+    auto error = state->parser.parse_many(padded).get(docs);
+    if (error) {
+        r.result.ok = 0;
+        r.result.error_code = static_cast<int>(error);
+        r.result.error_msg = simdjson::error_message(error);
+        return r;
+    }
+
+    // Collect all document tapes into one combined tape + string buffer.
+    thread_local std::vector<uint64_t> combined_tape;
+    thread_local std::vector<uint8_t> combined_strings;
+    combined_tape.clear();
+    combined_strings.clear();
+
+    for (auto doc_result : docs) {
+        simdjson::dom::element doc;
+        error = doc_result.get(doc);
+        if (error) {
+            r.result.ok = 0;
+            r.result.error_code = static_cast<int>(error);
+            r.result.error_msg = simdjson::error_message(error);
+            return r;
+        }
+
+        auto& d = state->parser.doc;
+        if (!d.tape) continue;
+
+        uint64_t first = d.tape[0];
+        size_t tape_len = (first & 0x00ffffffffffffff);
+        if (tape_len > 0) tape_len++;
+
+        // Adjust tape offsets: string offsets need to shift by current combined_strings size.
+        // Container end-indices need to shift by current combined_tape size.
+        size_t tape_base = combined_tape.size();
+        size_t str_base = combined_strings.size();
+
+        for (size_t i = 0; i < tape_len; i++) {
+            uint64_t entry = d.tape[i];
+            uint8_t tag = entry >> 56;
+            uint64_t payload = entry & 0x00ffffffffffffff;
+
+            switch (tag) {
+            case '"': // string: payload is string buffer offset
+                entry = (uint64_t(tag) << 56) | (payload + str_base);
+                break;
+            case '{': case '[': // container open: lower 32 bits = end index
+            {
+                uint32_t end_idx = uint32_t(payload) + uint32_t(tape_base);
+                uint32_t count = uint32_t(payload >> 32);
+                entry = (uint64_t(tag) << 56) | (uint64_t(count) << 32) | end_idx;
+                break;
+            }
+            case '}': case ']': // container close: payload = start index
+                entry = (uint64_t(tag) << 56) | (payload + tape_base);
+                break;
+            case 'r': // root: payload = other root index
+                entry = (uint64_t(tag) << 56) | (payload + tape_base);
+                break;
+            default:
+                break;
+            }
+            combined_tape.push_back(entry);
+        }
+
+        // Copy string buffer
+        if (d.string_buf) {
+            // Find actual string buffer usage (same scan as parse_and_get_tape)
+            size_t max_end = 0;
+            size_t sbuf_cap = d.capacity() * 2 + 64;
+            for (size_t i = 0; i + 1 < tape_len; i++) {
+                uint8_t t = d.tape[i] >> 56;
+                if (t == '"') {
+                    uint64_t off = d.tape[i] & 0x00ffffffffffffff;
+                    if (off + 4 > sbuf_cap) continue;
+                    uint32_t slen;
+                    memcpy(&slen, d.string_buf.get() + off, sizeof(uint32_t));
+                    size_t end = off + 4 + slen + 1;
+                    if (end > sbuf_cap) continue;
+                    if (end > max_end) max_end = end;
+                }
+            }
+            size_t old_size = combined_strings.size();
+            combined_strings.resize(old_size + max_end);
+            memcpy(combined_strings.data() + old_size, d.string_buf.get(), max_end);
+        }
+    }
+
+    r.result = {1, 0, nullptr};
+    r.tape = combined_tape.data();
+    r.tape_len = combined_tape.size();
+    r.sbuf = combined_strings.data();
+    r.sbuf_len = combined_strings.size();
+    return r;
+}
+
 // --- Runtime info ---
 
 const char* simdjson_active_implementation(void) {

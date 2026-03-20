@@ -241,3 +241,22 @@ func TestParseNDStreamLargeLines(t *testing.T) {
 		t.Errorf("got %d, want 2", count)
 	}
 }
+
+func BenchmarkParseND(b *testing.B) {
+	// Build NDJSON from twitter.json — repeat the object 10 times
+	line := loadTestFileB(b, "twitter")
+	var buf []byte
+	for i := 0; i < 10; i++ {
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
+	}
+	b.SetBytes(int64(len(buf)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pj, err := ParseND(buf, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		pj.Close()
+	}
+}

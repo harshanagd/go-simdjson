@@ -4,73 +4,45 @@
 
 package simdjson
 
+// #include "bridge.h"
+import "C"
+
 import (
 	"bufio"
 	"bytes"
 	"fmt"
 	"io"
+	"unsafe"
 )
 
-// ParseND parses newline-delimited JSON (ndjson). Each line is a separate
-// JSON value. The returned ParsedJson contains all values accessible via
-// ForEach. Empty lines are skipped.
+// ParseND parses newline-delimited JSON (ndjson) using C++ simdjson's
+// parse_many for SIMD-accelerated batch processing. Each line is a separate
+// JSON value. The returned ParsedJson contains all values in a combined tape.
 func ParseND(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, error) {
 	b = bytes.TrimSpace(b)
 	if len(b) == 0 {
 		return nil, fmt.Errorf("empty input")
 	}
 
-	// For single-line input, just parse normally.
-	if bytes.IndexByte(b, '\n') < 0 {
-		return Parse(b, reuse, opts...)
-	}
-
-	// Multi-line: parse each line and concatenate tapes.
-	// The result has multiple root entries in the tape.
-	var combined Tape
-	var copyStrings, useNumber bool
-	if reuse != nil {
-		copyStrings = reuse.copyStrings
-		useNumber = reuse.useNumber
-	} else {
-		copyStrings = true
+	pj := reuse
+	if pj == nil {
+		pj = newParsedJson()
 	}
 	for _, opt := range opts {
-		tmp := &ParsedJson{copyStrings: copyStrings, useNumber: useNumber}
-		opt(tmp)
-		copyStrings = tmp.copyStrings
-		useNumber = tmp.useNumber
+		opt(pj)
 	}
 
-	lines := bytes.Split(b, []byte{'\n'})
-	for _, line := range lines {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		pj, err := Parse(line, nil, opts...)
-		if err != nil {
-			return nil, fmt.Errorf("line %q: %w", truncate(line, 50), err)
-		}
-		// Append this line's tape (skip outer root entries)
-		combined.data = append(combined.data, pj.tape.data...)
-		// Adjust string buffer offsets — strings from this line start at
-		// the current end of the combined string buffer.
-		combined.strings = append(combined.strings, pj.tape.strings...)
-		pj.Close()
+	res := C.simdjson_parse_many(pj.parser, (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b)))
+	if res.result.ok == 0 {
+		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
-
-	combined.copyStrings = copyStrings
-
-	if reuse == nil {
-		reuse = newParsedJson()
+	pj.tape = Tape{
+		data:        copyUint64Slice(uintptr(unsafe.Pointer(res.tape)), int(res.tape_len)),
+		strings:     copyByteSlice(uintptr(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
+		copyStrings: pj.copyStrings,
 	}
-	for _, opt := range opts {
-		opt(reuse)
-	}
-	reuse.tape = combined
-	reuse.hasTape = true
-	return reuse, nil
+	pj.hasTape = true
+	return pj, nil
 }
 
 // Stream is used to stream back results from ParseNDStream.
