@@ -137,6 +137,8 @@ Runtime detection is automatic — no build flags needed.
 
 ```go
 func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, error)
+func ParseND(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, error)
+func ParseNDStream(r io.Reader, res chan<- Stream, reuse <-chan *ParsedJson)
 func GetParser() *ParsedJson
 func PutParser(pj *ParsedJson)
 func SupportedCPU() bool
@@ -175,11 +177,23 @@ func (i *Iter) Object(reuse *Object) (*Object, error)
 func (i *Iter) Array(reuse *Array) (*Array, error)
 func (i *Iter) Interface() (interface{}, error)
 func (i *Iter) Advance() Type
+func (i *Iter) AdvanceInto() Tag
 func (i *Iter) AdvanceIter(dst *Iter) (Type, error)
 func (i *Iter) PeekNext() Type
 func (i *Iter) PeekNextTag() Tag
 func (i *Iter) Root(dst *Iter) (Type, *Iter, error)
 func (i *Iter) FindElement(reuse *Element, path ...string) (*Element, error)
+func (i *Iter) MarshalJSON() ([]byte, error)
+func (i *Iter) MarshalJSONBuffer(dst []byte) ([]byte, error)
+
+// Mutation
+func (i *Iter) SetFloat(v float64) error
+func (i *Iter) SetInt(v int64) error
+func (i *Iter) SetUInt(v uint64) error
+func (i *Iter) SetString(v string) error
+func (i *Iter) SetStringBytes(v []byte) error
+func (i *Iter) SetBool(v bool) error
+func (i *Iter) SetNull() error
 ```
 
 ### Object
@@ -193,6 +207,7 @@ func (o *Object) NextElement(dst *Iter) (name string, t Type, err error)
 func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error)
 func (o *Object) Parse(dst *Elements) (*Elements, error)
 func (o *Object) Count() (int, error)
+func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[string]struct{}) error
 ```
 
 ### Array
@@ -206,12 +221,25 @@ func (a *Array) AsUint64() ([]uint64, error)
 func (a *Array) AsString() ([]string, error)
 func (a *Array) AsStringCvt() ([]string, error)
 func (a *Array) Count() (int, error)
+func (a *Array) DeleteElems(fn func(i Iter) bool)
+func (a *Array) MarshalJSON() ([]byte, error)
+func (a *Array) MarshalJSONBuffer(dst []byte) ([]byte, error)
 ```
 
 ### Elements
 
 ```go
 func (e Elements) Lookup(key string) *Element
+func (e Elements) MarshalJSON() ([]byte, error)
+func (e Elements) MarshalJSONBuffer(dst []byte) ([]byte, error)
+```
+
+### Serializer
+
+```go
+func NewSerializer() *Serializer
+func (s *Serializer) Serialize(dst []byte, pj ParsedJson) []byte
+func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, error)
 ```
 
 ### Tape (Pure Go, Zero CGo)
@@ -361,12 +389,22 @@ for {
 | Elements.Lookup | 0 | Zero-alloc after initial `Object.Parse` |
 | AsFloat/AsInteger | 3 | Single slice allocation for result |
 
-## Roadmap
+## API Parity with simdjson-go
 
-- [ ] `ParseND` — newline-delimited JSON (ndjson) support
-- [ ] `MarshalJSON` — re-serialize parsed elements
-- [ ] Mutation APIs (`Set*`, `Delete*`)
-- [ ] Binary serialization (`Serialize`/`Deserialize`)
+| Category | APIs | Status |
+|----------|------|--------|
+| Parse / Pool | `Parse`, `GetParser`, `PutParser`, `SupportedCPU`, `ActiveImplementation` | ✅ |
+| Read (Iter) | `Type`, `String`, `Int`, `Uint`, `Float`, `Bool`, `Object`, `Array`, `Interface` | ✅ |
+| Navigation | `Advance`, `AdvanceInto`, `AdvanceIter`, `PeekNext`, `PeekNextTag`, `Root`, `FindElement` | ✅ |
+| Object | `FindKey`, `FindPath`, `ForEach`, `Map`, `NextElement`, `NextElementBytes`, `Parse`, `Count` | ✅ |
+| Array | `ForEach`, `Interface`, `AsFloat`, `AsInteger`, `AsUint64`, `AsString`, `AsStringCvt`, `Count` | ✅ |
+| Elements | `Lookup` | ✅ |
+| Tape (pure Go) | `TapeIter`, `TapeObject`, `TapeArray` — full navigation | ✅ |
+| Mutation | `SetFloat`, `SetInt`, `SetUInt`, `SetString`, `SetStringBytes`, `SetBool`, `SetNull` | ✅ |
+| Delete | `Object.DeleteElems`, `Array.DeleteElems` | ✅ |
+| Serialization | `MarshalJSON`, `MarshalJSONBuffer` (Iter, Array, Elements) | ✅ |
+| Binary | `NewSerializer`, `Serialize`, `Deserialize` | ✅ |
+| NDJSON | `ParseND`, `ParseNDStream` | ✅ |
 
 ## License
 
