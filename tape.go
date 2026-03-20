@@ -241,8 +241,10 @@ func (ti *TapeIter) payload() uint64 { return ti.tape.data[ti.idx] & payloadMask
 
 // skipValue returns the tape index after the value at idx.
 func (t *Tape) skipValue(idx int) int {
-	tag := byte(t.data[idx] >> 56)
+	tag := t.tapeTagAt(idx)
 	switch tag {
+	case tagNop:
+		return t.tapeSkipNop(idx)
 	case tagObject, tagArray:
 		return int(t.data[idx] & 0xffffffff) // end index (past closing tag)
 	case tagInt64, tagUint64, tagDouble:
@@ -263,11 +265,15 @@ type TapeObject struct {
 func (o *TapeObject) FindKey(key string) *TapeIter {
 	pos := o.startIdx
 	for pos < o.endIdx {
-		keyEntry := o.tape.data[pos]
-		if byte(keyEntry>>56) != tagString {
+		tag := o.tape.tapeTagAt(pos)
+		if tag == tagNop {
+			pos = o.tape.tapeSkipNop(pos)
+			continue
+		}
+		if tag != tagString {
 			break
 		}
-		k, _ := o.tape.readString(keyEntry & payloadMask)
+		k, _ := o.tape.readString(o.tape.tapePayloadAt(pos))
 		valIdx := pos + 1
 		if k == key {
 			return &TapeIter{tape: o.tape, idx: valIdx}
@@ -281,11 +287,15 @@ func (o *TapeObject) FindKey(key string) *TapeIter {
 func (o *TapeObject) ForEach(fn func(key string, val TapeIter) error) error {
 	pos := o.startIdx
 	for pos < o.endIdx {
-		keyEntry := o.tape.data[pos]
-		if byte(keyEntry>>56) != tagString {
+		tag := o.tape.tapeTagAt(pos)
+		if tag == tagNop {
+			pos = o.tape.tapeSkipNop(pos)
+			continue
+		}
+		if tag != tagString {
 			break
 		}
-		key, _ := o.tape.readString(keyEntry & payloadMask)
+		key, _ := o.tape.readString(o.tape.tapePayloadAt(pos))
 		valIdx := pos + 1
 		if err := fn(key, TapeIter{tape: o.tape, idx: valIdx}); err != nil {
 			return err
@@ -437,6 +447,8 @@ func (t *Tape) readValue(idx int) (interface{}, int, error) {
 	payload := entry & payloadMask
 
 	switch tag {
+	case tagNop:
+		return nil, t.tapeSkipNop(idx), nil
 	case tagString:
 		s, err := t.readString(payload)
 		return s, idx + 1, err
@@ -468,11 +480,15 @@ func (t *Tape) readObject(idx int) (map[string]interface{}, int, error) {
 	result := make(map[string]interface{}, count)
 	pos := idx + 1
 	for pos < endIdx-1 {
-		keyEntry := t.data[pos]
-		if byte(keyEntry>>56) != tagString {
+		tag := t.tapeTagAt(pos)
+		if tag == tagNop {
+			pos = t.tapeSkipNop(pos)
+			continue
+		}
+		if tag != tagString {
 			return nil, pos, fmt.Errorf("expected string key at %d", pos)
 		}
-		key, err := t.readString(keyEntry & payloadMask)
+		key, err := t.readString(t.tapePayloadAt(pos))
 		if err != nil {
 			return nil, pos, err
 		}
@@ -494,6 +510,11 @@ func (t *Tape) readArray(idx int) ([]interface{}, int, error) {
 	result := make([]interface{}, 0, count)
 	pos := idx + 1
 	for pos < endIdx-1 {
+		tag := t.tapeTagAt(pos)
+		if tag == tagNop {
+			pos = t.tapeSkipNop(pos)
+			continue
+		}
 		val, nextPos, err := t.readValue(pos)
 		if err != nil {
 			return nil, pos, err
@@ -540,6 +561,8 @@ func (t *Tape) readValueNum(idx int) (interface{}, int, error) {
 	payload := entry & payloadMask
 
 	switch tag {
+	case tagNop:
+		return nil, t.tapeSkipNop(idx), nil
 	case tagString:
 		s, err := t.readString(payload)
 		return s, idx + 1, err
@@ -571,11 +594,15 @@ func (t *Tape) readObjectNum(idx int) (map[string]interface{}, int, error) {
 	result := make(map[string]interface{}, count)
 	pos := idx + 1
 	for pos < endIdx-1 {
-		keyEntry := t.data[pos]
-		if byte(keyEntry>>56) != tagString {
+		tag := t.tapeTagAt(pos)
+		if tag == tagNop {
+			pos = t.tapeSkipNop(pos)
+			continue
+		}
+		if tag != tagString {
 			return nil, pos, fmt.Errorf("expected string key at %d", pos)
 		}
-		key, err := t.readString(keyEntry & payloadMask)
+		key, err := t.readString(t.tapePayloadAt(pos))
 		if err != nil {
 			return nil, pos, err
 		}
@@ -597,6 +624,11 @@ func (t *Tape) readArrayNum(idx int) ([]interface{}, int, error) {
 	result := make([]interface{}, 0, count)
 	pos := idx + 1
 	for pos < endIdx-1 {
+		tag := t.tapeTagAt(pos)
+		if tag == tagNop {
+			pos = t.tapeSkipNop(pos)
+			continue
+		}
 		val, nextPos, err := t.readValueNum(pos)
 		if err != nil {
 			return nil, pos, err

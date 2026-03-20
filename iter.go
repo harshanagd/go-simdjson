@@ -5,7 +5,9 @@
 package simdjson
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 )
 
@@ -518,4 +520,256 @@ func (a *Array) AsStringCvt() ([]string, error) {
 		return nil
 	})
 	return result, err
+}
+
+// TagNop is a no-operation tape entry used to fill gaps after mutations.
+// The payload stores the skip distance for Advance().
+const TagNop = Tag('N')
+
+const tagNop = byte(TagNop)
+
+// --- Tape write helpers ---
+// These abstract the tape entry format: [tag:8 | payload:56].
+
+// tapeEntry builds a tape entry from a tag byte and payload.
+func tapeEntry(tag byte, payload uint64) uint64 {
+	return (uint64(tag) << 56) | (payload & payloadMask)
+}
+
+// tapeSetTag writes a tag-only entry (no payload) at the given index.
+func (t *Tape) tapeSetTag(idx int, tag byte) {
+	t.data[idx] = tapeEntry(tag, 0)
+}
+
+// tapeSetTagPayload writes a tag + payload entry at the given index.
+func (t *Tape) tapeSetTagPayload(idx int, tag byte, payload uint64) {
+	t.data[idx] = tapeEntry(tag, payload)
+}
+
+// tapeSetNop writes a NOP entry at idx. Advance() will skip forward by `skip` entries.
+func (t *Tape) tapeSetNop(idx int, skip uint64) {
+	t.data[idx] = tapeEntry(tagNop, skip)
+}
+
+// tapeTagAt returns the tag byte at the given tape index.
+func (t *Tape) tapeTagAt(idx int) byte {
+	return byte(t.data[idx] >> 56)
+}
+
+// tapePayloadAt returns the 56-bit payload at the given tape index.
+func (t *Tape) tapePayloadAt(idx int) uint64 {
+	return t.data[idx] & payloadMask
+}
+
+// tapeSkipNop advances past a NOP entry, returning the next index.
+func (t *Tape) tapeSkipNop(idx int) int {
+	skip := int(t.tapePayloadAt(idx))
+	if skip == 0 {
+		skip = 1
+	}
+	return idx + skip
+}
+
+// tapeNopRange fills tape[start:end] with NOP entries, each pointing to end.
+func (t *Tape) tapeNopRange(start, end int) {
+	for j := start; j < end; j++ {
+		t.tapeSetNop(j, uint64(end-j))
+	}
+}
+
+// tapeAppendString appends a string to the string buffer and returns the offset.
+// Format: [4-byte LE length][UTF-8 bytes][null terminator].
+// The buffer is already well-sized from parse; append handles growth if needed.
+func (t *Tape) tapeAppendString(v []byte) uint64 {
+	off := len(t.strings)
+	t.strings = append(t.strings, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(t.strings[off:], uint32(len(v)))
+	t.strings = append(t.strings, v...)
+	t.strings = append(t.strings, 0)
+	return uint64(off)
+}
+
+// --- Mutation methods ---
+
+// SetFloat changes the current value to a float64.
+// Works on float, int, and uint elements (all use 2 tape entries).
+func (i *Iter) SetFloat(v float64) error {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tag := ti.tag()
+	switch tag {
+	case tagDouble, tagInt64, tagUint64:
+		i.tape.tapeSetTag(i.tapeIdx, tagDouble)
+		i.tape.data[i.tapeIdx+1] = math.Float64bits(v)
+		return nil
+	}
+	return fmt.Errorf("cannot set tag '%c' to float", tag)
+}
+
+// SetInt changes the current value to an int64.
+// Works on float, int, and uint elements (all use 2 tape entries).
+func (i *Iter) SetInt(v int64) error {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tag := ti.tag()
+	switch tag {
+	case tagDouble, tagInt64, tagUint64:
+		i.tape.tapeSetTag(i.tapeIdx, tagInt64)
+		i.tape.data[i.tapeIdx+1] = uint64(v)
+		return nil
+	}
+	return fmt.Errorf("cannot set tag '%c' to int", tag)
+}
+
+// SetUInt changes the current value to a uint64.
+// Works on float, int, and uint elements (all use 2 tape entries).
+func (i *Iter) SetUInt(v uint64) error {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tag := ti.tag()
+	switch tag {
+	case tagDouble, tagInt64, tagUint64:
+		i.tape.tapeSetTag(i.tapeIdx, tagUint64)
+		i.tape.data[i.tapeIdx+1] = v
+		return nil
+	}
+	return fmt.Errorf("cannot set tag '%c' to uint", tag)
+}
+
+// SetStringBytes changes the current value to a string.
+// Works on string, float, int, and uint elements (all use 2 tape entries).
+// The new string is appended to the string buffer; the old value is orphaned.
+func (i *Iter) SetStringBytes(v []byte) error {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tag := ti.tag()
+	switch tag {
+	case tagString:
+		// String → string: 1-entry type, just update the offset.
+		off := i.tape.tapeAppendString(v)
+		i.tape.tapeSetTagPayload(i.tapeIdx, tagString, off)
+		return nil
+	case tagDouble, tagInt64, tagUint64:
+		// Number → string: 2-entry type shrinks to 1 entry.
+		// First entry becomes the string, second becomes NOP.
+		off := i.tape.tapeAppendString(v)
+		i.tape.tapeSetTagPayload(i.tapeIdx, tagString, off)
+		i.tape.tapeSetNop(i.tapeIdx+1, 1)
+		return nil
+	}
+	return fmt.Errorf("cannot set tag '%c' to string", tag)
+}
+
+// SetString changes the current value to a string.
+// Works on string, float, int, and uint elements (all use 2 tape entries).
+func (i *Iter) SetString(v string) error {
+	return i.SetStringBytes([]byte(v))
+}
+
+// SetBool changes the current value to a bool.
+// Works on bool and null elements (all use 1 tape entry).
+func (i *Iter) SetBool(v bool) error {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tag := ti.tag()
+	switch tag {
+	case tagTrue, tagFalse, tagNull:
+		if v {
+			i.tape.tapeSetTag(i.tapeIdx, tagTrue)
+		} else {
+			i.tape.tapeSetTag(i.tapeIdx, tagFalse)
+		}
+		return nil
+	}
+	return fmt.Errorf("cannot set tag '%c' to bool", tag)
+}
+
+// SetNull changes the current value to null.
+// Works on bool, string, number, object, and array elements.
+// For 2-entry types (string, number), the second entry becomes a NOP.
+// For containers (object, array), all entries through the closing tag become NOPs.
+func (i *Iter) SetNull() error {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	tag := ti.tag()
+	switch tag {
+	case tagTrue, tagFalse, tagNull, tagString:
+		// 1-entry types: just overwrite the tag.
+		i.tape.tapeSetTag(i.tapeIdx, tagNull)
+		return nil
+	case tagDouble, tagInt64, tagUint64:
+		// 2-entry types: first entry becomes null, second becomes NOP(skip=1).
+		i.tape.tapeSetTag(i.tapeIdx, tagNull)
+		i.tape.tapeSetNop(i.tapeIdx+1, 1)
+		return nil
+	case tagObject, tagArray:
+		// Container: first entry becomes null, everything through closing tag becomes NOP.
+		endIdx := int(i.tape.data[i.tapeIdx] & 0xffffffff)
+		i.tape.tapeSetTag(i.tapeIdx, tagNull)
+		i.tape.tapeNopRange(i.tapeIdx+1, endIdx+1)
+		return nil
+	}
+	return fmt.Errorf("cannot set tag '%c' to null", tag)
+}
+
+// DeleteElems removes key-value pairs from the object where fn returns true.
+// If onlyKeys is non-nil, only keys in the set are considered.
+// Deleted entries are replaced with NOP entries in the tape.
+func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[string]struct{}) error {
+	if o.tobj == nil {
+		return fmt.Errorf("nil object")
+	}
+	t := o.tobj.tape
+	pos := o.tobj.startIdx
+	n := 0
+	for pos < o.tobj.endIdx {
+		tag := t.tapeTagAt(pos)
+		if tag == tagNop {
+			pos = t.tapeSkipNop(pos)
+			continue
+		}
+		if tag != tagString {
+			break
+		}
+		startPos := pos
+		keyBytes, err := t.readStringBytes(t.tapePayloadAt(pos))
+		if err != nil {
+			return err
+		}
+		pos++ // past key entry (string tag is 1 entry in DOM tape; length is next)
+
+		if len(onlyKeys) > 0 {
+			if _, ok := onlyKeys[string(keyBytes)]; !ok {
+				pos = t.skipValue(pos)
+				continue
+			}
+		}
+
+		valueEnd := t.skipValue(pos)
+		if fn == nil || fn(keyBytes, Iter{tape: t, tapeIdx: pos, copyStrings: o.copyStrings, useNumber: o.useNumber}) {
+			// NOP-fill from key through value (inclusive).
+			t.tapeNopRange(startPos, valueEnd)
+		}
+		pos = valueEnd
+		n++
+		if len(onlyKeys) > 0 && n == len(onlyKeys) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// DeleteElems removes elements from the array where fn returns true.
+// Deleted entries are replaced with NOP entries in the tape.
+func (a *Array) DeleteElems(fn func(i Iter) bool) {
+	t := a.tarr.tape
+	pos := a.tarr.startIdx
+	endIdx := a.tarr.endIdx
+	for pos < endIdx {
+		tag := t.tapeTagAt(pos)
+		if tag == tagNop {
+			pos = t.tapeSkipNop(pos)
+			continue
+		}
+		valueEnd := t.skipValue(pos)
+		if fn(Iter{tape: t, tapeIdx: pos, copyStrings: a.copyStrings}) {
+			// NOP-fill the entire element.
+			t.tapeNopRange(pos, valueEnd)
+		}
+		pos = valueEnd
+	}
 }
