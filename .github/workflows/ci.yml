@@ -45,6 +45,7 @@ jobs:
           - arch: s390x
             distro: ubuntu_latest
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: uraimo/run-on-arch-action@v3
@@ -52,10 +53,11 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           distro: ${{ matrix.distro }}
-          githubToken: ${{ github.token }}
+          dockerRunArgs: --volume "${PWD}:/work"
           install: |
             apt-get update -q -y
             apt-get install -y golang-go gcc g++
           run: |
+            cd /work
             go build ./...
-            go test -v ./...
+            go test -count=1 ./...
