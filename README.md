@@ -1,6 +1,6 @@
 # go-simdjson
 
-Cross-architecture SIMD JSON parser for Go, powered by [simdjson](https://github.com/simdjson/simdjson). Supports x86_64 (AVX2/SSE4.2) and ARM64 (NEON) with automatic runtime detection.
+Cross-architecture SIMD JSON parser for Go, powered by [simdjson](https://github.com/simdjson/simdjson). CI-tested on x86_64, ARM64, ppc64le, and s390x with automatic runtime detection of the fastest SIMD backend (AVX-512, AVX2, SSE4.2, NEON, VSX, or scalar fallback).
 
 ## Why?
 
@@ -122,14 +122,19 @@ w, _ := elem.Int()
 
 ## Supported Platforms
 
-| Architecture | SIMD Backend | Status |
-|-------------|-------------|--------|
-| x86_64 | AVX2, SSE4.2 | ✅ |
-| ARM64 | NEON | ✅ |
-| ppc64le | ALTIVEC | ✅ |
-| Fallback | Portable | ✅ |
+The best SIMD implementation is selected automatically at runtime — no build flags needed.
 
-Runtime detection is automatic — no build flags needed.
+| Architecture | SIMD Backend | CI Tested |
+|-------------|-------------|-----------|
+| x86_64 | AVX-512, AVX2, SSE4.2 | ✅ Native |
+| ARM64 | NEON | ✅ Native |
+| ppc64le | VSX / Altivec | ✅ QEMU |
+| s390x | Scalar fallback | ✅ QEMU |
+| riscv64 | RISC-V Vector (RVV) | Supported, not CI tested |
+| LoongArch64 | LSX / LASX | Supported, not CI tested |
+| Any other | Scalar fallback | Supported via fallback |
+
+Use `simdjson.ActiveImplementation()` to check which backend was selected at runtime.
 
 ## API
 
