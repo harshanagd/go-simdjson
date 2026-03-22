@@ -35,3 +35,27 @@ jobs:
         run: go test -v -race ./...
       - name: Benchmark
         run: go test -bench=. -benchmem -benchtime=1s ./...
+
+  test-cross-arch:
+    strategy:
+      matrix:
+        include:
+          - arch: ppc64le
+            distro: ubuntu_latest
+          - arch: s390x
+            distro: ubuntu_latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: uraimo/run-on-arch-action@v3
+        name: Test on ${{ matrix.arch }}
+        with:
+          arch: ${{ matrix.arch }}
+          distro: ${{ matrix.distro }}
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update -q -y
+            apt-get install -y golang-go gcc g++
+          run: |
+            go build ./...
+            go test -v ./...
