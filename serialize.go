@@ -42,15 +42,15 @@ func (s *Serializer) Serialize(dst []byte, pj ParsedJson) []byte {
 
 	// Tape
 	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], uint64(tapeLen))
+	binary.NativeEndian.PutUint64(tmp[:], uint64(tapeLen))
 	dst = append(dst, tmp[:]...)
 	for _, v := range pj.tape.data {
-		binary.LittleEndian.PutUint64(tmp[:], v)
+		binary.NativeEndian.PutUint64(tmp[:], v)
 		dst = append(dst, tmp[:]...)
 	}
 
 	// Strings
-	binary.LittleEndian.PutUint64(tmp[:], uint64(strLen))
+	binary.NativeEndian.PutUint64(tmp[:], uint64(strLen))
 	dst = append(dst, tmp[:]...)
 	dst = append(dst, pj.tape.strings...)
 
@@ -72,7 +72,7 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	if off+8 > len(src) {
 		return nil, fmt.Errorf("truncated tape length")
 	}
-	tapeLen := int(binary.LittleEndian.Uint64(src[off:]))
+	tapeLen := int(binary.NativeEndian.Uint64(src[off:]))
 	off += 8
 
 	tapeBytes := tapeLen * 8
@@ -81,7 +81,7 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	}
 	tapeData := make([]uint64, tapeLen)
 	for i := range tapeData {
-		tapeData[i] = binary.LittleEndian.Uint64(src[off:])
+		tapeData[i] = binary.NativeEndian.Uint64(src[off:])
 		off += 8
 	}
 
@@ -89,7 +89,7 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	if off+8 > len(src) {
 		return nil, fmt.Errorf("truncated strings length")
 	}
-	strLen := int(binary.LittleEndian.Uint64(src[off:]))
+	strLen := int(binary.NativeEndian.Uint64(src[off:]))
 	off += 8
 
 	if off+strLen > len(src) {

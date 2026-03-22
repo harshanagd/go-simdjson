@@ -72,7 +72,7 @@ func (tag Tag) Type() Type {
 //
 //   - String buffer ([]byte): all parsed string values, copied from the input
 //     with JSON escape sequences resolved (e.g. \" → ", \n → newline). Each
-//     string is stored as a 4-byte little-endian length prefix followed by the
+//     string is stored as a 4-byte native-endian length prefix followed by the
 //     UTF-8 bytes and a null terminator. This is NOT the original input buffer.
 //
 // Both buffers are owned by the C++ parser and are overwritten on the next
@@ -544,7 +544,7 @@ func (t *Tape) readStringBytes(offset uint64) ([]byte, error) {
 	if off+4 > len(t.strings) {
 		return nil, fmt.Errorf("string offset %d out of bounds", off)
 	}
-	slen := int(binary.LittleEndian.Uint32(t.strings[off : off+4]))
+	slen := int(binary.NativeEndian.Uint32(t.strings[off : off+4]))
 	start := off + 4
 	if start+slen > len(t.strings) {
 		return nil, fmt.Errorf("string length %d at offset %d out of bounds", slen, off)

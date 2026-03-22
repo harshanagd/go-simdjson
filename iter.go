@@ -583,7 +583,7 @@ func (t *Tape) tapeNopRange(start, end int) {
 func (t *Tape) tapeAppendString(v []byte) uint64 {
 	off := len(t.strings)
 	t.strings = append(t.strings, 0, 0, 0, 0)
-	binary.LittleEndian.PutUint32(t.strings[off:], uint32(len(v)))
+	binary.NativeEndian.PutUint32(t.strings[off:], uint32(len(v)))
 	t.strings = append(t.strings, v...)
 	t.strings = append(t.strings, 0)
 	return uint64(off)
