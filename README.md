@@ -120,6 +120,26 @@ elem := ti.FindElement("Image", "Width")
 w, _ := elem.Int()
 ```
 
+## Big Integer Support
+
+JSON integers that exceed the 64-bit range (e.g., blockchain IDs, large financial numbers) are supported via opt-in options:
+
+```go
+// Option 1: UseBigInt — only big integers become json.Number, normal numbers stay native
+pj, err := simdjson.Parse(data, nil, simdjson.UseBigInt())
+iter, _ := pj.Iter()
+v, _ := iter.Interface()
+// v["big"] is json.Number("123456789012345678901")
+// v["small"] is int64(42)
+
+// Option 2: UseNumber — all numbers become json.Number (like encoding/json)
+pj, err = simdjson.Parse(data, nil, simdjson.UseNumber())
+// v["big"] is json.Number("123456789012345678901")
+// v["small"] is json.Number("42")
+```
+
+Without either option, big integers return a parse error (existing behavior).
+
 ## Supported Platforms
 
 The best SIMD implementation is selected automatically at runtime — no build flags needed.
@@ -150,6 +170,7 @@ func SupportedCPU() bool
 func ActiveImplementation() string
 func WithCopyStrings(copy bool) ParserOption
 func UseNumber() ParserOption
+func UseBigInt() ParserOption
 ```
 
 ### ParsedJson
@@ -256,7 +277,7 @@ func (t *Tape) Interface() (interface{}, error)
 func (t *Tape) Clone() *Tape
 
 // TapeIter — cursor-style navigation
-func (ti *TapeIter) Type/String/Int/Uint/Float/Bool/Object/Array/Interface
+func (ti *TapeIter) Type/String/Int/Uint/Float/Bool/BigInt/Object/Array/Interface
 func (ti *TapeIter) Advance() Type
 func (ti *TapeIter) PeekNext() Type
 func (ti *TapeIter) AdvanceInto() Type
@@ -410,6 +431,7 @@ for {
 | Serialization | `MarshalJSON`, `MarshalJSONBuffer` (Iter, Array, Elements) | ✅ |
 | Binary | `NewSerializer`, `Serialize`, `Deserialize` | ✅ |
 | NDJSON | `ParseND`, `ParseNDStream` | ✅ |
+| Big Integer | `UseBigInt`, `BigInt`, `TypeBigInt` | ✅ |
 
 ## License
 
