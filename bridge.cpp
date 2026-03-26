@@ -23,10 +23,11 @@ void simdjson_parser_free(simdjson_parser p) {
     delete static_cast<parser_state*>(p);
 }
 
-simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char* buf, size_t len) {
+simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char* buf, size_t len, int number_as_string) {
     simdjson_parse_result r = {};
     auto* state = static_cast<parser_state*>(p);
     state->has_doc = false;
+    state->parser.number_as_string(number_as_string != 0);
     auto error = state->parser.parse(buf, len).get(state->root);
     if (error) {
         r.result = {0, static_cast<int>(error), simdjson::error_message(error)};
@@ -56,7 +57,7 @@ simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char*
     size_t sbuf_cap = doc.capacity() * 2 + 64;
     for (size_t i = 0; i + 1 < tape_len_val; i++) {
         uint8_t tag = doc.tape[i] >> 56;
-        if (tag == '"') {
+        if (tag == '"' || tag == 'Z') {
             uint64_t offset = doc.tape[i] & 0x00ffffffffffffff;
             if (offset + 4 > sbuf_cap) continue; // safety check
             uint32_t slen;

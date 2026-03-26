@@ -34,7 +34,7 @@ typedef struct {
     size_t sbuf_len;
 } simdjson_parse_result;
 
-simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char* buf, size_t len);
+simdjson_parse_result simdjson_parse_and_get_tape(simdjson_parser p, const char* buf, size_t len, int number_as_string);
 
 // --- NDJSON via parse_many ---
 // Parses newline-delimited JSON using C++ simdjson's parse_many.

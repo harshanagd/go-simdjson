@@ -26,6 +26,7 @@ type ParsedJson struct {
 	hasTape     bool
 	copyStrings bool
 	useNumber   bool
+	bigInt      bool
 }
 
 // ParserOption configures parsing behavior.
@@ -43,9 +44,20 @@ func WithCopyStrings(copy bool) ParserOption {
 
 // UseNumber causes Interface() to return json.Number instead of int64/uint64/float64
 // for numeric values, preserving the exact string representation.
+// Big integers (exceeding uint64 range) are also returned as json.Number.
 func UseNumber() ParserOption {
 	return func(pj *ParsedJson) {
 		pj.useNumber = true
+		pj.bigInt = true
+	}
+}
+
+// UseBigInt enables parsing of integers that exceed the 64-bit range.
+// Big integers are returned as json.Number by Interface().
+// Normal int64/uint64/float64 values are unaffected.
+func UseBigInt() ParserOption {
+	return func(pj *ParsedJson) {
+		pj.bigInt = true
 	}
 }
 
@@ -90,7 +102,11 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 		return nil, fmt.Errorf("empty input")
 	}
 	// Single CGo call: parse + extract tape pointers
-	res := C.simdjson_parse_and_get_tape(pj.parser, (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b)))
+	bigIntFlag := C.int(0)
+	if pj.bigInt {
+		bigIntFlag = 1
+	}
+	res := C.simdjson_parse_and_get_tape(pj.parser, (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b)), bigIntFlag)
 	if res.result.ok == 0 {
 		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
@@ -130,6 +146,7 @@ func (pj *ParsedJson) Clone(dst *ParsedJson) *ParsedJson {
 	}
 	dst.copyStrings = pj.copyStrings
 	dst.useNumber = pj.useNumber
+	dst.bigInt = pj.bigInt
 	dst.tape = *pj.tape.Clone()
 	dst.hasTape = true
 	return dst
@@ -158,6 +175,7 @@ const (
 	TypeString Type = '"'
 	TypeBool   Type = 't'
 	TypeNull   Type = 'n'
+	TypeBigInt Type = 'Z'
 )
 
 // String returns the type name.
@@ -179,6 +197,8 @@ func (t Type) String() string {
 		return "bool"
 	case TypeNull:
 		return "null"
+	case TypeBigInt:
+		return "bigint"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(t))
 	}

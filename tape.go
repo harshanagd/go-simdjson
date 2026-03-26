@@ -30,6 +30,7 @@ const (
 	TagArrayEnd    = Tag(']')
 	TagRoot        = Tag('r')
 	TagEnd         = Tag(0)
+	TagBigInt      = Tag('Z')
 
 	payloadMask = 0x00ffffffffffffff
 
@@ -46,6 +47,7 @@ const (
 	tagTrue   = byte(TagBoolTrue)
 	tagFalse  = byte(TagBoolFalse)
 	tagNull   = byte(TagNull)
+	tagBigint = byte(TagBigInt)
 )
 
 // Type converts a Tag to its corresponding Type.
@@ -158,6 +160,15 @@ func (ti *TapeIter) String() (string, error) {
 		return "", fmt.Errorf("element is not a string")
 	}
 	return ti.tape.readString(ti.payload())
+}
+
+// BigInt returns the big integer as a json.Number at the current position.
+func (ti *TapeIter) BigInt() (json.Number, error) {
+	if ti.tag() != tagBigint {
+		return "", fmt.Errorf("element is not a big integer")
+	}
+	s, err := ti.tape.readString(ti.payload())
+	return json.Number(s), err
 }
 
 // Int returns the int64 value at the current position.
@@ -468,6 +479,9 @@ func (t *Tape) readValue(idx int) (interface{}, int, error) {
 		return t.readObject(idx)
 	case tagArray:
 		return t.readArray(idx)
+	case tagBigint:
+		s, err := t.readString(payload)
+		return json.Number(s), idx + 1, err
 	default:
 		return nil, idx + 1, fmt.Errorf("unknown tag '%c' at index %d", tag, idx)
 	}
@@ -582,6 +596,9 @@ func (t *Tape) readValueNum(idx int) (interface{}, int, error) {
 		return t.readObjectNum(idx)
 	case tagArray:
 		return t.readArrayNum(idx)
+	case tagBigint:
+		s, err := t.readString(payload)
+		return json.Number(s), idx + 1, err
 	default:
 		return nil, idx + 1, fmt.Errorf("unknown tag '%c' at index %d", tag, idx)
 	}

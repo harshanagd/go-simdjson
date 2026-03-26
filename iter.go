@@ -940,6 +940,13 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 		// Skip NOP entries
 		return dst, nil
 
+	case tagBigint:
+		s, err := t.readString(t.tapePayloadAt(idx))
+		if err != nil {
+			return nil, err
+		}
+		return append(dst, s...), nil
+
 	default:
 		return nil, fmt.Errorf("unknown tag '%c' at index %d", tag, idx)
 	}
