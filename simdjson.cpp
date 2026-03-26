@@ -1,4 +1,4 @@
-/* auto-generated on 2026-03-17 12:38:11 -0400. version 4.4.1 Do not edit! */
+/* auto-generated on 2026-03-25 17:25:37 -0400. version 4.5.0 Do not edit! */
 /* including simdjson.cpp:  */
 /* begin file simdjson.cpp */
 #define SIMDJSON_SRC_SIMDJSON_CPP
@@ -7308,6 +7308,12 @@ protected:
    */
   size_t _max_depth{0};
 
+public:
+  /** Whether to store big integers as strings instead of returning BIGINT_ERROR */
+  bool _number_as_string{false};
+
+protected:
+
   // Declaring these so that subclasses can use them to implement their constructors.
   simdjson_inline dom_parser_implementation() noexcept;
   simdjson_inline dom_parser_implementation(dom_parser_implementation &&other) noexcept;
@@ -7883,7 +7889,8 @@ enum class tape_type {
   DOUBLE = 'd',
   TRUE_VALUE = 't',
   FALSE_VALUE = 'f',
-  NULL_VALUE = 'n'
+  NULL_VALUE = 'n',
+  BIGINT = 'Z'  // Big integer stored as string in string buffer
 }; // enum class tape_type
 
 } // namespace internal
@@ -14178,6 +14185,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -14259,6 +14269,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -15198,7 +15220,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
@@ -20539,6 +20577,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -20620,6 +20661,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -21559,7 +21612,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
@@ -26895,6 +26964,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -26976,6 +27048,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -27915,7 +27999,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
@@ -33522,6 +33622,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -33603,6 +33706,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -34542,7 +34657,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
@@ -40711,6 +40842,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -40792,6 +40926,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -41731,7 +41877,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
@@ -46931,6 +47093,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -47012,6 +47177,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -47951,7 +48128,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
@@ -53055,6 +53248,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -53136,6 +53332,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -54075,7 +54283,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
@@ -59598,6 +59822,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -59679,6 +59906,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -60618,7 +60857,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
@@ -64189,6 +64444,9 @@ struct tape_writer {
   /** Write a double value to tape. */
   simdjson_inline void append_double(double value) noexcept;
 
+  /** Write a big integer (as string) to tape. src points to first digit, len is byte count. */
+  simdjson_inline void append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept;
+
   /**
    * Append a tape entry (an 8-bit type,and 56 bits worth of value).
    */
@@ -64270,6 +64528,18 @@ simdjson_inline void tape_writer::append2(uint64_t val, T val2, internal::tape_t
 
 simdjson_inline void tape_writer::write(uint64_t &tape_loc, uint64_t val, internal::tape_type t) noexcept {
   tape_loc = val | ((uint64_t(char(t))) << 56);
+}
+
+simdjson_inline void tape_writer::append_bigint(const uint8_t *src, size_t len, uint8_t *&string_buf) noexcept {
+  // Write to string buffer: [4-byte LE length][digits][null]
+  uint32_t str_len = uint32_t(len);
+  memcpy(string_buf, &str_len, sizeof(uint32_t));
+  memcpy(string_buf + sizeof(uint32_t), src, len);
+  string_buf[sizeof(uint32_t) + len] = 0;
+  // Tape entry: offset into string buffer
+  // The caller must set the offset relative to doc.string_buf base
+  append(0, internal::tape_type::BIGINT); // placeholder offset, caller patches
+  string_buf += sizeof(uint32_t) + len + 1;
 }
 
 } // namespace stage2
@@ -64455,7 +64725,23 @@ simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_string(
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_number(json_iterator &iter, const uint8_t *value) noexcept {
   iter.log_value("number");
-  return numberparsing::parse_number(value, tape);
+  error_code err = numberparsing::parse_number(value, tape);
+  if (simdjson_unlikely(err == BIGINT_ERROR &&
+      iter.dom_parser._number_as_string)) {
+    // Write big integer to string buffer using the same format as strings.
+    // Scan digits the same way parse_number does (skip optional '-', then digits).
+    const uint8_t *p = value;
+    if (*p == '-') p++;
+    while (numberparsing::is_digit(*p)) p++;
+    size_t len = size_t(p - value);
+    tape.append(current_string_buf_loc - iter.dom_parser.doc->string_buf.get(), internal::tape_type::BIGINT);
+    uint8_t *dst = current_string_buf_loc + sizeof(uint32_t);
+    memcpy(dst, value, len);
+    dst += len;
+    on_end_string(dst);
+    return SUCCESS;
+  }
+  return err;
 }
 
 simdjson_warn_unused simdjson_inline error_code tape_builder::visit_root_number(json_iterator &iter, const uint8_t *value) noexcept {
