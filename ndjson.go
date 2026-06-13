@@ -37,8 +37,8 @@ func ParseND(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, er
 		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
 	pj.tape = Tape{
-		data:        copyUint64Slice(uintptr(unsafe.Pointer(res.tape)), int(res.tape_len)),
-		strings:     copyByteSlice(uintptr(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
+		data:        copyUint64Slice(unsafe.Pointer(res.tape), int(res.tape_len)),
+		strings:     copyByteSlice(unsafe.Pointer(res.sbuf), int(res.sbuf_len)),
 		copyStrings: pj.copyStrings,
 	}
 	pj.hasTape = true

@@ -111,8 +111,8 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
 	pj.tape = Tape{
-		data:        copyUint64Slice(uintptr(unsafe.Pointer(res.tape)), int(res.tape_len)),
-		strings:     copyByteSlice(uintptr(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
+		data:        copyUint64Slice(unsafe.Pointer(res.tape), int(res.tape_len)),
+		strings:     copyByteSlice(unsafe.Pointer(res.sbuf), int(res.sbuf_len)),
 		copyStrings: pj.copyStrings,
 	}
 	pj.hasTape = true
@@ -313,20 +313,20 @@ func ActiveImplementation() string {
 	return C.GoString(C.simdjson_active_implementation())
 }
 
-func copyUint64Slice(ptr uintptr, length int) []uint64 {
-	if ptr == 0 || length == 0 {
+func copyUint64Slice(ptr unsafe.Pointer, length int) []uint64 {
+	if ptr == nil || length == 0 {
 		return nil
 	}
 	dst := make([]uint64, length)
-	C.memcpy(unsafe.Pointer(&dst[0]), unsafe.Pointer(ptr), C.size_t(length*8))
+	C.memcpy(unsafe.Pointer(&dst[0]), ptr, C.size_t(length*8))
 	return dst
 }
 
-func copyByteSlice(ptr uintptr, length int) []byte {
-	if ptr == 0 || length == 0 {
+func copyByteSlice(ptr unsafe.Pointer, length int) []byte {
+	if ptr == nil || length == 0 {
 		return nil
 	}
 	dst := make([]byte, length)
-	C.memcpy(unsafe.Pointer(&dst[0]), unsafe.Pointer(ptr), C.size_t(length))
+	C.memcpy(unsafe.Pointer(&dst[0]), ptr, C.size_t(length))
 	return dst
 }
