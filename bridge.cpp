@@ -16,7 +16,7 @@ extern "C" {
 // --- Parser lifecycle ---
 
 simdjson_parser simdjson_parser_new(void) {
-    return new parser_state{};
+    return new parser_state();
 }
 
 void simdjson_parser_free(simdjson_parser p) {
