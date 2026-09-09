@@ -32,10 +32,14 @@ type ParsedJson struct {
 // ParserOption configures parsing behavior.
 type ParserOption func(*ParsedJson)
 
-// WithCopyStrings controls whether string values are copied from C memory.
-// When true (default), strings are copied and safe to retain indefinitely.
-// When false, strings point into parser-owned memory and are only valid
-// until the next Parse call or Close — same semantics as simdjson-go.
+// WithCopyStrings controls whether each string value is copied out of the tape's
+// string buffer when it is read.
+//
+// Note both settings are safe to retain: Parse copies the C++ string buffer into
+// Go-managed memory, so a returned string is never invalidated by a later Parse or
+// Close. The flag only controls whether each read allocates a fresh copy or
+// aliases the tape's buffer, which matters for []byte results — see StringBytes.
+// When true (the default), every string read allocates.
 func WithCopyStrings(copy bool) ParserOption {
 	return func(pj *ParsedJson) {
 		pj.copyStrings = copy
@@ -82,24 +86,43 @@ func GetParser() *ParsedJson {
 }
 
 // PutParser returns a ParsedJson to the pool for reuse.
+// The parser is reset first, so it does not carry its tape or its parser
+// options over to the next GetParser caller.
 func PutParser(pj *ParsedJson) {
 	if pj != nil && pj.parser != nil {
+		pj.Reset()
 		parserPool.Put(pj)
 	}
 }
 
 // Parse parses JSON bytes using the provided ParsedJson (or a new one if nil).
 // The returned ParsedJson owns the parsed data until the next Parse call.
+//
+// Parser options apply only to this call: they are reset to their defaults
+// before opts are applied, so an option passed for one document does not carry
+// over to the next parse on the same ParsedJson.
+//
+// On error the returned ParsedJson is non-nil (it is the reuse argument when one
+// was supplied) and holds no tape, so a failed parse never exposes the previous
+// document.
 func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, error) {
 	pj := reuse
 	if pj == nil {
 		pj = newParsedJson()
 	}
+	// Reset options to their defaults before applying opts. Without this they
+	// accumulate across reuse of the same ParsedJson — including reuse via the
+	// pool, where the next caller would inherit them.
+	pj.copyStrings = true
+	pj.useNumber = false
+	pj.bigInt = false
 	for _, opt := range opts {
 		opt(pj)
 	}
 	if len(b) == 0 {
-		return nil, fmt.Errorf("empty input")
+		pj.hasTape = false
+		pj.tape = Tape{}
+		return pj, fmt.Errorf("empty input")
 	}
 	// Single CGo call: parse + extract tape pointers
 	bigIntFlag := C.int(0)
@@ -108,12 +131,15 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 	}
 	res := C.simdjson_parse_and_get_tape(pj.parser, (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b)), bigIntFlag)
 	if res.result.ok == 0 {
-		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
+		pj.hasTape = false
+		pj.tape = Tape{}
+		return pj, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
 	pj.tape = Tape{
 		data:        copyUint64Slice(unsafe.Pointer(res.tape), int(res.tape_len)),
 		strings:     copyByteSlice(unsafe.Pointer(res.sbuf), int(res.sbuf_len)),
 		copyStrings: pj.copyStrings,
+		useNumber:   pj.useNumber,
 	}
 	pj.hasTape = true
 	return pj, nil
@@ -128,25 +154,34 @@ func (pj *ParsedJson) Close() {
 	}
 }
 
-// Reset clears the parsed tape, allowing the ParsedJson to be reused.
+// Reset clears the parsed tape and restores the default parser options,
+// allowing the ParsedJson to be reused without inheriting prior state.
 func (pj *ParsedJson) Reset() {
 	pj.hasTape = false
 	pj.tape = Tape{}
+	pj.copyStrings = true
+	pj.useNumber = false
+	pj.bigInt = false
 }
 
 // Clone returns a deep copy of the ParsedJson tape data.
 // The clone has no C++ parser — it can only be used for reading, not re-parsing.
-// If dst is non-nil, it is reused.
+// If dst is non-nil, it is reused. The returned pointer is never nil: cloning a
+// ParsedJson that holds no tape yields an empty but usable clone.
 func (pj *ParsedJson) Clone(dst *ParsedJson) *ParsedJson {
-	if !pj.hasTape {
-		return dst
-	}
 	if dst == nil {
 		dst = &ParsedJson{}
 	}
 	dst.copyStrings = pj.copyStrings
 	dst.useNumber = pj.useNumber
 	dst.bigInt = pj.bigInt
+	if !pj.hasTape {
+		// Clear any tape dst carried from a previous use, so reusing a clone
+		// target cannot surface a stale document.
+		dst.hasTape = false
+		dst.tape = Tape{}
+		return dst
+	}
 	dst.tape = *pj.tape.Clone()
 	dst.hasTape = true
 	return dst

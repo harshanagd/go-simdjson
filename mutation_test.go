@@ -694,3 +694,58 @@ func TestNumberToStringThenInterface(t *testing.T) {
 		t.Errorf("b = %v", m["b"])
 	}
 }
+
+// TestSettersOnTruncatedTape covers the mutation counterpart of the truncated
+// numeric entry: SetFloat/SetInt/SetUInt overwrite the second word in place, so
+// they must refuse an entry that has no second word rather than panicking.
+// Not reachable from Parse — see the truncated-tape tests in tape_test.go.
+func TestSettersOnTruncatedTape(t *testing.T) {
+	newIter := func(tag byte) Iter {
+		tp := &Tape{data: []uint64{
+			uint64(tagRoot) << 56,
+			uint64(tag) << 56, // numeric tag word with no value word after it
+		}}
+		return Iter{tape: tp, tapeIdx: 1}
+	}
+
+	for _, tag := range []struct {
+		name string
+		tag  byte
+	}{{"double", tagDouble}, {"int", tagInt64}, {"uint", tagUint64}} {
+		t.Run("SetFloat_on_"+tag.name, func(t *testing.T) {
+			it := newIter(tag.tag)
+			if err := it.SetFloat(1.5); err == nil {
+				t.Error("SetFloat on a truncated numeric entry returned no error")
+			}
+		})
+		t.Run("SetInt_on_"+tag.name, func(t *testing.T) {
+			it := newIter(tag.tag)
+			if err := it.SetInt(7); err == nil {
+				t.Error("SetInt on a truncated numeric entry returned no error")
+			}
+		})
+		t.Run("SetUInt_on_"+tag.name, func(t *testing.T) {
+			it := newIter(tag.tag)
+			if err := it.SetUInt(7); err == nil {
+				t.Error("SetUInt on a truncated numeric entry returned no error")
+			}
+		})
+	}
+
+	// A well-formed numeric entry must still be settable.
+	pj, err := Parse([]byte(`{"n":1}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+	e := obj.FindKey("n", nil)
+	if err := e.Iter.SetFloat(2.5); err != nil {
+		t.Fatalf("SetFloat on a well-formed entry: %v", err)
+	}
+	v, err := e.Iter.Float()
+	if err != nil || v != 2.5 {
+		t.Fatalf("Float() after SetFloat = %v, %v; want 2.5, nil", v, err)
+	}
+}

@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"testing"
 )
@@ -597,5 +598,436 @@ func TestArrayAsStringCvt(t *testing.T) {
 	}
 	if len(v) != 4 || v[0] != "1" || v[1] != "two" || v[2] != "true" || v[3] != "null" {
 		t.Fatalf("expected [1,two,true,null], got %v", v)
+	}
+}
+
+// --- #9: string byte slices are cap-bounded and honour copyStrings ---
+
+func TestIterStringBytesIsCapBounded(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":"hello","b":"world"}`), nil, WithCopyStrings(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	elem := obj.FindKey("a", nil)
+	if elem == nil {
+		t.Fatal("key 'a' not found")
+	}
+	b, err := elem.Iter.StringBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "hello" {
+		t.Fatalf("got %q, want %q", string(b), "hello")
+	}
+	if cap(b) != len(b) {
+		t.Fatalf("cap(%d) != len(%d): slice not cap-bounded, append would corrupt the buffer", cap(b), len(b))
+	}
+
+	// Appending must reallocate rather than write into the next string's
+	// length prefix.
+	_ = append(b, '!') //nolint:gocritic // deliberate: exercises the cap bound
+
+	other := obj.FindKey("b", nil)
+	if other == nil {
+		t.Fatal("key 'b' not found")
+	}
+	s, err := other.Iter.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != "world" {
+		t.Fatalf("adjacent string corrupted by append: got %q, want %q", s, "world")
+	}
+}
+
+func TestIterStringBytesRespectsCopyStrings(t *testing.T) {
+	// Default (copyStrings true): the result must be independent of the buffer.
+	pj, err := Parse([]byte(`{"a":"hello","b":"world"}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elem := obj.FindKey("a", nil)
+	if elem == nil {
+		t.Fatal("key 'a' not found")
+	}
+	b, err := elem.Iter.StringBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range b {
+		b[i] = 'X'
+	}
+
+	// Mutating the copy must not disturb the tape.
+	again := obj.FindKey("a", nil)
+	s, err := again.Iter.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != "hello" {
+		t.Fatalf("StringBytes returned a view into the buffer despite copyStrings: got %q", s)
+	}
+}
+
+func TestIterStringBytesRejectsNonString(t *testing.T) {
+	pj, err := Parse([]byte(`{"n":42}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elem := obj.FindKey("n", nil)
+	if elem == nil {
+		t.Fatal("key 'n' not found")
+	}
+	if _, err := elem.Iter.StringBytes(); err == nil {
+		t.Fatal("StringBytes accepted a numeric element; the payload was read as a string offset")
+	}
+}
+
+// TestIterStringBytesPastEnd covers the "iterator past end of tape" guard.
+// Before it, this indexed tape.data out of range and panicked.
+func TestIterStringBytesPastEnd(t *testing.T) {
+	pj, err := Parse([]byte(`"hello"`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Walk off the end of the tape. Type() reports Type(-1) once exhausted, so
+	// check before each Advance (Advance itself is unguarded).
+	for i := 0; i < 16 && iter.Type() != Type(-1); i++ {
+		iter.Advance()
+	}
+	if iter.Type() != Type(-1) {
+		t.Fatal("could not position the iterator past the end of the tape")
+	}
+
+	if _, err := iter.StringBytes(); err == nil {
+		t.Fatal("StringBytes did not report an exhausted iterator")
+	}
+}
+
+func TestNextElementBytesCopiesKeysByDefault(t *testing.T) {
+	pj, err := Parse([]byte(`{"alpha":1,"beta":2}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var keys [][]byte
+	for {
+		name, _, err := obj.NextElementBytes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == nil {
+			break
+		}
+		keys = append(keys, name)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys))
+	}
+
+	// Overwrite the returned key; the tape's string buffer must be unaffected.
+	for i := range keys[0] {
+		keys[0][i] = 'X'
+	}
+	obj2, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj2.FindKey("alpha", nil) == nil {
+		t.Fatal("mutating a NextElementBytes key corrupted the tape's string buffer")
+	}
+}
+
+// TestNextElementBytesTruncatedTape covers the "key has no value" guard. A key
+// entry in the final tape slot is not reachable from Parse, so the tape is
+// constructed directly — the shape Serializer.Deserialize can produce from a
+// corrupt payload.
+func TestNextElementBytesTruncatedTape(t *testing.T) {
+	// String buffer: [4-byte native-endian length]["alpha"][NUL]
+	strs := make([]byte, 4+5+1)
+	binary.NativeEndian.PutUint32(strs[0:4], 5)
+	copy(strs[4:], "alpha")
+
+	// data[0] stands in for the root entry; data[1] is a string key with no
+	// following value word, so the value index lands one past the end.
+	// Payload is the string-buffer offset, which is 0 here.
+	keyEntry := uint64(tagString) << 56
+	tape := &Tape{
+		data:        []uint64{0, keyEntry},
+		strings:     strs,
+		copyStrings: true,
+	}
+	obj := &Object{
+		tobj:        &TapeObject{tape: tape, startIdx: 1, endIdx: 2},
+		iterPos:     1,
+		copyStrings: true,
+	}
+
+	name, _, err := obj.NextElementBytes(nil)
+	if err == nil {
+		t.Fatalf("NextElementBytes accepted a key with no value word, returning %q", string(name))
+	}
+	if name != nil {
+		t.Errorf("expected a nil name alongside the error, got %q", string(name))
+	}
+}
+
+// TestNextElementBytesPropagatesStringError covers the readStringBytes error
+// that NextElementBytes previously discarded: an out-of-range string offset must
+// surface rather than yielding a silently empty key.
+func TestNextElementBytesPropagatesStringError(t *testing.T) {
+	// Key entry points past the end of the string buffer.
+	keyEntry := uint64(tagString)<<56 | 64
+	tape := &Tape{
+		data:        []uint64{0, keyEntry, 0},
+		strings:     make([]byte, 8),
+		copyStrings: true,
+	}
+	obj := &Object{
+		tobj:        &TapeObject{tape: tape, startIdx: 1, endIdx: 3},
+		iterPos:     1,
+		copyStrings: true,
+	}
+
+	if _, _, err := obj.NextElementBytes(nil); err == nil {
+		t.Fatal("NextElementBytes swallowed an out-of-bounds string offset")
+	}
+}
+
+// TestNextElementBytesSkipsNops verifies that NOP padding left by DeleteElems
+// does not end iteration early. Before the skip loop, a deleted key made
+// NextElementBytes return the end sentinel at that point, silently truncating
+// the remainder of the object.
+func TestNextElementBytesSkipsNops(t *testing.T) {
+	cases := []struct {
+		name   string
+		delete string
+		want   []string
+	}{
+		{"delete first", "a", []string{"b", "c"}},
+		{"delete middle", "b", []string{"a", "c"}},
+		{"delete last", "c", []string{"a", "b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pj, err := Parse([]byte(`{"a":1,"b":2,"c":3}`), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pj.Close()
+
+			iter, err := pj.Iter()
+			if err != nil {
+				t.Fatal(err)
+			}
+			obj, err := iter.Object(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := obj.DeleteElems(func(key []byte, _ Iter) bool {
+				return string(key) == tc.delete
+			}, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			// Fresh Object so iterPos starts at the top of the (now gapped) object.
+			fresh, err := iter.Object(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for {
+				name, _, err := fresh.NextElementBytes(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if name == nil {
+					break
+				}
+				got = append(got, string(name))
+			}
+
+			if len(got) != len(tc.want) {
+				t.Fatalf("after deleting %q got keys %v, want %v", tc.delete, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("after deleting %q got keys %v, want %v", tc.delete, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestNextElementBytesFalseValueIsBool guards the tagFalse mapping that moved
+// from an inline special-case into Tag.Type().
+func TestNextElementBytesFalseValueIsBool(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":false,"b":true}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{"a", "b"} {
+		name, typ, err := obj.NextElementBytes(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(name) != want {
+			t.Fatalf("got key %q, want %q", string(name), want)
+		}
+		if typ != TypeBool {
+			t.Errorf("key %q: got type %v, want bool", want, typ)
+		}
+	}
+}
+
+// TestNextElementBytesUsesTagType covers the Tag.Type() mapping for a zero tag,
+// which Tag.Type() reports as Type(-1). The previous inline special-case handled
+// only tagFalse and returned Type(0) here.
+func TestNextElementBytesUsesTagType(t *testing.T) {
+	// String buffer: [4-byte native-endian length]["k"][NUL]
+	strs := make([]byte, 4+1+1)
+	binary.NativeEndian.PutUint32(strs[0:4], 1)
+	copy(strs[4:], "k")
+
+	keyEntry := uint64(tagString) << 56
+	tape := &Tape{
+		// data[2] is the value entry and carries a zero tag.
+		data:        []uint64{0, keyEntry, 0, 0},
+		strings:     strs,
+		copyStrings: true,
+	}
+	obj := &Object{
+		tobj:        &TapeObject{tape: tape, startIdx: 1, endIdx: 4},
+		iterPos:     1,
+		copyStrings: true,
+	}
+
+	name, typ, err := obj.NextElementBytes(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(name) != "k" {
+		t.Fatalf("got key %q, want %q", string(name), "k")
+	}
+	if typ != Type(-1) {
+		t.Fatalf("got type %v, want Type(-1) via Tag.Type() for a zero tag", typ)
+	}
+}
+
+// TestIterPeekNextTagSkipsNops covers the Iter-layer peek, which builds its own
+// skipValue call rather than delegating to TapeIter.PeekNext and so needed its
+// own NOP guard. Before the fix it reported TagNop as if it were a value tag.
+func TestIterPeekNextTagSkipsNops(t *testing.T) {
+	pj, err := Parse([]byte(`[1,2,3]`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, err := iter.Array(nil)
+	if err != nil {
+		t.Fatalf("Array: %v", err)
+	}
+	arr.DeleteElems(func(i Iter) bool {
+		v, _ := i.Int()
+		return v == 2
+	})
+
+	// Position an Iter on the first element, then peek across the NOP run.
+	tape, _ := pj.GetTape()
+	rootIter := tape.Iter()
+	tarr, err := rootIter.Array()
+	if err != nil {
+		t.Fatalf("TapeIter.Array: %v", err)
+	}
+	cur := tarr.Iter()
+	it := Iter{tape: cur.tape, tapeIdx: cur.idx}
+
+	if got := it.PeekNextTag(); got != TagInteger {
+		t.Fatalf("PeekNextTag() over a NOP run = %q, want %q", rune(got), rune(TagInteger))
+	}
+}
+
+// TestIterAdvanceIntoSkipsNops covers the Iter-layer wrapper, whose doc claimed
+// NOP entries were skipped before the underlying TapeIter method actually did.
+func TestIterAdvanceIntoSkipsNops(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1,"b":2}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	if err := obj.DeleteElems(func(key []byte, i Iter) bool { return string(key) == "a" }, nil); err != nil {
+		t.Fatalf("DeleteElems: %v", err)
+	}
+
+	root, _ := pj.Iter()
+	if got := root.AdvanceInto(); got != TagString {
+		t.Fatalf("AdvanceInto() = %q, want %q (the key \"b\")", rune(got), rune(TagString))
 	}
 }

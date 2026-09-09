@@ -66,22 +66,28 @@ func (i *Iter) Type() Type {
 }
 
 // String extracts a string value from the current element.
-// If WithCopyStrings(false) was set, the string points into parser-owned
-// memory and is only valid until the next Parse call or Close.
+// The result is safe to retain: tape strings live in Go-managed memory and remain
+// valid for the lifetime of the Tape, regardless of WithCopyStrings.
 func (i *Iter) String() (string, error) {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	return ti.String()
 }
 
 // StringRef extracts a string value without copying.
-// The returned string points into parser-owned memory and is only valid
-// until the next Parse call or Close.
+// Equivalent to String() — tape strings are stored in Go-managed memory and
+// remain valid for the lifetime of the Tape.
 func (i *Iter) StringRef() (string, error) {
-	return i.String() // tape strings already point into C memory
+	return i.String()
 }
 
-// StringCvt converts any scalar value to its JSON string representation
-// using simdjson's native serialization — no float precision loss.
+// StringCvt converts any scalar value to its JSON string representation.
+//
+// Floats are formatted with strconv.FormatFloat(v, 'g', -1, 64), which round-trips
+// the stored float64 exactly. That is not the same as round-tripping the source
+// token: the tape holds the parsed float64, not the original text, so `1e2` comes
+// back as "100", and a literal carrying more precision than a float64 can hold was
+// already lossy before this call. Big integers are exempt — they are stored as
+// their original digits and returned verbatim.
 func (i *Iter) StringCvt() (string, error) {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	switch ti.Type() {
@@ -90,24 +96,39 @@ func (i *Iter) StringCvt() (string, error) {
 	case TypeString:
 		return ti.String()
 	case TypeInt64:
-		v, _ := ti.Int()
+		v, err := ti.Int()
+		if err != nil {
+			return "", err
+		}
 		return strconv.FormatInt(v, 10), nil
 	case TypeUint64:
-		v, _ := ti.Uint()
+		v, err := ti.Uint()
+		if err != nil {
+			return "", err
+		}
 		return strconv.FormatUint(v, 10), nil
 	case TypeDouble:
-		v, _ := ti.Float()
+		v, err := ti.Float()
+		if err != nil {
+			return "", err
+		}
 		return strconv.FormatFloat(v, 'g', -1, 64), nil
 	case TypeBool:
-		v, _ := ti.Bool()
+		v, err := ti.Bool()
+		if err != nil {
+			return "", err
+		}
 		if v {
 			return "true", nil
 		}
 		return "false", nil
 	case TypeNull:
 		return "null", nil
+	case TypeBigInt:
+		v, err := ti.BigInt()
+		return string(v), err
 	default:
-		return "", fmt.Errorf("unknown type %v", ti.Type())
+		return "", fmt.Errorf("cannot convert %v to string", ti.Type())
 	}
 }
 
@@ -237,10 +258,28 @@ func (o *Object) Map(dst map[string]interface{}) (map[string]interface{}, error)
 }
 
 // StringBytes extracts a string value as []byte.
-// Respects WithCopyStrings setting.
+// When WithCopyStrings(true) (the default), the result is an independent copy.
+// When false, it is a slice into the tape's string buffer whose capacity is
+// pinned to its length, so appending to it reallocates rather than corrupting
+// the adjacent string.
 func (i *Iter) StringBytes() ([]byte, error) {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
-	return ti.tape.readStringBytes(ti.payload())
+	if ti.pastEnd() {
+		return nil, fmt.Errorf("iterator past end of tape")
+	}
+	if ti.tag() != tagString {
+		return nil, fmt.Errorf("element is not a string")
+	}
+	b, err := ti.tape.readStringBytes(ti.payload())
+	if err != nil {
+		return nil, err
+	}
+	if i.copyStrings {
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		return cp, nil
+	}
+	return b, nil
 }
 
 // FindPath navigates a dot-separated path of object keys from the current element.
@@ -284,7 +323,8 @@ func (i *Iter) Advance() Type {
 }
 
 // AdvanceIter advances and copies the current element into dst.
-// Returns the type of the element and an error if past end.
+// Returns the type of the element, or Type(-1) with a nil error at end — the
+// error return is reserved for future use and is never currently non-nil.
 func (i *Iter) AdvanceIter(dst *Iter) (Type, error) {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	t := ti.Advance()
@@ -307,14 +347,14 @@ func (i *Iter) PeekNext() Type {
 }
 
 // PeekNextTag returns the raw Tag of the next sibling without advancing.
+// NOP padding left behind by mutation is skipped, so this never reports TagNop.
 // Returns TagEnd at end.
 func (i *Iter) PeekNextTag() Tag {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
-	next := i.tape.skipValue(ti.idx)
-	if next >= len(i.tape.data) {
+	if ti.Advance() == Type(-1) {
 		return TagEnd
 	}
-	return Tag(i.tape.data[next] >> 56)
+	return Tag(ti.tag())
 }
 
 // Root returns an Iter positioned at the root element's value.
@@ -359,26 +399,49 @@ func (o *Object) NextElement(dst *Iter) (name string, t Type, err error) {
 
 // NextElementBytes is like NextElement but returns the key as []byte,
 // avoiding a string allocation. Returns nil name when done.
+// The key is copied when WithCopyStrings(true) (the default); when false it is a
+// cap-bounded slice into the tape's string buffer.
+//
+// NOP entries left behind by DeleteElems are skipped, so deleting a key does not
+// end iteration early.
+//
+// Note: an object with an empty-string key ("") whose value is null yields an
+// empty but non-nil name with TypeNull, which differs from the end-of-iteration
+// sentinel only in that the name is non-nil. Callers that test len(name) == 0
+// instead of name == nil will stop early on such an entry — use ForEach for
+// objects that may contain one.
 func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
+	// Skip any NOP padding left by a prior delete before reading the key.
+	o.iterPos = o.tobj.tape.skipNopsUntil(o.iterPos, o.tobj.endIdx)
 	if o.iterPos >= o.tobj.endIdx {
 		return nil, TypeNull, nil
 	}
-	keyEntry := o.tobj.tape.data[o.iterPos]
-	if byte(keyEntry>>56) != tagString {
+	if o.tobj.tape.tapeTagAt(o.iterPos) != tagString {
 		return nil, TypeNull, nil
 	}
-	s, _ := o.tobj.tape.readStringBytes(keyEntry & payloadMask)
+	keyEntry := o.tobj.tape.data[o.iterPos]
+	s, err := o.tobj.tape.readStringBytes(keyEntry & payloadMask)
+	if err != nil {
+		return nil, TypeNull, err
+	}
+	if o.copyStrings {
+		cp := make([]byte, len(s))
+		copy(cp, s)
+		s = cp
+	}
 	valIdx := o.iterPos + 1
+	if valIdx >= len(o.tobj.tape.data) {
+		return nil, TypeNull, fmt.Errorf("truncated tape: key at %d has no value", o.iterPos)
+	}
 	if dst != nil {
 		dst.tape = o.tobj.tape
 		dst.tapeIdx = valIdx
 		dst.copyStrings = o.copyStrings
 		dst.useNumber = o.useNumber
 	}
-	t = Type(o.tobj.tape.data[valIdx] >> 56)
-	if byte(t) == tagFalse {
-		t = TypeBool
-	}
+	// Tag.Type() is the single source of truth for tag-to-Type mapping: it folds
+	// 'f' (false) into TypeBool and maps a zero tag to Type(-1).
+	t = Tag(o.tobj.tape.tapeTagAt(valIdx)).Type()
 	o.iterPos = o.tobj.tape.skipValue(valIdx)
 	return s, t, nil
 }
@@ -570,6 +633,17 @@ func (t *Tape) tapeSkipNop(idx int) int {
 	return idx + skip
 }
 
+// skipNopsUntil advances idx past any leading NOP entries, stopping before limit.
+// Mutation (DeleteElems, and the setters when they shrink a value) leaves NOP
+// padding on the tape; every walker must step over it before treating an index
+// as a value. Bounded by limit so it is safe to call at a container's end.
+func (t *Tape) skipNopsUntil(idx, limit int) int {
+	for idx < limit && t.tapeTagAt(idx) == tagNop {
+		idx = t.tapeSkipNop(idx)
+	}
+	return idx
+}
+
 // tapeNopRange fills tape[start:end] with NOP entries, each pointing to end.
 func (t *Tape) tapeNopRange(start, end int) {
 	for j := start; j < end; j++ {
@@ -598,6 +672,9 @@ func (i *Iter) SetFloat(v float64) error {
 	tag := ti.tag()
 	switch tag {
 	case tagDouble, tagInt64, tagUint64:
+		if !i.tape.hasValueWord(i.tapeIdx) {
+			return fmt.Errorf("truncated tape: numeric entry at %d has no value word", i.tapeIdx)
+		}
 		i.tape.tapeSetTag(i.tapeIdx, tagDouble)
 		i.tape.data[i.tapeIdx+1] = math.Float64bits(v)
 		return nil
@@ -612,6 +689,9 @@ func (i *Iter) SetInt(v int64) error {
 	tag := ti.tag()
 	switch tag {
 	case tagDouble, tagInt64, tagUint64:
+		if !i.tape.hasValueWord(i.tapeIdx) {
+			return fmt.Errorf("truncated tape: numeric entry at %d has no value word", i.tapeIdx)
+		}
 		i.tape.tapeSetTag(i.tapeIdx, tagInt64)
 		i.tape.data[i.tapeIdx+1] = uint64(v)
 		return nil
@@ -626,6 +706,9 @@ func (i *Iter) SetUInt(v uint64) error {
 	tag := ti.tag()
 	switch tag {
 	case tagDouble, tagInt64, tagUint64:
+		if !i.tape.hasValueWord(i.tapeIdx) {
+			return fmt.Errorf("truncated tape: numeric entry at %d has no value word", i.tapeIdx)
+		}
 		i.tape.tapeSetTag(i.tapeIdx, tagUint64)
 		i.tape.data[i.tapeIdx+1] = v
 		return nil
@@ -774,8 +857,9 @@ func (a *Array) DeleteElems(fn func(i Iter) bool) {
 	}
 }
 
-// AdvanceInto steps into a container (object/array) or advances to the next
-// element, skipping NOP entries. Returns the Tag of the current element.
+// AdvanceInto steps into a container (object/array), positioning at the first
+// child and skipping any NOP padding left by mutation. Returns TagEnd if the
+// element is not a container or the container has no remaining children.
 func (i *Iter) AdvanceInto() Tag {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	t := ti.AdvanceInto()
@@ -856,16 +940,25 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 		return dst, nil
 
 	case tagInt64:
-		v := int64(t.data[idx+1])
-		return strconv.AppendInt(dst, v, 10), nil
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return dst, err
+		}
+		return strconv.AppendInt(dst, int64(w), 10), nil
 
 	case tagUint64:
-		v := t.data[idx+1]
-		return strconv.AppendUint(dst, v, 10), nil
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return dst, err
+		}
+		return strconv.AppendUint(dst, w, 10), nil
 
 	case tagDouble:
-		v := math.Float64frombits(t.data[idx+1])
-		return appendJSONFloat(dst, v)
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return dst, err
+		}
+		return appendJSONFloat(dst, math.Float64frombits(w))
 
 	case tagTrue:
 		return append(dst, "true"...), nil

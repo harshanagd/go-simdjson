@@ -238,6 +238,485 @@ func TestTapeArrayAsFloat(t *testing.T) {
 	}
 }
 
+// deleteFromArray parses input, deletes every element for which drop returns
+// true via the mutation API, and returns a TapeArray over the resulting tape.
+// The deletions leave NOP padding behind, which is what these tests exercise.
+func deleteFromArray(t *testing.T, input string, drop func(i Iter) bool) (*ParsedJson, TapeArray) {
+	t.Helper()
+	pj, err := Parse([]byte(input), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatalf("Iter: %v", err)
+	}
+	arr, err := iter.Array(nil)
+	if err != nil {
+		t.Fatalf("Array: %v", err)
+	}
+	arr.DeleteElems(drop)
+
+	tape, err := pj.GetTape()
+	if err != nil {
+		t.Fatalf("GetTape: %v", err)
+	}
+	ti := tape.Iter()
+	tarr, err := ti.Array()
+	if err != nil {
+		t.Fatalf("TapeIter.Array: %v", err)
+	}
+	return pj, *tarr
+}
+
+// deleteFromObject is the object counterpart of deleteFromArray.
+func deleteFromObject(t *testing.T, input string, drop func(key []byte, i Iter) bool) (*ParsedJson, TapeObject) {
+	t.Helper()
+	pj, err := Parse([]byte(input), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	iter, err := pj.Iter()
+	if err != nil {
+		t.Fatalf("Iter: %v", err)
+	}
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	if err := obj.DeleteElems(drop, nil); err != nil {
+		t.Fatalf("DeleteElems: %v", err)
+	}
+
+	tape, err := pj.GetTape()
+	if err != nil {
+		t.Fatalf("GetTape: %v", err)
+	}
+	ti := tape.Iter()
+	tobj, err := ti.Object()
+	if err != nil {
+		t.Fatalf("TapeIter.Object: %v", err)
+	}
+	return pj, *tobj
+}
+
+// TestTapeArrayForEachSkipsNops covers the NOP padding DeleteElems leaves on the
+// tape. ForEach previously handed the callback an iterator sitting on a NOP,
+// whose Type() is a non-value, so every derived helper failed on any array that
+// had had an element removed.
+func TestTapeArrayForEachSkipsNops(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		drop  func(i Iter) bool
+		want  []int64
+	}{
+		{
+			name:  "delete_first",
+			input: `[1,2,3,4]`,
+			drop:  func(i Iter) bool { v, _ := i.Int(); return v == 1 },
+			want:  []int64{2, 3, 4},
+		},
+		{
+			name:  "delete_middle",
+			input: `[1,2,3,4]`,
+			drop:  func(i Iter) bool { v, _ := i.Int(); return v == 2 || v == 3 },
+			want:  []int64{1, 4},
+		},
+		{
+			name:  "delete_last",
+			input: `[1,2,3,4]`,
+			drop:  func(i Iter) bool { v, _ := i.Int(); return v == 4 },
+			want:  []int64{1, 2, 3},
+		},
+		{
+			name:  "delete_all",
+			input: `[1,2,3]`,
+			drop:  func(i Iter) bool { return true },
+			want:  []int64{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pj, arr := deleteFromArray(t, tt.input, tt.drop)
+			defer pj.Close()
+
+			var got []int64
+			err := arr.ForEach(func(val TapeIter) error {
+				v, err := val.Int()
+				if err != nil {
+					return err
+				}
+				got = append(got, v)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("ForEach: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("ForEach yielded %v, want %v", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("ForEach yielded %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestTapeArrayAsIntegerAfterDelete checks the derived helpers, which all route
+// through ForEach and so all inherited the NOP defect.
+func TestTapeArrayAsIntegerAfterDelete(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3,4]`, func(i Iter) bool {
+		v, _ := i.Int()
+		return v == 2
+	})
+	defer pj.Close()
+
+	got, err := arr.AsInteger()
+	if err != nil {
+		t.Fatalf("AsInteger after delete: %v", err)
+	}
+	want := []int64{1, 3, 4}
+	if len(got) != len(want) {
+		t.Fatalf("AsInteger = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("AsInteger = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestTapeArrayAsStringAfterDelete covers the string path, which fails on a NOP
+// with a type error rather than silently, since readString would be handed the
+// NOP's payload.
+func TestTapeArrayAsStringAfterDelete(t *testing.T) {
+	pj, arr := deleteFromArray(t, `["a","b","c"]`, func(i Iter) bool {
+		v, _ := i.String()
+		return v == "b"
+	})
+	defer pj.Close()
+
+	got, err := arr.AsString()
+	if err != nil {
+		t.Fatalf("AsString after delete: %v", err)
+	}
+	want := []string{"a", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("AsString = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("AsString = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestTapeArrayAsFloatAfterDelete covers the float path. Structurally identical
+// to the integer path but on a distinct tag, and doubles are 2-word entries so
+// the NOP run length differs.
+func TestTapeArrayAsFloatAfterDelete(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1.5,2.5,3.5]`, func(i Iter) bool {
+		v, _ := i.Float()
+		return v == 2.5
+	})
+	defer pj.Close()
+
+	got, err := arr.AsFloat()
+	if err != nil {
+		t.Fatalf("AsFloat after delete: %v", err)
+	}
+	want := []float64{1.5, 3.5}
+	if len(got) != len(want) {
+		t.Fatalf("AsFloat = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("AsFloat = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestTapeArrayForEachNestedAfterDelete exercises the one path the scalar tests
+// miss: skipValue taking its object/array branch on the element immediately
+// following a NOP run. A container advances via its header's end index rather
+// than a fixed width, so an off-by-one in the skip would land mid-container.
+func TestTapeArrayForEachNestedAfterDelete(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[{"x":1},{"y":2},{"z":3}]`, func(i Iter) bool {
+		obj, err := i.Object(nil)
+		if err != nil {
+			return false
+		}
+		return obj.FindKey("x", nil) != nil
+	})
+	defer pj.Close()
+
+	var keys []string
+	err := arr.ForEach(func(val TapeIter) error {
+		obj, err := val.Object()
+		if err != nil {
+			return err
+		}
+		return obj.ForEach(func(key string, _ TapeIter) error {
+			keys = append(keys, key)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("ForEach over nested objects after delete: %v", err)
+	}
+	if len(keys) != 2 || keys[0] != "y" || keys[1] != "z" {
+		t.Fatalf("keys = %v, want [y z]", keys)
+	}
+}
+
+// --- NOP handling across the remaining tape walkers ---
+//
+// Every walker below previously read the tape without stepping over the NOP
+// padding DeleteElems leaves behind, so each reported a NOP as if it were a
+// value. Deleting the FIRST entry is the discriminating case: the NOP then sits
+// exactly where the walker starts.
+
+func TestTapeArrayIterSkipsNops(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool {
+		v, _ := i.Int()
+		return v == 1
+	})
+	defer pj.Close()
+
+	it := arr.Iter()
+	if got := it.Type(); got != TypeInt64 {
+		t.Fatalf("Iter().Type() = %v, want %v", got, TypeInt64)
+	}
+	v, err := it.Int()
+	if err != nil || v != 2 {
+		t.Fatalf("Iter().Int() = %v, %v; want 2, nil", v, err)
+	}
+}
+
+func TestTapeArrayIterAllDeletedIsPastEnd(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool { return true })
+	defer pj.Close()
+
+	it := arr.Iter()
+	if got := it.Type(); got != Type(-1) {
+		t.Fatalf("Iter().Type() on fully deleted array = %v, want Type(-1)", got)
+	}
+}
+
+func TestTapeArrayFirstTypeSkipsNops(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool {
+		v, _ := i.Int()
+		return v == 1
+	})
+	defer pj.Close()
+
+	if got := arr.FirstType(); got != TypeInt64 {
+		t.Fatalf("FirstType() = %v, want %v", got, TypeInt64)
+	}
+
+	pj2, arr2 := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool { return true })
+	defer pj2.Close()
+	if got := arr2.FirstType(); got != Type(-1) {
+		t.Fatalf("FirstType() on fully deleted array = %v, want Type(-1)", got)
+	}
+}
+
+func TestTapeArrayInterfaceSkipsNops(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool {
+		v, _ := i.Int()
+		return v == 1
+	})
+	defer pj.Close()
+
+	// Before the fix this returned [nil 2 3]: readValue reports a NOP as a nil
+	// value, which the open-coded walk appended.
+	got, err := arr.Interface()
+	if err != nil {
+		t.Fatalf("Interface: %v", err)
+	}
+	if len(got) != 2 || got[0] != int64(2) || got[1] != int64(3) {
+		t.Fatalf("Interface() = %#v, want [2 3]", got)
+	}
+}
+
+func TestTapeArrayInterfaceUseNumberSkipsNops(t *testing.T) {
+	// Interface() now delegates to readArray/readArrayNum; check the UseNumber
+	// branch is still selected after the rewrite.
+	pj, err := Parse([]byte(`[1,2,3]`), nil, UseNumber())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	a, _ := iter.Array(nil)
+	a.DeleteElems(func(i Iter) bool { s, _ := i.StringCvt(); return s == "1" })
+
+	tape, _ := pj.GetTape()
+	ti := tape.Iter()
+	tarr, err := ti.Array()
+	if err != nil {
+		t.Fatalf("Array: %v", err)
+	}
+	got, err := tarr.Interface()
+	if err != nil {
+		t.Fatalf("Interface: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Interface() = %#v, want 2 elements", got)
+	}
+	if _, ok := got[0].(json.Number); !ok {
+		t.Fatalf("Interface()[0] = %T, want json.Number (UseNumber not honoured)", got[0])
+	}
+}
+
+func TestTapeObjectIterSkipsNops(t *testing.T) {
+	pj, obj := deleteFromObject(t, `{"a":1,"b":2}`, func(key []byte, i Iter) bool {
+		return string(key) == "a"
+	})
+	defer pj.Close()
+
+	it := obj.Iter()
+	if got := it.Type(); got != TypeString {
+		t.Fatalf("Iter().Type() = %v, want %v (the key \"b\")", got, TypeString)
+	}
+	k, err := it.String()
+	if err != nil || k != "b" {
+		t.Fatalf("Iter().String() = %q, %v; want \"b\", nil", k, err)
+	}
+}
+
+func TestTapeObjectIterAllDeletedIsPastEnd(t *testing.T) {
+	pj, obj := deleteFromObject(t, `{"a":1,"b":2}`, func(key []byte, i Iter) bool { return true })
+	defer pj.Close()
+
+	it := obj.Iter()
+	if got := it.Type(); got != Type(-1) {
+		t.Fatalf("Iter().Type() on fully deleted object = %v, want Type(-1)", got)
+	}
+}
+
+func TestTapeObjectMapSkipsNops(t *testing.T) {
+	pj, obj := deleteFromObject(t, `{"a":1,"b":2}`, func(key []byte, i Iter) bool {
+		return string(key) == "a"
+	})
+	defer pj.Close()
+
+	// Before the fix this returned an empty map with a nil error: the walk broke
+	// on the leading NOP's tag, silently discarding every remaining key.
+	m, err := obj.Map(nil)
+	if err != nil {
+		t.Fatalf("Map: %v", err)
+	}
+	if len(m) != 1 || m["b"] != int64(2) {
+		t.Fatalf("Map() = %#v, want map[b:2]", m)
+	}
+}
+
+func TestTapeObjectMapMergesIntoDst(t *testing.T) {
+	pj, obj := deleteFromObject(t, `{"a":1,"b":2}`, func(key []byte, i Iter) bool {
+		return string(key) == "a"
+	})
+	defer pj.Close()
+
+	dst := map[string]interface{}{"keep": "me", "b": "overwrite me"}
+	m, err := obj.Map(dst)
+	if err != nil {
+		t.Fatalf("Map: %v", err)
+	}
+	if m["keep"] != "me" {
+		t.Errorf("Map(dst) dropped a pre-existing key not present in the object")
+	}
+	if m["b"] != int64(2) {
+		t.Errorf("Map(dst)[\"b\"] = %#v, want 2 (existing key should be overwritten)", m["b"])
+	}
+}
+
+func TestTapeIterAdvanceSkipsNops(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool {
+		v, _ := i.Int()
+		return v == 2
+	})
+	defer pj.Close()
+
+	cur := arr.Iter()
+	if got := cur.Type(); got != TypeInt64 {
+		t.Fatalf("start Type() = %v, want %v", got, TypeInt64)
+	}
+	if got := cur.PeekNext(); got != TypeInt64 {
+		t.Fatalf("PeekNext() over a NOP run = %v, want %v", got, TypeInt64)
+	}
+	if got := cur.Advance(); got != TypeInt64 {
+		t.Fatalf("Advance() over a NOP run = %v, want %v", got, TypeInt64)
+	}
+	v, err := cur.Int()
+	if err != nil || v != 3 {
+		t.Fatalf("Int() after Advance = %v, %v; want 3, nil", v, err)
+	}
+}
+
+func TestTapeIterAdvanceIntoSkipsNops(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1,"b":2}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+	if err := obj.DeleteElems(func(key []byte, i Iter) bool { return string(key) == "a" }, nil); err != nil {
+		t.Fatalf("DeleteElems: %v", err)
+	}
+
+	tape, _ := pj.GetTape()
+	root := tape.Iter()
+	if got := root.AdvanceInto(); got != TypeString {
+		t.Fatalf("AdvanceInto() = %v, want %v (the key \"b\")", got, TypeString)
+	}
+	k, err := root.String()
+	if err != nil || k != "b" {
+		t.Fatalf("String() after AdvanceInto = %q, %v; want \"b\", nil", k, err)
+	}
+}
+
+func TestTapeIterAdvanceIntoEmptyContainer(t *testing.T) {
+	for _, input := range []string{`[]`, `{}`} {
+		t.Run(input, func(t *testing.T) {
+			pj, err := Parse([]byte(input), nil)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			defer pj.Close()
+			tape, _ := pj.GetTape()
+			ti := tape.Iter()
+			if got := ti.AdvanceInto(); got != Type(-1) {
+				t.Fatalf("AdvanceInto() on %s = %v, want Type(-1)", input, got)
+			}
+		})
+	}
+}
+
+func TestTapeIterAdvanceIntoFullyDeletedContainer(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+	if err := obj.DeleteElems(func(key []byte, i Iter) bool { return true }, nil); err != nil {
+		t.Fatalf("DeleteElems: %v", err)
+	}
+
+	tape, _ := pj.GetTape()
+	ti := tape.Iter()
+	if got := ti.AdvanceInto(); got != Type(-1) {
+		t.Fatalf("AdvanceInto() on a fully deleted object = %v, want Type(-1)", got)
+	}
+}
+
 func TestLargeNumbers(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -427,5 +906,527 @@ func TestTapeArrayInterface(t *testing.T) {
 	}
 	if len(v) != 3 || v[0] != int64(1) || v[1] != "two" || v[2] != true {
 		t.Fatalf("expected [1,two,true], got %v", v)
+	}
+}
+
+// --- #8: UseNumber reaches the tape API ---
+
+func TestUseNumberAppliesToTapeAPI(t *testing.T) {
+	pj, err := Parse([]byte(`{"n":42,"arr":[1,2]}`), nil, UseNumber())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	// Tape.Interface via ParsedJson
+	v, err := pj.TapeInterface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := v.(map[string]interface{})
+	if _, ok := m["n"].(json.Number); !ok {
+		t.Errorf("TapeInterface ignored UseNumber: got %T", m["n"])
+	}
+
+	tape, err := pj.GetTape()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// TapeIter.Interface
+	ti := tape.Iter()
+	tv, err := ti.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tv.(map[string]interface{})["n"].(json.Number); !ok {
+		t.Error("TapeIter.Interface ignored UseNumber")
+	}
+
+	obj, err := ti.Object()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// TapeObject.Map
+	mp, err := obj.Map(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mp["n"].(json.Number); !ok {
+		t.Errorf("TapeObject.Map ignored UseNumber: got %T", mp["n"])
+	}
+
+	// TapeArray.Interface
+	arrIter := obj.FindKey("arr")
+	if arrIter == nil {
+		t.Fatal("key 'arr' not found")
+	}
+	arr, err := arrIter.Array()
+	if err != nil {
+		t.Fatal(err)
+	}
+	av, err := arr.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := av[0].(json.Number); !ok {
+		t.Errorf("TapeArray.Interface ignored UseNumber: got %T", av[0])
+	}
+}
+
+func TestUseNumberSurvivesTapeClone(t *testing.T) {
+	pj, err := Parse([]byte(`{"n":42}`), nil, UseNumber())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloned := pj.Clone(nil)
+	pj.Close()
+
+	v, err := cloned.TapeInterface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v.(map[string]interface{})["n"].(json.Number); !ok {
+		t.Error("Tape.Clone dropped useNumber")
+	}
+}
+
+// TestTapeObjectForEachPropagatesKeyError covers the readString error that
+// ForEach previously discarded (`key, _ :=`), which silently yielded an empty
+// key rather than reporting a corrupt string offset. Not reachable from Parse,
+// so the tape is built directly; a corrupt tape is reachable in practice via
+// Serializer.Deserialize, which performs no structural validation.
+func TestTapeObjectForEachPropagatesKeyError(t *testing.T) {
+	// Key entry's payload points past the end of the string buffer.
+	keyEntry := uint64(tagString)<<56 | 64
+	tape := &Tape{
+		data:        []uint64{0, keyEntry, uint64(tagNull) << 56},
+		strings:     make([]byte, 8),
+		copyStrings: true,
+	}
+	obj := &TapeObject{tape: tape, startIdx: 1, endIdx: 3}
+
+	called := false
+	err := obj.ForEach(func(key string, val TapeIter) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("ForEach accepted an out-of-range key offset without an error")
+	}
+	if called {
+		t.Error("callback was invoked despite the key failing to decode")
+	}
+
+	// Map delegates to ForEach, so it must surface the same error.
+	if _, err := obj.Map(nil); err == nil {
+		t.Error("Map did not propagate ForEach's key error")
+	}
+}
+
+// TestTapeObjectFindKeySkipsNops covers the FindKey guard conversion. Deleting
+// the FIRST key puts a NOP exactly where the scan starts, so an unguarded scan
+// breaks immediately and reports every remaining key as missing.
+func TestTapeObjectFindKeySkipsNops(t *testing.T) {
+	pj, obj := deleteFromObject(t, `{"a":1,"b":2,"c":3}`, func(key []byte, i Iter) bool {
+		return string(key) == "a"
+	})
+	defer pj.Close()
+
+	for _, want := range []struct {
+		key string
+		val int64
+	}{{"b", 2}, {"c", 3}} {
+		it := obj.FindKey(want.key)
+		if it == nil {
+			t.Fatalf("FindKey(%q) = nil after deleting a preceding key", want.key)
+		}
+		v, err := it.Int()
+		if err != nil || v != want.val {
+			t.Fatalf("FindKey(%q).Int() = %v, %v; want %d, nil", want.key, v, err, want.val)
+		}
+	}
+	if obj.FindKey("a") != nil {
+		t.Error("FindKey found the deleted key")
+	}
+}
+
+// TestReadObjectSkipsNops reaches readObject/readObjectNum, the object twins of
+// readArray/readArrayNum. Map no longer routes through them (it delegates to
+// ForEach), so a whole-value Interface() on a mutated object is the only path.
+func TestReadObjectSkipsNops(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []ParserOption
+		want interface{}
+	}{
+		{"readObject", nil, int64(2)},
+		{"readObjectNum", []ParserOption{UseNumber()}, json.Number("2")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pj, err := Parse([]byte(`{"outer":{"a":1,"b":2}}`), nil, tc.opts...)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			defer pj.Close()
+
+			iter, _ := pj.Iter()
+			outer, _ := iter.Object(nil)
+			inner, err := outer.FindKey("outer", nil).Iter.Object(nil)
+			if err != nil {
+				t.Fatalf("inner Object: %v", err)
+			}
+			if err := inner.DeleteElems(func(key []byte, i Iter) bool {
+				return string(key) == "a"
+			}, nil); err != nil {
+				t.Fatalf("DeleteElems: %v", err)
+			}
+
+			tape, _ := pj.GetTape()
+			v, err := tape.Interface()
+			if err != nil {
+				t.Fatalf("Tape.Interface after delete: %v", err)
+			}
+			m, ok := v.(map[string]interface{})
+			if !ok {
+				t.Fatalf("Interface() = %T, want map", v)
+			}
+			got, ok := m["outer"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("outer = %T, want map", m["outer"])
+			}
+			if len(got) != 1 || got["b"] != tc.want {
+				t.Fatalf("outer = %#v, want map[b:%#v]", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTapeBoolAfterNop covers a NOP skip landing on a `false` element, which the
+// int64-based tests above do not reach. The raw tag is 'f' and must be reported
+// as TypeBool.
+//
+// Note this does NOT discriminate the switch to Tag.Type() in FirstType and
+// PeekNext: the inline `if tag == tagFalse` form they replaced maps `false`
+// identically. Tag.Type() differs only on a zero tag (TagEnd -> Type(-1)), which
+// a well-formed parse never produces — see the RootType issue for that case.
+func TestTapeBoolAfterNop(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,false,true]`, func(i Iter) bool {
+		v, err := i.Int()
+		return err == nil && v == 1
+	})
+	defer pj.Close()
+
+	if got := arr.FirstType(); got != TypeBool {
+		t.Errorf("FirstType() after a NOP, on `false` = %v, want %v", got, TypeBool)
+	}
+
+	// PeekNext across a NOP onto `false`.
+	pj2, err := Parse([]byte(`[1,2,false]`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj2.Close()
+	iter, _ := pj2.Iter()
+	a, _ := iter.Array(nil)
+	a.DeleteElems(func(i Iter) bool { v, err := i.Int(); return err == nil && v == 2 })
+
+	tape, _ := pj2.GetTape()
+	rootIter := tape.Iter()
+	tarr, err := rootIter.Array()
+	if err != nil {
+		t.Fatalf("Array: %v", err)
+	}
+	cur := tarr.Iter()
+	if got := cur.PeekNext(); got != TypeBool {
+		t.Errorf("PeekNext() across a NOP, onto `false` = %v, want %v", got, TypeBool)
+	}
+}
+
+// TestTapeIterExhaustedAccessorsDoNotPanic covers the consequence of Iter()
+// positioning past the tape for an empty container: every accessor must return
+// an error rather than indexing out of range.
+func TestTapeIterExhaustedAccessorsDoNotPanic(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool { return true })
+	defer pj.Close()
+
+	it := arr.Iter()
+	if got := it.Type(); got != Type(-1) {
+		t.Fatalf("Type() = %v, want Type(-1)", got)
+	}
+	if _, err := it.Int(); err == nil {
+		t.Error("Int() on an exhausted iterator returned no error")
+	}
+	if _, err := it.Uint(); err == nil {
+		t.Error("Uint() on an exhausted iterator returned no error")
+	}
+	if _, err := it.Float(); err == nil {
+		t.Error("Float() on an exhausted iterator returned no error")
+	}
+	if _, err := it.Bool(); err == nil {
+		t.Error("Bool() on an exhausted iterator returned no error")
+	}
+	if _, err := it.String(); err == nil {
+		t.Error("String() on an exhausted iterator returned no error")
+	}
+	if _, err := it.Object(); err == nil {
+		t.Error("Object() on an exhausted iterator returned no error")
+	}
+	if _, err := it.Array(); err == nil {
+		t.Error("Array() on an exhausted iterator returned no error")
+	}
+	if got := it.AdvanceInto(); got != Type(-1) {
+		t.Errorf("AdvanceInto() on an exhausted iterator = %v, want Type(-1)", got)
+	}
+	// Advance and PeekNext call skipValue, which reads the tag at the cursor, so
+	// they need the bound checked on the INPUT rather than only on the result.
+	if got := it.Advance(); got != Type(-1) {
+		t.Errorf("Advance() on an exhausted iterator = %v, want Type(-1)", got)
+	}
+	if got := it.PeekNext(); got != Type(-1) {
+		t.Errorf("PeekNext() on an exhausted iterator = %v, want Type(-1)", got)
+	}
+}
+
+// TestIterExhaustedPeekNextTagDoesNotPanic is the Iter-layer counterpart: it
+// builds its own skipValue call and so needs its own input guard.
+func TestIterExhaustedPeekNextTagDoesNotPanic(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool { return true })
+	defer pj.Close()
+
+	cur := arr.Iter()
+	ei := Iter{tape: cur.tape, tapeIdx: cur.idx}
+	if got := ei.PeekNextTag(); got != TagEnd {
+		t.Errorf("PeekNextTag() on an exhausted iterator = %q, want TagEnd", rune(got))
+	}
+	if got := ei.Advance(); got != Type(-1) {
+		t.Errorf("Iter.Advance() on an exhausted iterator = %v, want Type(-1)", got)
+	}
+	if got := ei.PeekNext(); got != Type(-1) {
+		t.Errorf("Iter.PeekNext() on an exhausted iterator = %v, want Type(-1)", got)
+	}
+	if got := ei.AdvanceInto(); got != TagEnd {
+		t.Errorf("Iter.AdvanceInto() on an exhausted iterator = %q, want TagEnd", rune(got))
+	}
+	var dst Iter
+	if got, err := ei.AdvanceIter(&dst); got != Type(-1) || err != nil {
+		t.Errorf("AdvanceIter() on an exhausted iterator = %v, %v; want Type(-1), nil", got, err)
+	}
+}
+
+// TestRootTypeAgreesAcrossLayers covers the tag-to-Type mapping at the root.
+// Tape.RootType previously returned the raw tag, so a document whose root is
+// `false` reported unknown(102) while ParsedJson.RootType (which routes through
+// TapeIter.Type) reported bool — the two disagreed on the same document.
+func TestRootTypeAgreesAcrossLayers(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  Type
+	}{
+		{`false`, TypeBool},
+		{`true`, TypeBool},
+		{`{"a":1}`, TypeObject},
+		{`[1]`, TypeArray},
+		{`"s"`, TypeString},
+		{`1`, TypeInt64},
+		{`1.5`, TypeDouble},
+		{`null`, TypeNull},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			pj, err := Parse([]byte(tc.input), nil)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			defer pj.Close()
+			tape, err := pj.GetTape()
+			if err != nil {
+				t.Fatalf("GetTape: %v", err)
+			}
+			if got := tape.RootType(); got != tc.want {
+				t.Errorf("Tape.RootType() = %v, want %v", got, tc.want)
+			}
+			if got := pj.RootType(); got != tc.want {
+				t.Errorf("ParsedJson.RootType() = %v, want %v", got, tc.want)
+			}
+			ti := tape.Iter()
+			if got := ti.Type(); got != tc.want {
+				t.Errorf("TapeIter.Type() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestZeroTagReportsEndSentinel covers an in-bounds zero tag, which a well-formed
+// parse never produces but Serializer.Deserialize can yield from a corrupt
+// payload since it performs no structural validation. Every accessor must agree
+// that it is the end sentinel rather than one calling it Type(0).
+func TestZeroTagReportsEndSentinel(t *testing.T) {
+	tape := &Tape{data: []uint64{
+		uint64(tagRoot) << 56,
+		0, // zero tag where the root value should be
+	}}
+
+	if got := tape.RootType(); got != Type(-1) {
+		t.Errorf("Tape.RootType() on a zero tag = %v, want Type(-1)", got)
+	}
+	ti := TapeIter{tape: tape, idx: 1}
+	if got := ti.Type(); got != Type(-1) {
+		t.Errorf("TapeIter.Type() on a zero tag = %v, want Type(-1)", got)
+	}
+	if got := Tag(tape.tapeTagAt(1)).Type(); got != Type(-1) {
+		t.Errorf("Tag.Type() on a zero tag = %v, want Type(-1)", got)
+	}
+}
+
+// TestTapeArrayForEachTrailingNop covers a NOP run at the very END of a
+// container, where the post-advance skip must stop rather than yielding the
+// padding as a value.
+//
+// It is a boundary case, not an overrun guard: the closing bracket halts the
+// scan and the `pos < endIdx` loop bound blocks callbacks past end, so a
+// too-large skip limit would be masked here.
+func TestTapeArrayForEachTrailingNop(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool {
+		v, _ := i.Int()
+		return v == 2 || v == 3
+	})
+	defer pj.Close()
+
+	var got []int64
+	if err := arr.ForEach(func(val TapeIter) error {
+		v, err := val.Int()
+		if err != nil {
+			return err
+		}
+		got = append(got, v)
+		return nil
+	}); err != nil {
+		t.Fatalf("ForEach: %v", err)
+	}
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("ForEach = %v, want [1]", got)
+	}
+}
+
+// --- #12: a tape truncated between a numeric tag word and its value word ---
+//
+// Parse never produces this, but Serializer.Deserialize rebuilds a Tape from
+// arbitrary bytes with only length-prefix checks and no structural validation, so
+// a corrupt payload can. Every read of the second word must error rather than
+// index out of range. The tapes below are built directly because the guard is not
+// reachable through the public parse path.
+
+// truncatedNumericTape returns a tape whose last entry is a numeric TAG with no
+// following value word, and a cursor positioned on it.
+func truncatedNumericTape(tag byte) (*Tape, TapeIter) {
+	tp := &Tape{data: []uint64{
+		uint64(tagRoot) << 56,
+		uint64(tag) << 56, // tag word at index 1, no value word at index 2
+	}}
+	return tp, TapeIter{tape: tp, idx: 1}
+}
+
+func TestTapeIterNumericAccessorsOnTruncatedTape(t *testing.T) {
+	t.Run("Int", func(t *testing.T) {
+		_, ti := truncatedNumericTape(tagInt64)
+		if _, err := ti.Int(); err == nil {
+			t.Error("Int() on a truncated int64 entry returned no error")
+		}
+	})
+	t.Run("Uint_from_uint_tag", func(t *testing.T) {
+		_, ti := truncatedNumericTape(tagUint64)
+		if _, err := ti.Uint(); err == nil {
+			t.Error("Uint() on a truncated uint64 entry returned no error")
+		}
+	})
+	t.Run("Uint_from_int_tag", func(t *testing.T) {
+		// Uint also accepts an int64 tag, a second path to the same read.
+		_, ti := truncatedNumericTape(tagInt64)
+		if _, err := ti.Uint(); err == nil {
+			t.Error("Uint() on a truncated int64 entry returned no error")
+		}
+	})
+	for _, tag := range []struct {
+		name string
+		tag  byte
+	}{{"double", tagDouble}, {"int", tagInt64}, {"uint", tagUint64}} {
+		t.Run("Float_from_"+tag.name, func(t *testing.T) {
+			// Float accepts all three numeric tags, so each is a distinct read.
+			_, ti := truncatedNumericTape(tag.tag)
+			if _, err := ti.Float(); err == nil {
+				t.Errorf("Float() on a truncated %s entry returned no error", tag.name)
+			}
+		})
+	}
+}
+
+func TestReadValueOnTruncatedTape(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tag       byte
+		useNumber bool
+	}{
+		{"readValue_int", tagInt64, false},
+		{"readValue_uint", tagUint64, false},
+		{"readValue_double", tagDouble, false},
+		{"readValueNum_int", tagInt64, true},
+		{"readValueNum_uint", tagUint64, true},
+		{"readValueNum_double", tagDouble, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp, ti := truncatedNumericTape(tc.tag)
+			tp.useNumber = tc.useNumber
+
+			// TapeIter.Interface routes to readValue / readValueNum.
+			if _, err := ti.Interface(); err == nil {
+				t.Error("TapeIter.Interface() on a truncated numeric entry returned no error")
+			}
+			// Tape.Interface enters at index 1, the same entry.
+			if _, err := tp.Interface(); err == nil {
+				t.Error("Tape.Interface() on a truncated numeric entry returned no error")
+			}
+		})
+	}
+}
+
+func TestMarshalTapeOnTruncatedTape(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tag  byte
+	}{{"int", tagInt64}, {"uint", tagUint64}, {"double", tagDouble}} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp, _ := truncatedNumericTape(tc.tag)
+			it := Iter{tape: tp, tapeIdx: 1}
+			if _, err := it.MarshalJSON(); err == nil {
+				t.Errorf("MarshalJSON() on a truncated %s entry returned no error", tc.name)
+			}
+		})
+	}
+}
+
+// TestStringCvtOnTruncatedTape covers the layer above the numeric accessors: both
+// StringCvt implementations previously discarded their error (`v, _ := ti.Int()`),
+// so a truncated numeric entry produced "0" with a nil error instead of surfacing
+// the failure. Array.AsStringCvt inherits the fix by delegation.
+func TestStringCvtOnTruncatedTape(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tag  byte
+	}{{"int", tagInt64}, {"uint", tagUint64}, {"double", tagDouble}} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp, ti := truncatedNumericTape(tc.tag)
+
+			s, err := ti.StringCvt()
+			if err == nil {
+				t.Errorf("TapeIter.StringCvt() on a truncated %s entry returned %q with no error", tc.name, s)
+			}
+
+			it := Iter{tape: tp, tapeIdx: 1}
+			s, err = it.StringCvt()
+			if err == nil {
+				t.Errorf("Iter.StringCvt() on a truncated %s entry returned %q with no error", tc.name, s)
+			}
+		})
 	}
 }

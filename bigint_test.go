@@ -193,3 +193,81 @@ func TestBigIntInArray(t *testing.T) {
 		t.Fatalf("[2]: expected int64, got %T", arr[2])
 	}
 }
+
+// TestBigIntStringCvt covers StringCvt at both layers. Both switches lacked a
+// TypeBigInt arm, so a big integer fell to the default and errored — despite the
+// digits being stored verbatim in the string buffer and trivially returnable.
+func TestBigIntStringCvt(t *testing.T) {
+	pj, err := Parse([]byte(bigIntJSON), nil, UseBigInt())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+
+	const wantBig = "123456789012345678901"
+	const wantNeg = "-99999999999999999999999"
+
+	// Iter layer.
+	iter, _ := pj.Iter()
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	for key, want := range map[string]string{"big": wantBig, "neg": wantNeg, "small": "42"} {
+		got, err := obj.FindKey(key, nil).Iter.StringCvt()
+		if err != nil {
+			t.Errorf("Iter.StringCvt(%q): %v", key, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("Iter.StringCvt(%q) = %q, want %q", key, got, want)
+		}
+	}
+
+	// Tape layer.
+	tape, _ := pj.GetTape()
+	ti := tape.Iter()
+	tobj, err := ti.Object()
+	if err != nil {
+		t.Fatalf("TapeIter.Object: %v", err)
+	}
+	for key, want := range map[string]string{"big": wantBig, "neg": wantNeg, "small": "42"} {
+		got, err := tobj.FindKey(key).StringCvt()
+		if err != nil {
+			t.Errorf("TapeIter.StringCvt(%q): %v", key, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("TapeIter.StringCvt(%q) = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// TestBigIntAsStringCvt confirms Array.AsStringCvt inherits the fix rather than
+// needing its own — it delegates to Iter.StringCvt per element.
+func TestBigIntAsStringCvt(t *testing.T) {
+	pj, err := Parse([]byte(`[1,123456789012345678901,2.5,"s",true,null]`), nil, UseBigInt())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, err := iter.Array(nil)
+	if err != nil {
+		t.Fatalf("Array: %v", err)
+	}
+	got, err := arr.AsStringCvt()
+	if err != nil {
+		t.Fatalf("AsStringCvt: %v", err)
+	}
+	want := []string{"1", "123456789012345678901", "2.5", "s", "true", "null"}
+	if len(got) != len(want) {
+		t.Fatalf("AsStringCvt = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("AsStringCvt = %v, want %v", got, want)
+		}
+	}
+}

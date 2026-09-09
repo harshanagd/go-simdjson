@@ -18,28 +18,41 @@ import (
 // ParseND parses newline-delimited JSON (ndjson) using C++ simdjson's
 // parse_many for SIMD-accelerated batch processing. Each line is a separate
 // JSON value. The returned ParsedJson contains all values in a combined tape.
+//
+// As with Parse, parser options apply only to this call, and on error the
+// returned ParsedJson is non-nil and holds no tape.
 func ParseND(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, error) {
 	b = bytes.TrimSpace(b)
-	if len(b) == 0 {
-		return nil, fmt.Errorf("empty input")
-	}
 
 	pj := reuse
 	if pj == nil {
 		pj = newParsedJson()
 	}
+	// Reset options to their defaults before applying opts — see Parse.
+	pj.copyStrings = true
+	pj.useNumber = false
+	pj.bigInt = false
 	for _, opt := range opts {
 		opt(pj)
 	}
 
+	if len(b) == 0 {
+		pj.hasTape = false
+		pj.tape = Tape{}
+		return pj, fmt.Errorf("empty input")
+	}
+
 	res := C.simdjson_parse_many(pj.parser, (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b)))
 	if res.result.ok == 0 {
-		return nil, fmt.Errorf("%s", C.GoString(res.result.error_msg))
+		pj.hasTape = false
+		pj.tape = Tape{}
+		return pj, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
 	pj.tape = Tape{
 		data:        copyUint64Slice(unsafe.Pointer(res.tape), int(res.tape_len)),
 		strings:     copyByteSlice(unsafe.Pointer(res.sbuf), int(res.sbuf_len)),
 		copyStrings: pj.copyStrings,
+		useNumber:   pj.useNumber,
 	}
 	pj.hasTape = true
 	return pj, nil

@@ -77,13 +77,15 @@ func (tag Tag) Type() Type {
 //     string is stored as a 4-byte native-endian length prefix followed by the
 //     UTF-8 bytes and a null terminator. This is NOT the original input buffer.
 //
-// Both buffers are owned by the C++ parser and are overwritten on the next
-// Parse() call or freed on Close(). The Tape struct points directly into
-// this C memory — no copies are made.
+// Both C++ buffers are owned by the parser and are overwritten on the next
+// Parse() call or freed on Close(). The Tape does NOT point into them: Parse
+// copies both into Go-managed slices, so a Tape and every string obtained from it
+// remain valid for the lifetime of the Tape, independently of the C++ parser.
 type Tape struct {
 	data        []uint64
 	strings     []byte
 	copyStrings bool
+	useNumber   bool
 }
 
 // GetTape returns the tape extracted during Parse. Zero-cost after parse.
@@ -100,7 +102,7 @@ func (t *Tape) Clone() *Tape {
 	copy(d, t.data)
 	s := make([]byte, len(t.strings))
 	copy(s, t.strings)
-	return &Tape{data: d, strings: s, copyStrings: t.copyStrings}
+	return &Tape{data: d, strings: s, copyStrings: t.copyStrings, useNumber: t.useNumber}
 }
 
 // TapeInterface converts the entire document to Go native types via pure Go
@@ -123,11 +125,12 @@ func (pj *ParsedJson) TapeInterfaceUseNumber() (interface{}, error) {
 }
 
 // RootType returns the type of the root element.
+// Returns Type(-1) for an empty tape or a zero tag.
 func (t *Tape) RootType() Type {
 	if len(t.data) < 2 {
 		return Type(-1)
 	}
-	return Type(t.data[1] >> 56)
+	return Tag(t.tapeTagAt(1)).Type()
 }
 
 // Iter returns a TapeIter positioned at the root element.
@@ -142,16 +145,12 @@ type TapeIter struct {
 }
 
 // Type returns the JSON type at the current position.
+// Returns Type(-1) when the cursor is past the end of the tape.
 func (ti *TapeIter) Type() Type {
-	if ti.idx >= len(ti.tape.data) {
-		return Type(-1)
-	}
-	tag := byte(ti.tape.data[ti.idx] >> 56)
-	// Normalize: 'f' (false) → 't' (bool)
-	if tag == tagFalse {
-		return TypeBool
-	}
-	return Type(tag)
+	// Tag.Type() is the single source of truth for the tag-to-Type mapping: it
+	// folds 'f' (false) into TypeBool and maps a zero tag to Type(-1). tag()
+	// already yields a zero tag when the cursor is past end.
+	return Tag(ti.tag()).Type()
 }
 
 // String returns the string value at the current position.
@@ -176,20 +175,28 @@ func (ti *TapeIter) Int() (int64, error) {
 	if ti.tag() != tagInt64 {
 		return 0, fmt.Errorf("element is not an int64")
 	}
-	return int64(ti.tape.data[ti.idx+1]), nil
+	w, err := ti.tape.valueWord(ti.idx)
+	if err != nil {
+		return 0, err
+	}
+	return int64(w), nil
 }
 
 // Uint returns the uint64 value at the current position.
 func (ti *TapeIter) Uint() (uint64, error) {
 	tag := ti.tag()
-	if tag == tagUint64 {
-		return ti.tape.data[ti.idx+1], nil
+	if tag != tagUint64 && tag != tagInt64 {
+		return 0, fmt.Errorf("element is not a uint64")
 	}
-	if tag == tagInt64 {
-		v := int64(ti.tape.data[ti.idx+1])
-		if v >= 0 {
-			return uint64(v), nil
-		}
+	w, err := ti.tape.valueWord(ti.idx)
+	if err != nil {
+		return 0, err
+	}
+	if tag == tagUint64 {
+		return w, nil
+	}
+	if v := int64(w); v >= 0 {
+		return uint64(v), nil
 	}
 	return 0, fmt.Errorf("element is not a uint64")
 }
@@ -197,16 +204,21 @@ func (ti *TapeIter) Uint() (uint64, error) {
 // Float returns the float64 value at the current position.
 func (ti *TapeIter) Float() (float64, error) {
 	tag := ti.tag()
-	if tag == tagDouble {
-		return math.Float64frombits(ti.tape.data[ti.idx+1]), nil
+	if tag != tagDouble && tag != tagInt64 && tag != tagUint64 {
+		return 0, fmt.Errorf("element is not a double")
 	}
-	if tag == tagInt64 {
-		return float64(int64(ti.tape.data[ti.idx+1])), nil
+	w, err := ti.tape.valueWord(ti.idx)
+	if err != nil {
+		return 0, err
 	}
-	if tag == tagUint64 {
-		return float64(ti.tape.data[ti.idx+1]), nil
+	switch tag {
+	case tagDouble:
+		return math.Float64frombits(w), nil
+	case tagInt64:
+		return float64(int64(w)), nil
+	default:
+		return float64(w), nil
 	}
-	return 0, fmt.Errorf("element is not a double")
 }
 
 // Bool returns the bool value at the current position.
@@ -242,12 +254,63 @@ func (ti *TapeIter) Array() (*TapeArray, error) {
 }
 
 // Interface converts the element to its Go native equivalent.
+// Respects the UseNumber() option set during Parse — numeric values are
+// returned as json.Number when it is enabled.
 func (ti *TapeIter) Interface() (interface{}, error) {
+	if ti.tape.useNumber {
+		val, _, err := ti.tape.readValueNum(ti.idx)
+		return val, err
+	}
 	val, _, err := ti.tape.readValue(ti.idx)
 	return val, err
 }
 
-func (ti *TapeIter) tag() byte   { return byte(ti.tape.data[ti.idx] >> 56) }
+// pastEnd reports whether the cursor is outside the tape. Iter() on an empty or
+// fully deleted container deliberately returns such a cursor, so any method that
+// reads the tape before checking a bound must consult this first.
+func (ti *TapeIter) pastEnd() bool {
+	return ti.idx < 0 || ti.idx >= len(ti.tape.data)
+}
+
+// valueWord returns the second word of a two-word tape entry at idx — the raw
+// numeric payload of a tagInt64, tagUint64 or tagDouble entry.
+//
+// A tape truncated between a numeric tag word and its value word cannot come out
+// of Parse, but Serializer.Deserialize reconstructs a tape from arbitrary bytes
+// with only length-prefix checks and no structural validation, so a corrupt
+// payload can produce one. Every read of the second word goes through here so
+// that case surfaces as an error rather than an index-out-of-range panic.
+//
+// The presence test cannot look at the word itself: the second word of a numeric
+// entry is raw value bits, not a tape entry, so its top byte is not a tag —
+// it is zero for any value below 2^56. Only the slice length can answer this.
+func (t *Tape) valueWord(idx int) (uint64, error) {
+	if !t.hasValueWord(idx) {
+		return 0, fmt.Errorf("truncated tape: numeric entry at %d has no value word", idx)
+	}
+	return t.data[idx+1], nil
+}
+
+// hasValueWord reports whether the two-word entry at idx has its value word. This
+// is the single bound test for the second word; valueWord is its error-returning
+// form for readers, while the mutation setters call it directly because they
+// overwrite that word rather than reading it.
+func (t *Tape) hasValueWord(idx int) bool {
+	return idx >= 0 && idx+1 < len(t.data)
+}
+
+// tag returns the tag byte at the cursor, or 0 (tagEnd) when the cursor is past
+// the end of the tape. Returning tagEnd rather than panicking means every
+// accessor's tag comparison simply fails, so an exhausted iterator — including
+// one from Iter() on an empty or fully deleted container — yields an error
+// instead of an index-out-of-range panic.
+func (ti *TapeIter) tag() byte {
+	if ti.pastEnd() {
+		return byte(TagEnd)
+	}
+	return byte(ti.tape.data[ti.idx] >> 56)
+}
+
 func (ti *TapeIter) payload() uint64 { return ti.tape.data[ti.idx] & payloadMask }
 
 // skipValue returns the tape index after the value at idx.
@@ -273,69 +336,68 @@ type TapeObject struct {
 }
 
 // FindKey finds a key in the object. Returns nil if not found.
+// NOP padding left behind by DeleteElems is skipped.
 func (o *TapeObject) FindKey(key string) *TapeIter {
-	pos := o.startIdx
+	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	for pos < o.endIdx {
-		tag := o.tape.tapeTagAt(pos)
-		if tag == tagNop {
-			pos = o.tape.tapeSkipNop(pos)
-			continue
-		}
-		if tag != tagString {
+		if o.tape.tapeTagAt(pos) != tagString {
 			break
 		}
+		// A key that fails to decode cannot match, so skip past it. FindKey has
+		// no error return; use ForEach if you need the failure reported.
 		k, _ := o.tape.readString(o.tape.tapePayloadAt(pos))
 		valIdx := pos + 1
 		if k == key {
 			return &TapeIter{tape: o.tape, idx: valIdx}
 		}
-		pos = o.tape.skipValue(valIdx)
+		pos = o.tape.skipNopsUntil(o.tape.skipValue(valIdx), o.endIdx)
 	}
 	return nil
 }
 
 // ForEach iterates over all key-value pairs.
+// NOP padding left behind by DeleteElems is skipped.
 func (o *TapeObject) ForEach(fn func(key string, val TapeIter) error) error {
-	pos := o.startIdx
+	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	for pos < o.endIdx {
-		tag := o.tape.tapeTagAt(pos)
-		if tag == tagNop {
-			pos = o.tape.tapeSkipNop(pos)
-			continue
-		}
-		if tag != tagString {
+		if o.tape.tapeTagAt(pos) != tagString {
 			break
 		}
-		key, _ := o.tape.readString(o.tape.tapePayloadAt(pos))
+		key, err := o.tape.readString(o.tape.tapePayloadAt(pos))
+		if err != nil {
+			return err
+		}
 		valIdx := pos + 1
 		if err := fn(key, TapeIter{tape: o.tape, idx: valIdx}); err != nil {
 			return err
 		}
-		pos = o.tape.skipValue(valIdx)
+		pos = o.tape.skipNopsUntil(o.tape.skipValue(valIdx), o.endIdx)
 	}
 	return nil
 }
 
 // Map converts the object to map[string]interface{}.
+// Respects the UseNumber() option set during Parse.
+// If dst is non-nil, entries are added to it: existing keys are overwritten but
+// extra keys are not deleted. Pass nil for a fresh map.
+// On error the returned map is the partially populated dst, since a caller-supplied
+// dst has already been written to by the time a later entry fails.
 func (o *TapeObject) Map(dst map[string]interface{}) (map[string]interface{}, error) {
 	if dst == nil {
 		dst = make(map[string]interface{}, o.Count())
 	}
-	pos := o.startIdx
-	for pos < o.endIdx {
-		keyEntry := o.tape.data[pos]
-		if byte(keyEntry>>56) != tagString {
-			break
-		}
-		key, _ := o.tape.readString(keyEntry & payloadMask)
-		val, nextPos, err := o.tape.readValue(pos + 1)
+	// Delegate to ForEach rather than walking the range here: it skips the NOP
+	// padding DeleteElems leaves behind (an open-coded walk stops at the first
+	// deleted key), and val.Interface() honours UseNumber for free.
+	err := o.ForEach(func(key string, val TapeIter) error {
+		v, err := val.Interface()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		dst[key] = val
-		pos = nextPos
-	}
-	return dst, nil
+		dst[key] = v
+		return nil
+	})
+	return dst, err
 }
 
 // Count returns the number of key-value pairs.
@@ -373,13 +435,15 @@ type TapeArray struct {
 }
 
 // ForEach iterates over all elements.
+// NOP padding left behind by DeleteElems is skipped, both before the first
+// element and after each advance, so fn is only ever invoked on real values.
 func (a *TapeArray) ForEach(fn func(val TapeIter) error) error {
-	pos := a.startIdx
+	pos := a.tape.skipNopsUntil(a.startIdx, a.endIdx)
 	for pos < a.endIdx {
 		if err := fn(TapeIter{tape: a.tape, idx: pos}); err != nil {
 			return err
 		}
-		pos = a.tape.skipValue(pos)
+		pos = a.tape.skipNopsUntil(a.tape.skipValue(pos), a.endIdx)
 	}
 	return nil
 }
@@ -432,9 +496,14 @@ func (a *TapeArray) AsString() ([]string, error) {
 }
 
 // Interface converts the entire document to Go native types.
+// Respects the UseNumber() option set during Parse.
 func (t *Tape) Interface() (interface{}, error) {
 	if len(t.data) < 2 {
 		return nil, fmt.Errorf("empty tape")
+	}
+	if t.useNumber {
+		val, _, err := t.readValueNum(1)
+		return val, err
 	}
 	val, _, err := t.readValue(1)
 	return val, err
@@ -464,11 +533,23 @@ func (t *Tape) readValue(idx int) (interface{}, int, error) {
 		s, err := t.readString(payload)
 		return s, idx + 1, err
 	case tagInt64:
-		return int64(t.data[idx+1]), idx + 2, nil
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return nil, idx, err
+		}
+		return int64(w), idx + 2, nil
 	case tagUint64:
-		return t.data[idx+1], idx + 2, nil
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return nil, idx, err
+		}
+		return w, idx + 2, nil
 	case tagDouble:
-		return math.Float64frombits(t.data[idx+1]), idx + 2, nil
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return nil, idx, err
+		}
+		return math.Float64frombits(w), idx + 2, nil
 	case tagTrue:
 		return true, idx + 1, nil
 	case tagFalse:
@@ -492,14 +573,9 @@ func (t *Tape) readObject(idx int) (map[string]interface{}, int, error) {
 	endIdx := int(entry & 0xffffffff)
 	count := int((entry >> 32) & 0xffffff)
 	result := make(map[string]interface{}, count)
-	pos := idx + 1
+	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
-		tag := t.tapeTagAt(pos)
-		if tag == tagNop {
-			pos = t.tapeSkipNop(pos)
-			continue
-		}
-		if tag != tagString {
+		if t.tapeTagAt(pos) != tagString {
 			return nil, pos, fmt.Errorf("expected string key at %d", pos)
 		}
 		key, err := t.readString(t.tapePayloadAt(pos))
@@ -512,7 +588,7 @@ func (t *Tape) readObject(idx int) (map[string]interface{}, int, error) {
 			return nil, pos, err
 		}
 		result[key] = val
-		pos = nextPos
+		pos = t.skipNopsUntil(nextPos, endIdx-1)
 	}
 	return result, endIdx, nil
 }
@@ -522,19 +598,14 @@ func (t *Tape) readArray(idx int) ([]interface{}, int, error) {
 	endIdx := int(entry & 0xffffffff)
 	count := int((entry >> 32) & 0xffffff)
 	result := make([]interface{}, 0, count)
-	pos := idx + 1
+	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
-		tag := t.tapeTagAt(pos)
-		if tag == tagNop {
-			pos = t.tapeSkipNop(pos)
-			continue
-		}
 		val, nextPos, err := t.readValue(pos)
 		if err != nil {
 			return nil, pos, err
 		}
 		result = append(result, val)
-		pos = nextPos
+		pos = t.skipNopsUntil(nextPos, endIdx-1)
 	}
 	return result, endIdx, nil
 }
@@ -553,6 +624,12 @@ func (t *Tape) readString(offset uint64) (string, error) {
 	return unsafe.String(&b[0], len(b)), nil
 }
 
+// readStringBytes reads a string from the string buffer at the given offset.
+// Format: [4-byte native-endian length][UTF-8 content bytes][null terminator].
+//
+// The returned slice has its capacity pinned to its length, so a caller's append
+// reallocates instead of writing past the string into the adjacent entry's
+// length prefix, which would corrupt every string after it in the buffer.
 func (t *Tape) readStringBytes(offset uint64) ([]byte, error) {
 	off := int(offset)
 	if off+4 > len(t.strings) {
@@ -563,7 +640,8 @@ func (t *Tape) readStringBytes(offset uint64) ([]byte, error) {
 	if start+slen > len(t.strings) {
 		return nil, fmt.Errorf("string length %d at offset %d out of bounds", slen, off)
 	}
-	return t.strings[start : start+slen], nil
+	b := t.strings[start : start+slen]
+	return b[:len(b):len(b)], nil
 }
 
 func (t *Tape) readValueNum(idx int) (interface{}, int, error) {
@@ -581,11 +659,23 @@ func (t *Tape) readValueNum(idx int) (interface{}, int, error) {
 		s, err := t.readString(payload)
 		return s, idx + 1, err
 	case tagInt64:
-		return json.Number(strconv.FormatInt(int64(t.data[idx+1]), 10)), idx + 2, nil
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return nil, idx, err
+		}
+		return json.Number(strconv.FormatInt(int64(w), 10)), idx + 2, nil
 	case tagUint64:
-		return json.Number(strconv.FormatUint(t.data[idx+1], 10)), idx + 2, nil
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return nil, idx, err
+		}
+		return json.Number(strconv.FormatUint(w, 10)), idx + 2, nil
 	case tagDouble:
-		return json.Number(strconv.FormatFloat(math.Float64frombits(t.data[idx+1]), 'g', -1, 64)), idx + 2, nil
+		w, err := t.valueWord(idx)
+		if err != nil {
+			return nil, idx, err
+		}
+		return json.Number(strconv.FormatFloat(math.Float64frombits(w), 'g', -1, 64)), idx + 2, nil
 	case tagTrue:
 		return true, idx + 1, nil
 	case tagFalse:
@@ -609,14 +699,9 @@ func (t *Tape) readObjectNum(idx int) (map[string]interface{}, int, error) {
 	endIdx := int(entry & 0xffffffff)
 	count := int((entry >> 32) & 0xffffff)
 	result := make(map[string]interface{}, count)
-	pos := idx + 1
+	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
-		tag := t.tapeTagAt(pos)
-		if tag == tagNop {
-			pos = t.tapeSkipNop(pos)
-			continue
-		}
-		if tag != tagString {
+		if t.tapeTagAt(pos) != tagString {
 			return nil, pos, fmt.Errorf("expected string key at %d", pos)
 		}
 		key, err := t.readString(t.tapePayloadAt(pos))
@@ -629,7 +714,7 @@ func (t *Tape) readObjectNum(idx int) (map[string]interface{}, int, error) {
 			return nil, pos, err
 		}
 		result[key] = val
-		pos = nextPos
+		pos = t.skipNopsUntil(nextPos, endIdx-1)
 	}
 	return result, endIdx, nil
 }
@@ -639,53 +724,64 @@ func (t *Tape) readArrayNum(idx int) ([]interface{}, int, error) {
 	endIdx := int(entry & 0xffffffff)
 	count := int((entry >> 32) & 0xffffff)
 	result := make([]interface{}, 0, count)
-	pos := idx + 1
+	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
-		tag := t.tapeTagAt(pos)
-		if tag == tagNop {
-			pos = t.tapeSkipNop(pos)
-			continue
-		}
 		val, nextPos, err := t.readValueNum(pos)
 		if err != nil {
 			return nil, pos, err
 		}
 		result = append(result, val)
-		pos = nextPos
+		pos = t.skipNopsUntil(nextPos, endIdx-1)
 	}
 	return result, endIdx, nil
 }
 
 // Advance moves the iterator to the next sibling element.
+// NOP padding left behind by mutation is skipped.
+//
+// It operates on the full tape with no container boundary — it will walk past
+// closing brackets into subsequent entries. For bounded iteration within an
+// object or array, use TapeObject.ForEach / TapeArray.ForEach instead.
 func (ti *TapeIter) Advance() Type {
-	ti.idx = ti.tape.skipValue(ti.idx)
-	if ti.idx >= len(ti.tape.data) {
+	// skipValue reads the tag at the cursor, so the bound must be checked on the
+	// INPUT, not just the result. An exhausted cursor is reachable from Iter() on
+	// an empty or fully deleted container.
+	if ti.pastEnd() {
+		return Type(-1)
+	}
+	ti.idx = ti.tape.skipNopsUntil(ti.tape.skipValue(ti.idx), len(ti.tape.data))
+	if ti.pastEnd() {
 		return Type(-1)
 	}
 	return ti.Type()
 }
 
 // PeekNext returns the type of the next sibling without advancing.
+// NOP padding left behind by mutation is skipped.
+//
+// Like Advance, it is unbounded — use TapeObject/TapeArray methods for
+// container-scoped iteration.
 func (ti *TapeIter) PeekNext() Type {
-	next := ti.tape.skipValue(ti.idx)
-	if next >= len(ti.tape.data) {
-		return Type(-1)
-	}
-	tag := byte(ti.tape.data[next] >> 56)
-	if tag == tagFalse {
-		return TypeBool
-	}
-	return Type(tag)
+	next := *ti
+	return next.Advance()
 }
 
 // AdvanceInto steps into a container (object/array), positioning at the first child.
+// Returns Type(-1) if the element is not a container, the iterator is past end,
+// or the container is empty (e.g. [] or {}) — including an container left empty
+// by DeleteElems, whose children are NOP padding.
 func (ti *TapeIter) AdvanceInto() Type {
 	tag := ti.tag()
 	if tag != tagObject && tag != tagArray {
 		return Type(-1)
 	}
-	ti.idx++
-	if ti.idx >= len(ti.tape.data) {
+	ti.idx = ti.tape.skipNopsUntil(ti.idx+1, len(ti.tape.data))
+	if ti.pastEnd() {
+		return Type(-1)
+	}
+	// A closing bracket here means the container has no remaining children.
+	switch ti.tag() {
+	case tagObjEnd, tagArrEnd, tagRoot:
 		return Type(-1)
 	}
 	return ti.Type()
@@ -709,57 +805,83 @@ func (ti *TapeIter) StringCvt() (string, error) {
 	case TypeString:
 		return ti.String()
 	case TypeInt64:
-		v, _ := ti.Int()
+		v, err := ti.Int()
+		if err != nil {
+			return "", err
+		}
 		return strconv.FormatInt(v, 10), nil
 	case TypeUint64:
-		v, _ := ti.Uint()
+		v, err := ti.Uint()
+		if err != nil {
+			return "", err
+		}
 		return strconv.FormatUint(v, 10), nil
 	case TypeDouble:
-		v, _ := ti.Float()
+		v, err := ti.Float()
+		if err != nil {
+			return "", err
+		}
 		return strconv.FormatFloat(v, 'g', -1, 64), nil
 	case TypeBool:
-		v, _ := ti.Bool()
+		v, err := ti.Bool()
+		if err != nil {
+			return "", err
+		}
 		return strconv.FormatBool(v), nil
 	case TypeNull:
 		return "null", nil
+	case TypeBigInt:
+		v, err := ti.BigInt()
+		return string(v), err
 	default:
 		return "", fmt.Errorf("cannot convert %v to string", ti.Type())
 	}
 }
 
 // Iter returns a TapeIter at the first element of the array.
+// NOP padding left behind by DeleteElems is skipped. For an empty array — or one
+// left empty by deletion — the returned iterator is positioned past end, so
+// Type() returns Type(-1).
 func (a *TapeArray) Iter() TapeIter {
-	return TapeIter{tape: a.tape, idx: a.startIdx}
+	pos := a.tape.skipNopsUntil(a.startIdx, a.endIdx)
+	if pos >= a.endIdx {
+		return TapeIter{tape: a.tape, idx: len(a.tape.data)}
+	}
+	return TapeIter{tape: a.tape, idx: pos}
 }
 
 // FirstType returns the type of the first element, or Type(-1) if empty.
+// NOP padding left behind by DeleteElems is skipped.
 func (a *TapeArray) FirstType() Type {
-	if a.startIdx >= a.endIdx {
+	pos := a.tape.skipNopsUntil(a.startIdx, a.endIdx)
+	if pos >= a.endIdx {
 		return Type(-1)
 	}
-	tag := byte(a.tape.data[a.startIdx] >> 56)
-	if tag == tagFalse {
-		return TypeBool
-	}
-	return Type(tag)
+	return Tag(a.tape.tapeTagAt(pos)).Type()
 }
 
 // Interface returns the array as []interface{}.
+// Respects the UseNumber() option set during Parse.
 func (a *TapeArray) Interface() ([]interface{}, error) {
-	result := make([]interface{}, 0, a.Count())
-	pos := a.startIdx
-	for pos < a.endIdx {
-		val, nextPos, err := a.tape.readValue(pos)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, val)
-		pos = nextPos
+	// Delegate to the shared array walker, which skips the NOP padding that
+	// DeleteElems leaves behind. Walking the range here instead would append a
+	// nil per NOP, since readValue reports "nothing here" as a nil value.
+	if a.tape.useNumber {
+		result, _, err := a.tape.readArrayNum(a.startIdx - 1)
+		return result, err
 	}
-	return result, nil
+	result, _, err := a.tape.readArray(a.startIdx - 1)
+	return result, err
 }
 
 // Iter returns a TapeIter at the first key of the object.
+// NOP padding left behind by DeleteElems is skipped. For an empty object — or one
+// left empty by deletion — the returned iterator is positioned past end, so
+// Type() returns Type(-1).
 func (o *TapeObject) Iter() TapeIter {
-	return TapeIter{tape: o.tape, idx: o.startIdx}
+	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
+	if pos >= o.endIdx {
+		return TapeIter{tape: o.tape, idx: len(o.tape.data)}
+	}
+	return TapeIter{tape: o.tape, idx: pos}
 }
