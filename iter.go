@@ -357,7 +357,17 @@ func (i *Iter) PeekNextTag() Tag {
 	return Tag(ti.tag())
 }
 
-// Root returns an Iter positioned at the root element's value.
+// Root returns an Iter positioned at the value of the root document that contains
+// the cursor.
+//
+// For a tape from Parse there is one document, so this is that document's value.
+// For a tape from ParseND it is the document the cursor is currently inside — it
+// used to hardcode tape index 1 and so always returned the FIRST document, with a
+// nil error, no matter where the cursor was.
+//
+// Returns Type(-1) and an error when the cursor is not inside any document, in
+// which case dst is positioned past the end of the tape. Cost is O(documents
+// before the cursor), and O(1) for a single-document tape.
 func (i *Iter) Root(dst *Iter) (Type, *Iter, error) {
 	if dst == nil {
 		c := *i
@@ -365,8 +375,14 @@ func (i *Iter) Root(dst *Iter) (Type, *Iter, error) {
 	} else {
 		*dst = *i
 	}
-	// Position at the first element after root tag (index 1)
-	dst.tapeIdx = 1
+	root := i.tape.rootDocContaining(i.tapeIdx)
+	if root < 0 {
+		// Keep dst usable rather than nil: this method never used to fail, so a
+		// caller that ignores the error must not be handed a nil pointer.
+		dst.tapeIdx = len(i.tape.data)
+		return Type(-1), dst, fmt.Errorf("iterator at tape index %d is not inside a root document", i.tapeIdx)
+	}
+	dst.tapeIdx = root + 1
 	return dst.Type(), dst, nil
 }
 
@@ -642,6 +658,116 @@ func (t *Tape) skipNopsUntil(idx, limit int) int {
 		idx = t.tapeSkipNop(idx)
 	}
 	return idx
+}
+
+// --- Root document blocks ---
+//
+// simdjson_parse_many lays out an NDJSON stream as one self-contained block per
+// document, each of the form
+//
+//	[k]   tagRoot   payload = index one past the block's closing root
+//	[k+1] the document's value (an object, array or scalar)
+//	...
+//	[e]   tagRoot   payload = k (points back to the opening root)
+//	[e+1] NOT WRITTEN BY simdjson
+//
+// so the next document's opening root, if any, sits at payload+1. A tape from a
+// single-document Parse is the same shape with exactly one block.
+//
+// The word at payload is the important trap: tape_len counts it, so Parse copies
+// it, but simdjson never writes it and the C++ parser does not zero its tape
+// between parses — it holds whatever a previous parse left there. Never infer
+// structure from its contents; only the root payload chain is reliable.
+
+// nextRootDoc returns the index of the opening root entry of the next READABLE
+// root document after the one at rootIdx, or len(t.data) when there is none.
+//
+// "Readable" means the returned index is a root marker with a value entry after
+// it, so callers may read at index+1 without a further bound check. It always
+// makes progress, so it is safe to drive a loop.
+func (t *Tape) nextRootDoc(rootIdx int) int {
+	if !t.hasRootAt(rootIdx) {
+		return len(t.data)
+	}
+	next := int(t.tapePayloadAt(rootIdx)) + 1
+	if next <= rootIdx || !t.hasRootDocAt(next) {
+		return len(t.data)
+	}
+	return next
+}
+
+// hasRootAt reports whether idx is in range and holds a root entry. Use this to
+// recognise a root marker; use hasRootDocAt when you intend to read its value.
+func (t *Tape) hasRootAt(idx int) bool {
+	return idx >= 0 && idx < len(t.data) && t.tapeTagAt(idx) == tagRoot
+}
+
+// hasRootDocAt reports whether idx holds a readable root document: a root marker
+// with a value entry following it.
+//
+// Both halves are load-bearing. A bare length check only confirms a value slot
+// exists and never looks at the marker, so a tape with no root would pass it;
+// hasRootAt alone confirms the marker but not that anything follows. Neither
+// implies the other, and Serializer.Deserialize can produce either shape, since
+// it validates length prefixes but not structure.
+func (t *Tape) hasRootDocAt(idx int) bool {
+	return t.hasRootAt(idx) && idx+1 < len(t.data)
+}
+
+// hasRootDoc reports whether the tape holds at least one readable root document.
+// This is the guard for every entry point that reads from index 1 — RootType,
+// Interface, InterfaceUseNumber and ForEach.
+func (t *Tape) hasRootDoc() bool {
+	return t.hasRootDocAt(0)
+}
+
+// rootDocContaining returns the index of the opening root entry of the document
+// that contains idx, or -1 if idx is not inside any document.
+//
+// The block's extent is [root, payload): the opening root marker itself counts as
+// inside, so a cursor already sitting on a root resolves to that document rather
+// than being reported as outside one. The padding slot at payload does not count —
+// nothing on the tape refers to it and simdjson never writes it.
+//
+// Root blocks are laid out in order and do not overlap, so this walks them from
+// the start: O(documents before idx), and O(1) for a single-document tape. There
+// is no back-pointer from an arbitrary entry to its enclosing root, so a scan is
+// the only option — only the closing root points back, and a cursor deep inside a
+// container cannot reach it cheaply.
+func (t *Tape) rootDocContaining(idx int) int {
+	for root := 0; t.hasRootDocAt(root); root = t.nextRootDoc(root) {
+		if root > idx {
+			break
+		}
+		if idx < int(t.tapePayloadAt(root)) {
+			return root
+		}
+	}
+	return -1
+}
+
+// skipRootBoundary advances a cursor that has landed on a root marker to the
+// value of the next root document, or past the end of the tape when there is
+// none. A cursor not on a root marker is returned unchanged.
+//
+// A closing root's payload points back to its opening root, whose payload in turn
+// locates the end of the block — so the next document is found purely from the
+// payload chain, without reading the uninitialised padding word.
+func (t *Tape) skipRootBoundary(idx int) int {
+	if !t.hasRootAt(idx) {
+		return idx
+	}
+	payload := int(t.tapePayloadAt(idx))
+	if payload > idx {
+		// An opening root: its document's value is the next entry.
+		return idx + 1
+	}
+	// A closing root: payload is its opening root.
+	next := t.nextRootDoc(payload)
+	if next >= len(t.data) {
+		return len(t.data)
+	}
+	return next + 1
 }
 
 // tapeNopRange fills tape[start:end] with NOP entries, each pointing to end.

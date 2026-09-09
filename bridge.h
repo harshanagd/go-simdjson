@@ -46,6 +46,12 @@ typedef struct {
     size_t tape_len;
     const uint8_t* sbuf;
     size_t sbuf_len;
+    // Bytes at the end of the input that do not form a complete document.
+    // parse_many is a streaming API: it holds an incomplete trailing document
+    // over for the next batch rather than reporting an error, so a caller
+    // treating the input as complete must check this or lose that document
+    // silently.
+    size_t truncated_bytes;
 } simdjson_nd_result;
 
 simdjson_nd_result simdjson_parse_many(simdjson_parser p, const char* buf, size_t len);

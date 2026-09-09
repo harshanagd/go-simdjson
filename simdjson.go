@@ -187,15 +187,35 @@ func (pj *ParsedJson) Clone(dst *ParsedJson) *ParsedJson {
 	return dst
 }
 
-// ForEach calls fn for each root element in the parsed document.
-// For standard JSON this calls fn exactly once. Compatible with simdjson-go's
-// ndjson ForEach pattern.
+// ForEach calls fn once for each root element on the tape.
+//
+// A tape from Parse holds a single root, so fn is called once. A tape from
+// ParseND holds one root per NDJSON document, and fn is called for each in
+// order, with the Iter positioned at that document's value.
 func (pj *ParsedJson) ForEach(fn func(i Iter) error) error {
-	iter, err := pj.Iter()
-	if err != nil {
-		return err
+	if !pj.hasTape {
+		return fmt.Errorf("no parsed document")
 	}
-	return fn(iter)
+	t := &pj.tape
+	if !t.hasRootDoc() {
+		// Reporting success with zero calls would hide a corrupt tape, which is
+		// the same condition Interface and RootType refuse.
+		return fmt.Errorf("tape holds no root document")
+	}
+	// root+1 needs no bound check: hasRootDocAt establishes it for every block the
+	// walk visits, and nextRootDoc only yields indices that have a value after them.
+	for root := 0; t.hasRootDocAt(root); root = t.nextRootDoc(root) {
+		it := Iter{
+			tape:        t,
+			tapeIdx:     root + 1,
+			copyStrings: pj.copyStrings,
+			useNumber:   pj.useNumber,
+		}
+		if err := fn(it); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Type represents a JSON element type.

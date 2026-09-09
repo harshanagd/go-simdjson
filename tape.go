@@ -125,9 +125,9 @@ func (pj *ParsedJson) TapeInterfaceUseNumber() (interface{}, error) {
 }
 
 // RootType returns the type of the root element.
-// Returns Type(-1) for an empty tape or a zero tag.
+// Returns Type(-1) when the tape holds no root document, or for a zero tag.
 func (t *Tape) RootType() Type {
-	if len(t.data) < 2 {
+	if !t.hasRootDoc() {
 		return Type(-1)
 	}
 	return Tag(t.tapeTagAt(1)).Type()
@@ -497,9 +497,11 @@ func (a *TapeArray) AsString() ([]string, error) {
 
 // Interface converts the entire document to Go native types.
 // Respects the UseNumber() option set during Parse.
+// For an NDJSON tape this converts the FIRST document only — use
+// ParsedJson.ForEach to reach the rest.
 func (t *Tape) Interface() (interface{}, error) {
-	if len(t.data) < 2 {
-		return nil, fmt.Errorf("empty tape")
+	if !t.hasRootDoc() {
+		return nil, fmt.Errorf("tape holds no root document")
 	}
 	if t.useNumber {
 		val, _, err := t.readValueNum(1)
@@ -511,8 +513,8 @@ func (t *Tape) Interface() (interface{}, error) {
 
 // InterfaceUseNumber is like Interface but returns json.Number for numeric values.
 func (t *Tape) InterfaceUseNumber() (interface{}, error) {
-	if len(t.data) < 2 {
-		return nil, fmt.Errorf("empty tape")
+	if !t.hasRootDoc() {
+		return nil, fmt.Errorf("tape holds no root document")
 	}
 	val, _, err := t.readValueNum(1)
 	return val, err
@@ -737,7 +739,9 @@ func (t *Tape) readArrayNum(idx int) ([]interface{}, int, error) {
 }
 
 // Advance moves the iterator to the next sibling element.
-// NOP padding left behind by mutation is skipped.
+// NOP padding left behind by mutation is skipped, as is the root-marker
+// scaffolding between NDJSON documents — so on a ParseND tape this steps from one
+// document's value to the next rather than stopping on the boundary.
 //
 // It operates on the full tape with no container boundary — it will walk past
 // closing brackets into subsequent entries. For bounded iteration within an
@@ -749,7 +753,8 @@ func (ti *TapeIter) Advance() Type {
 	if ti.pastEnd() {
 		return Type(-1)
 	}
-	ti.idx = ti.tape.skipNopsUntil(ti.tape.skipValue(ti.idx), len(ti.tape.data))
+	next := ti.tape.skipNopsUntil(ti.tape.skipValue(ti.idx), len(ti.tape.data))
+	ti.idx = ti.tape.skipRootBoundary(next)
 	if ti.pastEnd() {
 		return Type(-1)
 	}

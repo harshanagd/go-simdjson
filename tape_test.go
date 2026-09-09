@@ -1430,3 +1430,107 @@ func TestStringCvtOnTruncatedTape(t *testing.T) {
 		})
 	}
 }
+
+// TestRootDocGuardIsConsistentAcrossEntryPoints locks the four entry points that
+// read from tape index 1 to one answer about whether a document is there.
+//
+// They used to disagree. RootType, Interface and InterfaceUseNumber each tested
+// `len(t.data) < 2`, which confirms a value slot exists but never looks at index 0
+// — so a tape with no root marker passed. ForEach tested hasRootAt(0), which
+// confirms the marker but not that a value follows. Neither implies the other, and
+// on a tape of length 2 with no root marker ForEach reported zero documents with a
+// NIL ERROR while the other three refused it. All four now share hasRootDoc.
+//
+// None of this is reachable from Parse. Serializer.Deserialize rebuilds a Tape
+// from arbitrary bytes checking length prefixes but not structure, so it can
+// produce either shape.
+func TestRootDocGuardIsConsistentAcrossEntryPoints(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []uint64
+		wantDoc  bool
+		wantType Type
+		wantVal  interface{}
+	}{
+		{
+			// Faithful single-document block: opening root payload is the index one
+			// past the closing root — the padding slot simdjson never writes.
+			name:     "well_formed",
+			data:     rootBlock(0, tagInt64, 42),
+			wantDoc:  true,
+			wantType: TypeInt64,
+			wantVal:  int64(42),
+		},
+		{
+			// Passes a bare length check, fails hasRootAt(0): this is the row where
+			// ForEach used to succeed silently.
+			name:     "length_ok_but_no_root_marker",
+			data:     []uint64{uint64(tagInt64) << 56, 42},
+			wantDoc:  false,
+			wantType: Type(-1),
+		},
+		{
+			// Passes hasRootAt(0), fails a length check: a marker with no value.
+			name:     "root_marker_with_no_value",
+			data:     []uint64{uint64(tagRoot) << 56},
+			wantDoc:  false,
+			wantType: Type(-1),
+		},
+		{
+			name:     "empty",
+			data:     []uint64{},
+			wantDoc:  false,
+			wantType: Type(-1),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tape := &Tape{data: tt.data}
+			pj := &ParsedJson{tape: *tape, hasTape: true, copyStrings: true}
+
+			if got := tape.hasRootDoc(); got != tt.wantDoc {
+				t.Fatalf("hasRootDoc() = %v, want %v", got, tt.wantDoc)
+			}
+
+			if got := tape.RootType(); got != tt.wantType {
+				t.Errorf("RootType() = %v, want %v", got, tt.wantType)
+			}
+
+			iv, iErr := tape.Interface()
+			_, nErr := tape.InterfaceUseNumber()
+			calls := 0
+			fErr := pj.ForEach(func(i Iter) error { calls++; return nil })
+
+			if tt.wantDoc {
+				if iErr != nil {
+					t.Errorf("Interface() = %v, want nil", iErr)
+				} else if iv != tt.wantVal {
+					t.Errorf("Interface() = %#v, want %#v", iv, tt.wantVal)
+				}
+				if nErr != nil {
+					t.Errorf("InterfaceUseNumber() = %v, want nil", nErr)
+				}
+				if fErr != nil || calls != 1 {
+					t.Errorf("ForEach: %d calls, err %v; want 1 call, nil", calls, fErr)
+				}
+				return
+			}
+
+			// No document: all four must refuse, and ForEach must not report
+			// success with nothing done.
+			if iErr == nil {
+				t.Error("Interface() accepted a tape with no root document")
+			}
+			if nErr == nil {
+				t.Error("InterfaceUseNumber() accepted a tape with no root document")
+			}
+			if fErr == nil {
+				t.Error("ForEach returned nil for a tape with no root document")
+			}
+			if calls != 0 {
+				t.Errorf("ForEach called fn %d times for a tape with no root document", calls)
+			}
+		})
+	}
+}

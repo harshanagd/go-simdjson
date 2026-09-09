@@ -3,6 +3,7 @@ package simdjson
 import (
 	"encoding/binary"
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -1029,5 +1030,286 @@ func TestIterAdvanceIntoSkipsNops(t *testing.T) {
 	root, _ := pj.Iter()
 	if got := root.AdvanceInto(); got != TagString {
 		t.Fatalf("AdvanceInto() = %q, want %q (the key \"b\")", rune(got), rune(TagString))
+	}
+}
+
+// TestIterRootIsCursorRelative covers Iter.Root, which hardcoded tape index 1:
+//
+//	// Position at the first element after root tag (index 1)
+//	dst.tapeIdx = 1
+//
+// For a single-document tape index 1 IS the root value, so this looked right. On a
+// ParseND tape it always returned the FIRST document with a nil error, whatever
+// the cursor was on — so iterating an NDJSON stream and calling Root() on the
+// third record silently handed back the first.
+func TestIterRootIsCursorRelative(t *testing.T) {
+	pj, err := ParseND([]byte("{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n"), nil)
+	if err != nil {
+		t.Fatalf("ParseND: %v", err)
+	}
+	defer pj.Close()
+
+	it, err := pj.Iter()
+	if err != nil {
+		t.Fatalf("Iter: %v", err)
+	}
+	for doc := 1; doc <= 3; doc++ {
+		ty, root, err := it.Root(nil)
+		if err != nil {
+			t.Fatalf("document %d: Root: %v", doc, err)
+		}
+		if ty != TypeObject {
+			t.Errorf("document %d: Root type = %v, want %v", doc, ty, TypeObject)
+		}
+		v, err := root.Interface()
+		if err != nil {
+			t.Fatalf("document %d: Interface: %v", doc, err)
+		}
+		want := map[string]interface{}{"n": int64(doc)}
+		if !reflect.DeepEqual(v, want) {
+			t.Errorf("document %d: Root() = %#v, want %#v", doc, v, want)
+		}
+		if doc < 3 && it.Advance() == Type(-1) {
+			t.Fatalf("walk ended early after document %d", doc)
+		}
+	}
+}
+
+// TestIterRootFromNestedCursor checks Root resolves the enclosing document from a
+// cursor inside a container, not just from one sitting on a document's value.
+func TestIterRootFromNestedCursor(t *testing.T) {
+	pj, err := ParseND([]byte("{\"n\":1}\n{\"n\":2,\"deep\":{\"x\":[7]}}\n"), nil)
+	if err != nil {
+		t.Fatalf("ParseND: %v", err)
+	}
+	defer pj.Close()
+
+	it, _ := pj.Iter()
+	if it.Advance() == Type(-1) {
+		t.Fatal("could not reach the second document")
+	}
+	obj, err := it.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	deep, err := obj.FindKey("deep", nil).Iter.Object(nil)
+	if err != nil {
+		t.Fatalf("nested Object: %v", err)
+	}
+	inner := deep.FindKey("x", nil)
+
+	_, root, err := inner.Iter.Root(nil)
+	if err != nil {
+		t.Fatalf("Root from a nested cursor: %v", err)
+	}
+	v, err := root.Interface()
+	if err != nil {
+		t.Fatalf("Interface: %v", err)
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		t.Fatalf("Root() = %T, want map", v)
+	}
+	if m["n"] != int64(2) {
+		t.Errorf("Root() resolved to the wrong document: n = %#v, want 2", m["n"])
+	}
+}
+
+// TestIterRootOutsideAnyDocument covers the cursor being past the end. Root used
+// to return index 1 and a nil error regardless; it now reports the failure while
+// still handing back a usable dst, since the method never used to fail and a
+// caller ignoring the error must not receive a nil pointer.
+func TestIterRootOutsideAnyDocument(t *testing.T) {
+	pj, err := ParseND([]byte("1\n2\n"), nil)
+	if err != nil {
+		t.Fatalf("ParseND: %v", err)
+	}
+	defer pj.Close()
+
+	it, _ := pj.Iter()
+	for step := 0; step < 8 && it.Advance() != Type(-1); step++ {
+	}
+
+	ty, root, err := it.Root(nil)
+	if err == nil {
+		t.Error("Root() on an exhausted cursor returned no error")
+	}
+	if root == nil {
+		t.Fatal("Root() returned a nil dst alongside the error")
+	}
+	if ty != Type(-1) {
+		t.Errorf("Root() type = %v, want Type(-1)", ty)
+	}
+	if got := root.Type(); got != Type(-1) {
+		t.Errorf("dst.Type() = %v, want Type(-1)", got)
+	}
+}
+
+// TestIterRootSingleDocumentUnchanged pins the behaviour the old hardcoded index
+// got right, so the rewrite cannot regress the common case.
+func TestIterRootSingleDocumentUnchanged(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":{"b":1}}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+
+	it, _ := pj.Iter()
+	obj, _ := it.Object(nil)
+	nested := obj.FindKey("a", nil)
+
+	for _, tc := range []struct {
+		name string
+		from Iter
+	}{
+		{"from_root", it},
+		{"from_nested", nested.Iter},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			from := tc.from
+			ty, root, err := from.Root(nil)
+			if err != nil {
+				t.Fatalf("Root: %v", err)
+			}
+			if ty != TypeObject {
+				t.Errorf("type = %v, want %v", ty, TypeObject)
+			}
+			v, err := root.Interface()
+			if err != nil {
+				t.Fatalf("Interface: %v", err)
+			}
+			want := map[string]interface{}{"a": map[string]interface{}{"b": int64(1)}}
+			if !reflect.DeepEqual(v, want) {
+				t.Errorf("Root() = %#v, want the whole document %#v", v, want)
+			}
+		})
+	}
+}
+
+// TestIterRootWhenAlreadyAtRoot covers a cursor sitting ON a root marker rather
+// than on a document's value.
+//
+// rootDocContaining originally took the block's extent as (root, payload) —
+// excluding the marker itself — so a cursor at index 0 reported "not inside a root
+// document" for a perfectly good tape. Asking Root() where you already are should
+// answer, not fail. The extent is now [root, payload).
+//
+// pj.Iter() starts at the value (root+1), so this position is not reachable
+// through the normal API; the iterators are built directly.
+func TestIterRootWhenAlreadyAtRoot(t *testing.T) {
+	pj, err := ParseND([]byte("{\"n\":1}\n{\"n\":2}\n"), nil)
+	if err != nil {
+		t.Fatalf("ParseND: %v", err)
+	}
+	defer pj.Close()
+	tape, err := pj.GetTape()
+	if err != nil {
+		t.Fatalf("GetTape: %v", err)
+	}
+
+	// Locate each block's opening root rather than hardcoding indices.
+	var roots []int
+	for root := 0; tape.hasRootDocAt(root); root = tape.nextRootDoc(root) {
+		roots = append(roots, root)
+	}
+	if len(roots) != 2 {
+		t.Fatalf("found %d root blocks, want 2", len(roots))
+	}
+
+	for doc, root := range roots {
+		it := Iter{tape: tape, tapeIdx: root, copyStrings: true}
+		ty, dst, err := it.Root(nil)
+		if err != nil {
+			t.Errorf("cursor on root marker at %d: Root: %v", root, err)
+			continue
+		}
+		if ty != TypeObject {
+			t.Errorf("cursor on root marker at %d: type = %v, want %v", root, ty, TypeObject)
+		}
+		v, err := dst.Interface()
+		if err != nil {
+			t.Errorf("cursor on root marker at %d: Interface: %v", root, err)
+			continue
+		}
+		want := map[string]interface{}{"n": int64(doc + 1)}
+		if !reflect.DeepEqual(v, want) {
+			t.Errorf("cursor on root marker at %d: Root() = %#v, want %#v", root, v, want)
+		}
+	}
+}
+
+// TestIterRootIsIdempotent checks that feeding Root's own result back into Root
+// returns the same position — the property that makes it safe to call defensively
+// without knowing whether the cursor has already been normalised.
+func TestIterRootIsIdempotent(t *testing.T) {
+	for _, input := range []string{
+		"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n",
+		"1\n2\n3\n", // scalar documents: the tightest blocks
+		"{\"a\":1}\n",
+	} {
+		pj, err := ParseND([]byte(input), nil)
+		if err != nil {
+			t.Fatalf("ParseND(%q): %v", input, err)
+		}
+
+		it, _ := pj.Iter()
+		for doc := 0; doc < 4; doc++ {
+			_, first, err := it.Root(nil)
+			if err != nil {
+				t.Fatalf("%q doc %d: Root: %v", input, doc, err)
+			}
+			_, second, err := first.Root(nil)
+			if err != nil {
+				t.Fatalf("%q doc %d: Root(Root()): %v", input, doc, err)
+			}
+			if first.tapeIdx != second.tapeIdx {
+				t.Errorf("%q doc %d: Root is not idempotent: %d then %d",
+					input, doc, first.tapeIdx, second.tapeIdx)
+			}
+			if it.Advance() == Type(-1) {
+				break
+			}
+		}
+		pj.Close()
+	}
+}
+
+// TestIterRootIntoAliasedDst covers dst aliasing the receiver — Root(&it) — since
+// reuse is the idiom this library promotes and the implementation copies *i into
+// dst before reading i.tapeIdx.
+func TestIterRootIntoAliasedDst(t *testing.T) {
+	pj, err := ParseND([]byte("{\"n\":1}\n{\"n\":2}\n"), nil)
+	if err != nil {
+		t.Fatalf("ParseND: %v", err)
+	}
+	defer pj.Close()
+
+	it, _ := pj.Iter()
+	if it.Advance() == Type(-1) {
+		t.Fatal("could not reach the second document")
+	}
+	obj, err := it.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	nested := obj.FindKey("n", nil).Iter
+
+	ty, dst, err := nested.Root(&nested)
+	if err != nil {
+		t.Fatalf("Root(&self): %v", err)
+	}
+	if dst != &nested {
+		t.Errorf("Root(&self) returned a different pointer than the dst passed in")
+	}
+	if ty != TypeObject {
+		t.Errorf("type = %v, want %v", ty, TypeObject)
+	}
+	v, err := dst.Interface()
+	if err != nil {
+		t.Fatalf("Interface: %v", err)
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok || m["n"] != int64(2) {
+		t.Errorf("Root(&self) = %#v, want the second document", v)
 	}
 }

@@ -174,6 +174,9 @@ simdjson_nd_result simdjson_parse_many(simdjson_parser p, const char* buf, size_
     r.tape_len = combined_tape.size();
     r.sbuf = combined_strings.data();
     r.sbuf_len = combined_strings.size();
+    // Must be read only after streaming through every document, per simdjson's
+    // contract. Non-zero means the input ended mid-document.
+    r.truncated_bytes = docs.truncated_bytes();
     return r;
 }
 

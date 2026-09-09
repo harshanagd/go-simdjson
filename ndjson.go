@@ -48,6 +48,17 @@ func ParseND(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, er
 		pj.tape = Tape{}
 		return pj, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
+	// parse_many is a streaming API: an incomplete document at the end of the
+	// buffer is held over for the next batch rather than reported as an error.
+	// ParseND is given the whole input at once, so held-over bytes mean the input
+	// is malformed or truncated — reporting success here would silently drop that
+	// document. Errors ARE raised normally when a malformed document is followed
+	// by a valid one; only the final one goes quiet.
+	if truncated := int(res.truncated_bytes); truncated > 0 {
+		pj.hasTape = false
+		pj.tape = Tape{}
+		return pj, fmt.Errorf("truncated NDJSON: the last %d byte(s) do not form a complete document", truncated)
+	}
 	pj.tape = Tape{
 		data:        copyUint64Slice(unsafe.Pointer(res.tape), int(res.tape_len)),
 		strings:     copyByteSlice(unsafe.Pointer(res.sbuf), int(res.sbuf_len)),
