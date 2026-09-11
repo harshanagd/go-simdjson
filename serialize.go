@@ -75,8 +75,10 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	tapeLen := int(binary.NativeEndian.Uint64(src[off:]))
 	off += 8
 
-	tapeBytes := tapeLen * 8
-	if off+tapeBytes > len(src) {
+	// Bound by division: tapeLen*8 overflows for a hostile length, wrapping to 0 or
+	// negative so the comparison passes and make() runs with the raw value.
+	// len(src)-off is non-negative because the check above already ran.
+	if tapeLen < 0 || tapeLen > (len(src)-off)/8 {
 		return nil, fmt.Errorf("truncated tape data")
 	}
 	tapeData := make([]uint64, tapeLen)
@@ -92,7 +94,8 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	strLen := int(binary.NativeEndian.Uint64(src[off:]))
 	off += 8
 
-	if off+strLen > len(src) {
+	// off+strLen overflows for a hostile length; compare against the remaining bytes.
+	if strLen < 0 || strLen > len(src)-off {
 		return nil, fmt.Errorf("truncated strings data")
 	}
 	strings := make([]byte, strLen)
@@ -105,6 +108,13 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 		data:        tapeData,
 		strings:     strings,
 		copyStrings: true,
+	}
+	// Everything downstream trusts the tape's structure, so it is established here
+	// once rather than re-checked by each walker. See Tape.validate.
+	if err := dst.tape.validate(); err != nil {
+		dst.tape = Tape{}
+		dst.hasTape = false
+		return nil, fmt.Errorf("invalid tape: %w", err)
 	}
 	dst.hasTape = true
 	return dst, nil

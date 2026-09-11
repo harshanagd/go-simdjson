@@ -643,11 +643,15 @@ func (t *Tape) tapeSetNop(idx int, skip uint64) {
 }
 
 // tapeTagAt returns the tag byte at the given tape index.
+// Callers must have bounded idx. Walkers rely on the tape's structural invariants,
+// which are established once at the trust boundary (see Tape.validate), so no bounds
+// check is paid per element here.
 func (t *Tape) tapeTagAt(idx int) byte {
 	return byte(t.data[idx] >> 56)
 }
 
 // tapePayloadAt returns the 56-bit payload at the given tape index.
+// See tapeTagAt for the bounding contract.
 func (t *Tape) tapePayloadAt(idx int) uint64 {
 	return t.data[idx] & payloadMask
 }
@@ -783,6 +787,7 @@ func (t *Tape) skipRootBoundary(idx int) int {
 }
 
 // tapeNopRange fills tape[start:end] with NOP entries, each pointing to end.
+// end must be within the tape; callers derive it from a validated container header.
 func (t *Tape) tapeNopRange(start, end int) {
 	for j := start; j < end; j++ {
 		t.tapeSetNop(j, uint64(end-j))
@@ -869,6 +874,9 @@ func (i *Iter) SetStringBytes(v []byte) error {
 	case tagDouble, tagInt64, tagUint64:
 		// Number → string: 2-entry type shrinks to 1 entry.
 		// First entry becomes the string, second becomes NOP.
+		if !i.tape.hasValueWord(i.tapeIdx) {
+			return fmt.Errorf("truncated tape: numeric entry at %d has no value word", i.tapeIdx)
+		}
 		off := i.tape.tapeAppendString(v)
 		i.tape.tapeSetTagPayload(i.tapeIdx, tagString, off)
 		i.tape.tapeSetNop(i.tapeIdx+1, 1)
@@ -914,6 +922,9 @@ func (i *Iter) SetNull() error {
 		return nil
 	case tagDouble, tagInt64, tagUint64:
 		// 2-entry types: first entry becomes null, second becomes NOP(skip=1).
+		if !i.tape.hasValueWord(i.tapeIdx) {
+			return fmt.Errorf("truncated tape: numeric entry at %d has no value word", i.tapeIdx)
+		}
 		i.tape.tapeSetTag(i.tapeIdx, tagNull)
 		i.tape.tapeSetNop(i.tapeIdx+1, 1)
 		return nil
@@ -921,7 +932,10 @@ func (i *Iter) SetNull() error {
 		// Container: first entry becomes null, everything through closing tag becomes NOP.
 		endIdx := int(i.tape.data[i.tapeIdx] & containerEndMask)
 		i.tape.tapeSetTag(i.tapeIdx, tagNull)
-		i.tape.tapeNopRange(i.tapeIdx+1, endIdx+1)
+		// endIdx is one PAST the closing tag, so the exclusive bound is endIdx: an
+		// extra entry here overwrites whatever follows the container, which destroys
+		// the next key or element unless the container is its parent's last child.
+		i.tape.tapeNopRange(i.tapeIdx+1, endIdx)
 		return nil
 	}
 	return fmt.Errorf("cannot set tag '%c' to null", tag)

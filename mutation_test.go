@@ -763,3 +763,106 @@ func TestDeleteElemsZeroValueObject(t *testing.T) {
 		t.Errorf("err = %q, want a nil-object error", err)
 	}
 }
+
+// TestSetNullOnContainerPreservesFollowingElements covers SetNull's container case
+// NOP-filling one entry too many. endIdx is one PAST the closing tag, so an
+// exclusive bound of endIdx+1 overwrote the entry after the container — the next key
+// or element. It only showed when the container was NOT its parent's last child,
+// which is why round-tripping a single-key object never caught it.
+func TestSetNullOnContainerPreservesFollowingElements(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		key   string
+		want  string
+	}{
+		{"object value followed by a key", `{"v":{"a":1},"w":2}`, "v", `{"v":null,"w":2}`},
+		{"array value followed by a key", `{"v":[1,2],"w":"keep"}`, "v", `{"v":null,"w":"keep"}`},
+		{"two following keys", `{"v":{"a":1},"w":2,"x":3}`, "v", `{"v":null,"w":2,"x":3}`},
+		{"container is the last child", `{"v":{"a":1}}`, "v", `{"v":null}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pj, err := Parse([]byte(tt.input), nil)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			defer pj.Close()
+
+			iter, _ := pj.Iter()
+			obj, err := iter.Object(nil)
+			if err != nil {
+				t.Fatalf("Object: %v", err)
+			}
+			elem := obj.FindKey(tt.key, nil)
+			if elem == nil {
+				t.Fatalf("key %q not found", tt.key)
+			}
+			if err := elem.Iter.SetNull(); err != nil {
+				t.Fatalf("SetNull: %v", err)
+			}
+
+			// Read back through both layers: the corruption showed up as an error or
+			// a silently missing entry depending on which followed the container.
+			after, _ := pj.Iter()
+			got, err := after.MarshalJSON()
+			if err != nil {
+				t.Fatalf("MarshalJSON after SetNull: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("got %s, want %s", got, tt.want)
+			}
+
+			again, _ := pj.Iter()
+			m, err := again.Interface()
+			if err != nil {
+				t.Fatalf("Interface after SetNull: %v", err)
+			}
+			var wantMap interface{}
+			if err := json.Unmarshal([]byte(tt.want), &wantMap); err != nil {
+				t.Fatalf("unmarshal want: %v", err)
+			}
+			gotJSON, _ := json.Marshal(m)
+			wantJSON, _ := json.Marshal(wantMap)
+			if string(gotJSON) != string(wantJSON) {
+				t.Errorf("Interface = %s, want %s", gotJSON, wantJSON)
+			}
+		})
+	}
+}
+
+// TestSettersRejectTruncatedNumeric covers the setters that shrink a 2-entry numeric
+// to 1 entry by writing a NOP at idx+1. SetInt/SetUInt/SetFloat guarded that write;
+// SetNull and SetStringBytes did not, so a numeric tag at the last tape entry — which
+// a deserialized tape can carry — indexed out of range on assignment.
+func TestSettersRejectTruncatedNumeric(t *testing.T) {
+	truncated := func() *Tape {
+		return &Tape{data: []uint64{
+			tapeEntry(tagRoot, 3),
+			tapeEntry(tagInt64, 0), // no value word follows
+		}}
+	}
+	for _, tc := range []struct {
+		name string
+		call func(*Iter) error
+	}{
+		{"SetNull", func(i *Iter) error { return i.SetNull() }},
+		{"SetStringBytes", func(i *Iter) error { return i.SetStringBytes([]byte("x")) }},
+		{"SetString", func(i *Iter) error { return i.SetString("x") }},
+		{"SetInt", func(i *Iter) error { return i.SetInt(1) }},
+		{"SetUInt", func(i *Iter) error { return i.SetUInt(1) }},
+		{"SetFloat", func(i *Iter) error { return i.SetFloat(1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked on a truncated numeric: %v", r)
+				}
+			}()
+			it := Iter{tape: truncated(), tapeIdx: 1}
+			if err := tc.call(&it); err == nil {
+				t.Error("expected an error for a numeric with no value word")
+			}
+		})
+	}
+}

@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -1639,6 +1640,420 @@ func TestTapeLookupsZeroValueOnMiss(t *testing.T) {
 			}
 			if ti != zero {
 				t.Errorf("not-found returned %+v, want the zero TapeIter", ti)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsEveryRealTape is the false-rejection guard for the trust
+// boundary. validate() gates Serializer.Deserialize, and every walker indexes the
+// tape on the assumption it passed, so a tape this package produced must never be
+// rejected. Rejecting a valid tape is a worse failure than the panics validate exists
+// to prevent, so this covers parsed files, literals, NDJSON multi-block tapes, and
+// tapes carrying NOP runs left by mutation.
+func TestValidateAcceptsEveryRealTape(t *testing.T) {
+	t.Run("parsed files", func(t *testing.T) {
+		for _, f := range benchmarkFiles {
+			data := loadTestFile(t, f)
+			pj, err := Parse(data, nil)
+			if err != nil {
+				t.Fatalf("%s: Parse: %v", f, err)
+			}
+			if err := pj.tape.validate(); err != nil {
+				t.Errorf("%s: rejected a parsed tape: %v", f, err)
+			}
+			pj.Close()
+		}
+	})
+
+	t.Run("literals and edge shapes", func(t *testing.T) {
+		for _, js := range []string{
+			`{}`, `[]`, `null`, `true`, `false`, `0`, `-1`, `1.5e10`, `""`, `"x"`,
+			`{"a":1}`, `[[[]]]`, `{"a":{"b":{"c":[]}}}`, `[{},{},[]]`,
+			`18446744073709551615`, `{"":null}`, `[1,"two",3.0,null,true]`,
+		} {
+			pj, err := Parse([]byte(js), nil)
+			if err != nil {
+				t.Fatalf("%s: Parse: %v", js, err)
+			}
+			if err := pj.tape.validate(); err != nil {
+				t.Errorf("%s: rejected: %v", js, err)
+			}
+			pj.Close()
+		}
+	})
+
+	t.Run("NDJSON multi-block tapes", func(t *testing.T) {
+		// Several root blocks, each followed by a padding word validate must step over
+		// rather than read: simdjson never writes it, so it holds stale memory.
+		for _, nd := range []string{"1\n2\n3\n", "{\"a\":1}\n{\"b\":2}\n", "{}\n[]\n{}\n", "[1]\n2\n"} {
+			pj, err := ParseND([]byte(nd), nil)
+			if err != nil {
+				t.Fatalf("%q: ParseND: %v", nd, err)
+			}
+			if err := pj.tape.validate(); err != nil {
+				t.Errorf("%q: rejected: %v", nd, err)
+			}
+			pj.Close()
+		}
+	})
+
+	t.Run("after mutation", func(t *testing.T) {
+		// Each mutation must actually change the document, or "validate accepted it"
+		// would be true of a no-op.
+		for _, tc := range []struct {
+			name string
+			fn   func(*ParsedJson)
+			want string
+		}{
+			{"DeleteElems on an object", func(pj *ParsedJson) {
+				it, _ := pj.Iter()
+				o, _ := it.Object(nil)
+				_ = o.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "b" }, nil)
+			}, `{"a":1,"arr":[1,2,3],"z":"end"}`},
+			{"DeleteElems on an array", func(pj *ParsedJson) {
+				it, _ := pj.Iter()
+				o, _ := it.Object(nil)
+				a, _ := o.FindKey("arr", nil).Iter.Array(nil)
+				a.DeleteElems(func(i Iter) bool { v, _ := i.Int(); return v == 2 })
+			}, `{"a":1,"b":2,"arr":[1,3],"z":"end"}`},
+			{"SetNull over a container", func(pj *ParsedJson) {
+				it, _ := pj.Iter()
+				o, _ := it.Object(nil)
+				_ = o.FindKey("arr", nil).Iter.SetNull()
+			}, `{"a":1,"b":2,"arr":null,"z":"end"}`},
+			{"SetString shrinking a number", func(pj *ParsedJson) {
+				it, _ := pj.Iter()
+				o, _ := it.Object(nil)
+				_ = o.FindKey("b", nil).Iter.SetString("replaced")
+			}, `{"a":1,"b":"replaced","arr":[1,2,3],"z":"end"}`},
+			{"two separate deletes leaving abutting NOP runs", func(pj *ParsedJson) {
+				// validate bounds each NOP's skip by its contiguous run rather than
+				// requiring every skip in a run to share one target, because this shape
+				// produces runs whose skips point at different ends. Deleting adjacent
+				// keys in separate calls is what makes them abut.
+				it, _ := pj.Iter()
+				o, _ := it.Object(nil)
+				_ = o.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "b" }, nil)
+				it2, _ := pj.Iter()
+				o2, _ := it2.Object(nil)
+				_ = o2.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "arr" }, nil)
+			}, `{"a":1,"z":"end"}`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				pj, err := Parse([]byte(`{"a":1,"b":2,"arr":[1,2,3],"z":"end"}`), nil)
+				if err != nil {
+					t.Fatalf("Parse: %v", err)
+				}
+				defer pj.Close()
+				tc.fn(pj)
+				if err := pj.tape.validate(); err != nil {
+					t.Fatalf("rejected a mutated tape: %v", err)
+				}
+				after, _ := pj.Iter()
+				got, err := after.MarshalJSON()
+				if err != nil {
+					t.Fatalf("MarshalJSON: %v", err)
+				}
+				if string(got) != tc.want {
+					t.Errorf("mutation produced %s, want %s", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("serializer round trips", func(t *testing.T) {
+		for _, js := range []string{`{"a":1,"b":[1,2,{"c":"x"}]}`, `[]`, `{}`, `[[1,2],"after"]`, `1e300`, `{"":null}`} {
+			pj, err := Parse([]byte(js), nil)
+			if err != nil {
+				t.Fatalf("%s: Parse: %v", js, err)
+			}
+			ser := NewSerializer()
+			got, err := ser.Deserialize(ser.Serialize(nil, *pj), nil)
+			if err != nil {
+				t.Errorf("%s: round trip rejected: %v", js, err)
+			} else if _, err := got.tape.Interface(); err != nil {
+				t.Errorf("%s: round trip tape unreadable: %v", js, err)
+			}
+			pj.Close()
+		}
+	})
+}
+
+// TestValidateRejectsCorruptTape covers the structural invariants walkers depend on.
+// Each shape below previously reached a walker and panicked, looped, or over-allocated
+// because the walkers took these values from the tape without checking them; the
+// boundary now rejects them once instead.
+func TestValidateRejectsCorruptTape(t *testing.T) {
+	// A valid `[1,2,3]`-shaped reference to mutate from is not needed: these are built
+	// directly, which is the only way to express a tape Parse cannot produce.
+	tests := []struct {
+		name string
+		data []uint64
+		want string
+	}{
+		{
+			"array end index past the tape",
+			[]uint64{tapeEntry(tagRoot, 4), uint64(tagArray)<<56 | 100000, tapeEntry(tagArrEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"invalid end index",
+		},
+		{
+			"object end index past the tape",
+			[]uint64{tapeEntry(tagRoot, 4), uint64(tagObject)<<56 | 100000, tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"invalid end index",
+		},
+		{
+			"end index points backwards",
+			[]uint64{tapeEntry(tagRoot, 4), uint64(tagObject) << 56, tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"invalid end index",
+		},
+		{
+			"end index is the container itself",
+			[]uint64{tapeEntry(tagRoot, 4), uint64(tagObject)<<56 | 1, tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"invalid end index",
+		},
+		{
+			"end index leaves no room for a closing tag",
+			[]uint64{tapeEntry(tagRoot, 4), uint64(tagObject)<<56 | 2, tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"invalid end index",
+		},
+		{
+			"nested end index cannot advance a walk",
+			[]uint64{tapeEntry(tagRoot, 6), uint64(tagArray)<<56 | 5, uint64(tagArray)<<56 | 2, tapeEntry(tagArrEnd, 2), tapeEntry(tagArrEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"invalid end index",
+		},
+		{
+			"container not closed by a matching tag",
+			[]uint64{tapeEntry(tagRoot, 4), uint64(tagObject)<<56 | 3, tapeEntry(tagArrEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"does not close it",
+		},
+		{
+			"array not closed by a matching tag",
+			[]uint64{tapeEntry(tagRoot, 4), uint64(tagArray)<<56 | 3, tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"does not close it",
+		},
+		{
+			"element count exceeds the container extent",
+			[]uint64{tapeEntry(tagRoot, 4), uint64(tagObject)<<56 | uint64(containerCountMask)<<32 | 3, tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0},
+			"exceeds its extent",
+		},
+		{
+			// A numeric in the block's final slot would borrow the closing root marker
+			// as its value word.
+			"numeric entry has no value word inside its block",
+			[]uint64{tapeEntry(tagRoot, 3), tapeEntry(tagInt64, 0), tapeEntry(tagRoot, 0), 0},
+			"no value word",
+		},
+		{
+			"no root marker at index 0",
+			[]uint64{tapeEntry(tagInt64, 0), 7},
+			"expected a root marker",
+		},
+		{
+			"closing root missing",
+			[]uint64{tapeEntry(tagRoot, 3), tapeEntry(tagNull, 0), tapeEntry(tagNull, 0), 0},
+			"no closing root",
+		},
+		{
+			"closing root does not point back",
+			[]uint64{tapeEntry(tagRoot, 3), tapeEntry(tagNull, 0), tapeEntry(tagRoot, 1), 0},
+			"does not point back",
+		},
+		{
+			"unknown tag",
+			[]uint64{tapeEntry(tagRoot, 3), uint64('Q') << 56, tapeEntry(tagRoot, 0), 0},
+			"unknown tag",
+		},
+		{
+			// The readers jump to a container's end index rather than walking tags in
+			// order, so validate must not honour a NOP's skip: a hostile skip would
+			// hide entries a reader still reaches. Here the NOP at 3 claims skip 5,
+			// which would carry a skip-following cursor from 3 straight to 8, leaving
+			// the self-referential container at 6 uninspected — and a reader following
+			// the container at 2 to its end index lands exactly on it, where
+			// skipValue returns 6 forever.
+			"NOP skip hides a self-referential container",
+			[]uint64{
+				tapeEntry(tagRoot, 9),    // 0
+				uint64(tagArray)<<56 | 8, // 1
+				uint64(tagArray)<<56 | 6, // 2
+				uint64(tagNop)<<56 | 5,   // 3  skip jumps 3 -> 8
+				0,                        // 4  hidden
+				tapeEntry(tagArrEnd, 0),  // 5
+				uint64(tagArray)<<56 | 6, // 6  hidden, end index == itself
+				tapeEntry(tagArrEnd, 0),  // 7
+				tapeEntry(tagRoot, 0),    // 8
+			},
+			"leaves its run",
+		},
+		{
+			// The mirror of the case above. Readers honour a NOP's skip, so a skip that
+			// lands on a numeric's VALUE word hands them 64 bits of tape data to decode
+			// as an entry — bits the walk consumes opaquely and never tag-checks. Here
+			// the smuggled container at 4 has an end index equal to its own position,
+			// so a reader steered onto it never advances.
+			"NOP skip lands a reader on a numeric value word",
+			[]uint64{
+				tapeEntry(tagRoot, 7),            // 0
+				uint64(tagArray)<<56 | 1<<32 | 6, // 1 '[' end 6, count 1
+				uint64(tagNop)<<56 | 2,           // 2 NOP skip 2 -> reader jumps to 4
+				tapeEntry(tagInt64, 0),           // 3 numeric; 4 is its value word
+				uint64(tagArray)<<56 | 4,         // 4 smuggled container, end == self
+				tapeEntry(tagArrEnd, 0),          // 5
+				tapeEntry(tagRoot, 0),            // 6
+				0,                                // 7
+			},
+			"leaves its run",
+		},
+		{
+			// A child must close before its parent: the inner container claims the
+			// parent's own closing tag as its end.
+			"container end index escapes its parent",
+			[]uint64{
+				tapeEntry(tagRoot, 6),    // 0, closing root at 5
+				uint64(tagArray)<<56 | 5, // 1, closes at 4
+				uint64(tagArray)<<56 | 5, // 2, claims the parent's close
+				tapeEntry(tagArrEnd, 0),  // 3
+				tapeEntry(tagArrEnd, 0),  // 4
+				tapeEntry(tagRoot, 0),    // 5
+				0,                        // 6
+			},
+			"escapes its parent",
+		},
+		{
+			// The closing tag must sit exactly where the end index points, not merely
+			// be a closing tag of the right kind somewhere inside.
+			"closing tag is not where the end index points",
+			[]uint64{
+				tapeEntry(tagRoot, 7),    // 0, closing root at 6
+				uint64(tagArray)<<56 | 6, // 1, end index says its close is at 5
+				tapeEntry(tagNull, 0),    // 2
+				tapeEntry(tagArrEnd, 0),  // 3, but a close appears here
+				tapeEntry(tagNull, 0),    // 4
+				tapeEntry(tagArrEnd, 0),  // 5
+				tapeEntry(tagRoot, 0),    // 6
+				0,                        // 7
+			},
+			"not where end index",
+		},
+		{
+			"closing tag with no open container",
+			[]uint64{tapeEntry(tagRoot, 3), tapeEntry(tagArrEnd, 0), tapeEntry(tagRoot, 0), 0},
+			"closing tag with no open container",
+		},
+		{
+			// A numeric as its container's last entry would take the closing tag as
+			// its value word.
+			"numeric borrows a closing tag as its value",
+			[]uint64{
+				tapeEntry(tagRoot, 5),
+				uint64(tagArray)<<56 | 4,
+				tapeEntry(tagInt64, 0),
+				tapeEntry(tagArrEnd, 0),
+				tapeEntry(tagRoot, 0),
+				0,
+			},
+			"no value word",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tp := &Tape{data: tt.data}
+			err := tp.validate()
+			if err == nil {
+				t.Fatal("accepted a corrupt tape")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsExcessiveNesting covers the one invariant the recursive tape
+// readers assume that structural checks alone do not give. readValue, readObject,
+// readArray and marshalTape recurse once per level, and a Go stack overflow is fatal —
+// recover cannot catch it. A ~32MB deserialized tape nested 2,000,000 deep crashed the
+// process outright, so validate bounds depth at what simdjson itself can emit.
+func TestValidateRejectsExcessiveNesting(t *testing.T) {
+	// nested builds `[[[...1...]]]` directly:
+	//   0: open root | 1..depth: opens | depth+1,depth+2: int64 + value word
+	//   depth+3..2*depth+2: closes | 2*depth+3: close root | 2*depth+4: padding
+	nested := func(depth int) *Tape {
+		closeIdx := 2*depth + 3
+		d := make([]uint64, 2*depth+5)
+		d[0] = tapeEntry(tagRoot, uint64(closeIdx+1))
+		for p := 1; p <= depth; p++ {
+			d[p] = uint64(tagArray)<<56 | uint64(2*depth+4-p)
+		}
+		d[depth+1] = tapeEntry(tagInt64, 0)
+		d[depth+2] = 7
+		for k := 1; k <= depth; k++ {
+			d[depth+2+k] = tapeEntry(tagArrEnd, uint64(depth+1-k))
+		}
+		d[closeIdx] = tapeEntry(tagRoot, 0)
+		return &Tape{data: d}
+	}
+
+	// simdjson refuses to parse deeper than maxTapeDepth, so anything at or under it
+	// must still be accepted, and the readers must handle it.
+	for _, depth := range []int{1, 2, 64, maxTapeDepth - 1, maxTapeDepth} {
+		tp := nested(depth)
+		if err := tp.validate(); err != nil {
+			t.Fatalf("depth %d rejected: %v", depth, err)
+		}
+		if _, err := tp.Interface(); err != nil {
+			t.Errorf("depth %d: Interface: %v", depth, err)
+		}
+	}
+
+	for _, depth := range []int{maxTapeDepth + 1, maxTapeDepth * 4} {
+		err := nested(depth).validate()
+		if err == nil {
+			t.Errorf("depth %d accepted", depth)
+		} else if !strings.Contains(err.Error(), "nesting deeper than") {
+			t.Errorf("depth %d: error = %q, want a nesting-depth error", depth, err)
+		}
+	}
+}
+
+// TestStringOffsetsAreGuardedAtReadTime documents the one invariant validate()
+// deliberately does not establish. readStringBytes is the only path to the string
+// buffer and must read the length prefix to slice at all, so bounds-checking there is
+// intrinsic; repeating it at the boundary cost 45% of the validation walk for no
+// safety gain. A bad offset must therefore surface as a read error, not a panic.
+func TestStringOffsetsAreGuardedAtReadTime(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		strings []byte
+		payload uint64
+		want    string
+	}{
+		{"offset past the buffer", make([]byte, 8), 500, "offset 500 out of bounds"},
+		{"length prefix overruns the buffer", func() []byte {
+			b := make([]byte, 8)
+			binary.NativeEndian.PutUint32(b[0:4], 9999)
+			return b
+		}(), 0, "length 9999"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tp := &Tape{
+				data:    []uint64{tapeEntry(tagRoot, 3), tapeEntry(tagString, tt.payload), tapeEntry(tagRoot, 0), 0},
+				strings: tt.strings,
+			}
+			if err := tp.validate(); err != nil {
+				t.Errorf("validate should not inspect string offsets, got %v", err)
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("reading the string panicked instead of erroring: %v", r)
+				}
+			}()
+			ti := tp.Iter()
+			if _, err := ti.String(); err == nil {
+				t.Error("expected a read error for an out-of-bounds string")
+			} else if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tt.want)
 			}
 		})
 	}

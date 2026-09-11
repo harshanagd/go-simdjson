@@ -40,6 +40,12 @@ const (
 	containerEndMask   = 0xffffffff // lower 32 bits: end index
 	containerCountMask = 0xffffff   // bits 32-55 (after >>32): element count
 
+	// maxTapeDepth bounds container nesting. Tape.validate enforces it so the
+	// recursive tape readers cannot be driven into a fatal stack overflow by a
+	// deserialized tape. It is simdjson's DEFAULT_MAX_DEPTH; Parse realises at most
+	// one level less than this, so the bound rejects nothing Parse can emit.
+	maxTapeDepth = 1024
+
 	// Internal byte aliases for tape walking.
 	tagRoot   = byte(TagRoot)
 	tagObject = byte(TagObjectStart)
@@ -265,6 +271,178 @@ func (ti *TapeIter) Array() (arr TapeArray, err error) {
 	return TapeArray{tape: ti.tape, startIdx: ti.idx + 1, endIdx: endIdx - 1}, nil
 }
 
+// validate checks the structural invariants every tape walker relies on.
+//
+// This is the package's trust boundary. Parse produces a tape from simdjson's own
+// structural pass, so its output always satisfies these invariants and the walkers
+// index the tape directly on that basis — no walker re-checks a bound. A tape rebuilt
+// by Serializer.Deserialize is arbitrary bytes, so it must be validated here before
+// any walker touches it.
+//
+// The walk visits only real entries: it follows the root-block chain and steps over
+// numeric value words and NOP runs. That matters because the word after each closing
+// root is padding that simdjson never writes, so it holds whatever was previously in
+// that memory; a naive linear scan would read it as a tag and could reject a valid
+// tape. It is iterative rather than recursive because nesting depth here is untrusted
+// (Deserialize bypasses simdjson's depth limit).
+func (t *Tape) validate() error {
+	if len(t.data) == 0 {
+		return nil
+	}
+	idx := 0
+	for idx < len(t.data) {
+		if byte(t.data[idx]>>56) != tagRoot {
+			return fmt.Errorf("tape index %d: expected a root marker", idx)
+		}
+		// The opening root's payload is one past its closing root.
+		closeIdx := int(t.data[idx]&payloadMask) - 1
+		if closeIdx <= idx || closeIdx >= len(t.data) {
+			return fmt.Errorf("root at %d: invalid closing index %d", idx, closeIdx+1)
+		}
+		if byte(t.data[closeIdx]>>56) != tagRoot {
+			return fmt.Errorf("root at %d: no closing root at %d", idx, closeIdx)
+		}
+		if int(t.data[closeIdx]&payloadMask) != idx {
+			return fmt.Errorf("closing root at %d does not point back to %d", closeIdx, idx)
+		}
+		if err := t.validateEntries(idx+1, closeIdx); err != nil {
+			return err
+		} // Skip the closing root and its uninitialised padding word.
+		idx = closeIdx + 2
+	}
+	return nil
+}
+
+// validateEntries checks every real entry in [start, end).
+//
+// It inspects every word rather than following NOP skips, and tracks open containers
+// on an explicit stack so a container's declared end must be exactly where its
+// matching closing tag sits. Both matter because the readers traverse by jumping to a
+// container's end index, not by walking tags in order: honouring a NOP's skip here
+// would let a hostile skip hide entries a reader still reaches, and checking a close
+// tag only pointwise would let an end index point somewhere it does not close. The
+// stack also gives the true nesting depth, which is the depth the recursive readers
+// experience.
+func (t *Tape) validateEntries(start, end int) error {
+	// stack holds the end index of each open container, so the innermost container's
+	// closing tag sits at stack[len-1]-1.
+	stack := make([]int, 0, 16)
+	pos := start
+	for pos < end {
+		// Entries must fall inside the innermost open container, or the block itself.
+		limit := end
+		if n := len(stack); n > 0 {
+			limit = stack[n-1] - 1
+		}
+
+		switch tag := byte(t.data[pos] >> 56); tag {
+		case tagNop:
+			// Readers DO honour a NOP's skip (tapeSkipNop), so a skip must land where
+			// this walk's next entry begins. Otherwise a reader can be steered onto a
+			// word the walk consumed opaquely — a numeric's value word is 64 bits of
+			// tape data that is never tag-checked, so landing there hands the reader an
+			// entry of the attacker's choosing.
+			//
+			// The bound is the end of the contiguous NOP run rather than each skip
+			// agreeing on a single target: two adjacent deletes merge into one run
+			// whose skips point at different ends (measured: skips 3,2,1 then 3,2,1),
+			// and that is a tape Parse plus DeleteElems really produces.
+			runEnd := pos
+			for runEnd < limit && byte(t.data[runEnd]>>56) == tagNop {
+				runEnd++
+			}
+			for j := pos; j < runEnd; j++ {
+				skip := int(t.data[j] & payloadMask)
+				if skip == 0 {
+					skip = 1 // tapeSkipNop floors a zero skip
+				}
+				// Compared as a distance so a 56-bit skip cannot overflow the addition
+				// on a 32-bit platform.
+				if skip > runEnd-j {
+					return fmt.Errorf("NOP at %d: skip %d leaves its run, which ends at %d", j, skip, runEnd)
+				}
+			}
+			pos = runEnd
+
+		case tagObject, tagArray:
+			endIdx := int(t.data[pos] & containerEndMask)
+			// Smallest legal value is pos+2, an empty container whose closing tag sits
+			// at pos+1. endIdx is exclusive, so endIdx == len(t.data) is legal.
+			if endIdx > len(t.data) || endIdx < pos+2 {
+				return fmt.Errorf("container at %d: invalid end index %d", pos, endIdx)
+			}
+			// A child must close before its parent does.
+			if endIdx > limit {
+				return fmt.Errorf("container at %d: end index %d escapes its parent", pos, endIdx)
+			}
+			want := tagObjEnd
+			if tag == tagArray {
+				want = tagArrEnd
+			}
+			if got := byte(t.data[endIdx-1] >> 56); got != want {
+				return fmt.Errorf("container at %d: end index %d does not close it (found %q)", pos, endIdx, got)
+			}
+			// The count sizes result collections, so an inflated one buys a large
+			// preallocation. Every element occupies at least one entry, so the
+			// container's extent bounds it; the field saturates rather than wrapping,
+			// so a real count never exceeds this.
+			if count := int((t.data[pos] >> 32) & containerCountMask); count > endIdx-pos {
+				return fmt.Errorf("container at %d: count %d exceeds its extent", pos, count)
+			}
+			// readValue, readObject, readArray and marshalTape recurse once per level,
+			// and a stack overflow is fatal — recover cannot catch it. simdjson will not
+			// parse deeper than this, so the bound rejects nothing Parse can emit.
+			if len(stack) >= maxTapeDepth {
+				return fmt.Errorf("container at %d: nesting deeper than %d", pos, maxTapeDepth)
+			}
+			stack = append(stack, endIdx)
+			pos++
+
+		case tagObjEnd, tagArrEnd:
+			n := len(stack)
+			if n == 0 {
+				return fmt.Errorf("tape index %d: closing tag with no open container", pos)
+			}
+			if stack[n-1] != pos+1 {
+				return fmt.Errorf("tape index %d: closing tag is not where end index %d points", pos, stack[n-1])
+			}
+			stack = stack[:n-1]
+			pos++
+
+		case tagInt64, tagUint64, tagDouble:
+			// The value word must sit inside the same container, or a reader would take
+			// a closing tag as the value.
+			if pos+1 >= limit {
+				return fmt.Errorf("numeric entry at %d has no value word", pos)
+			}
+			pos += 2
+
+		case tagString, tagBigint:
+			// String payloads are deliberately NOT validated here. readStringBytes is
+			// the only path to the string buffer and must read the length prefix to
+			// slice at all, so its bounds check is intrinsic rather than an extra
+			// guard — validating offsets here would repeat it and cost 45% of this
+			// walk. A bad offset surfaces as an error from the read instead.
+			pos++
+
+		case tagTrue, tagFalse, tagNull:
+			pos++
+
+		default:
+			return fmt.Errorf("tape index %d: unknown tag %q", pos, tag)
+		}
+	}
+	if n := len(stack); n > 0 {
+		// A backstop, not a reachable branch on current logic: every container's end
+		// index is bounded by its parent's close, and the numeric bound keeps the
+		// cursor from straddling a closing tag, so the walk lands on each close and
+		// pops it. Kept because it is one comparison and it fails closed if either of
+		// those arguments stops holding.
+		return fmt.Errorf("%d container(s) left unclosed at tape index %d", n, end)
+	}
+	return nil
+}
+
 // Interface converts the element to its Go native equivalent.
 // Respects the UseNumber() option set during Parse — numeric values are
 // returned as json.Number when it is enabled.
@@ -326,6 +504,11 @@ func (ti *TapeIter) tag() byte {
 func (ti *TapeIter) payload() uint64 { return ti.tape.data[ti.idx] & payloadMask }
 
 // skipValue returns the tape index after the value at idx.
+//
+// A container's end index is taken from the tape and returned unchanged, with no
+// progress check. That is safe only because Tape.validate has established that every
+// reader-reachable container's end index is at least idx+2, so the cursor always
+// advances. See Tape.validate.
 func (t *Tape) skipValue(idx int) int {
 	tag := t.tapeTagAt(idx)
 	switch tag {
