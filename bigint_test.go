@@ -232,7 +232,12 @@ func TestBigIntStringCvt(t *testing.T) {
 		t.Fatalf("TapeIter.Object: %v", err)
 	}
 	for key, want := range map[string]string{"big": wantBig, "neg": wantNeg, "small": "42"} {
-		got, err := tobj.FindKey(key).StringCvt()
+		kv, ok := tobj.FindKey(key)
+		if !ok {
+			t.Errorf("TapeObject.FindKey(%q): not found", key)
+			continue
+		}
+		got, err := kv.StringCvt()
 		if err != nil {
 			t.Errorf("TapeIter.StringCvt(%q): %v", key, err)
 			continue

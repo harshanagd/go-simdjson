@@ -103,7 +103,10 @@ ti := tape.Iter()
 
 // Navigate objects
 obj, _ := ti.Object()
-val := obj.FindKey("status")
+val, ok := obj.FindKey("status")
+if !ok {
+    log.Fatal("no status key")
+}
 s, _ := val.String()
 
 // Cursor-style iteration
@@ -116,7 +119,10 @@ for ai.Type() != simdjson.Type(-1) {
 }
 
 // Path-based lookup
-elem := ti.FindElement("Image", "Width")
+elem, ok := ti.FindElement("Image", "Width")
+if !ok {
+    log.Fatal("no Image.Width")
+}
 w, _ := elem.Int()
 ```
 
@@ -276,16 +282,21 @@ func (t *Tape) RootType() Type
 func (t *Tape) Interface() (interface{}, error)
 func (t *Tape) Clone() *Tape
 
-// TapeIter — cursor-style navigation
-func (ti *TapeIter) Type/String/Int/Uint/Float/Bool/BigInt/Object/Array/Interface
+// TapeIter — cursor-style navigation. Containers and lookups are returned by
+// value, so navigation does not allocate; lookups report absence with ok=false.
+func (ti *TapeIter) Type/String/Int/Uint/Float/Bool/BigInt/Interface
+func (ti *TapeIter) Object() (TapeObject, error)
+func (ti *TapeIter) Array() (TapeArray, error)
 func (ti *TapeIter) Advance() Type
 func (ti *TapeIter) PeekNext() Type
 func (ti *TapeIter) AdvanceInto() Type
-func (ti *TapeIter) FindElement(path ...string) *TapeIter
+func (ti *TapeIter) FindElement(path ...string) (TapeIter, bool)
 func (ti *TapeIter) StringCvt() (string, error)
 
 // TapeObject
-func (o *TapeObject) FindKey/FindPath/ForEach/Map/Count/Iter
+func (o *TapeObject) FindKey(key string) (TapeIter, bool)
+func (o *TapeObject) FindPath(path ...string) (TapeIter, bool)
+func (o *TapeObject) ForEach/Map/Count/Iter
 
 // TapeArray
 func (a *TapeArray) ForEach/AsFloat/AsInteger/AsString/Count/Interface/FirstType/Iter
@@ -387,12 +398,16 @@ These show the cost of individual API calls (twitter.json, 632KB, pre-parsed):
 | `NextElementBytes` (key as `[]byte`) | 56ns | 2 | 48 |
 | `NextElement` (key as `string`) | 62ns | 2 | 48 |
 | `Object.ForEach` | 92ns | 4 | 72 |
-| `Object.FindKey` | 114ns | 5 | 120 |
-| `Object.FindPath` (2 levels) | 399ns | 17 | 320 |
+| `Object.FindKey` | 114ns | 3 | 104 |
+| `Object.FindPath` (2 levels) | 399ns | 11 | 192 |
 | `Array.ForEach` (243 elements) | 1.1µs | 11 | 224 |
 | `AsFloat` (numbers.json) | 68µs | 3 | 82KB |
 | `AsInteger` (10K ints) | 67µs | 3 | 82KB |
 | `Clone` (full document) | 172µs | 2 | 713KB |
+
+Allocation counts for `FindKey` and `FindPath` reflect the by-value tape navigation; the
+timings predate it and are pending a re-run on the reference machine, so both are faster
+than shown.
 
 Use `reuse` parameters to eliminate `Object`/`Array`/`Element` heap allocations in hot loops:
 

@@ -135,8 +135,8 @@ func TestTapeIterFloat(t *testing.T) {
 	tape, _ := pj.GetTape()
 	ti := TapeIter{tape: tape, idx: 1}
 	obj, _ := ti.Object()
-	vi := obj.FindKey("v")
-	if vi == nil {
+	vi, ok := obj.FindKey("v")
+	if !ok {
 		t.Fatal("key not found")
 	}
 	f, err := vi.Float()

@@ -6,6 +6,7 @@ package simdjson
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -747,5 +748,18 @@ func TestSettersOnTruncatedTape(t *testing.T) {
 	v, err := e.Iter.Float()
 	if err != nil || v != 2.5 {
 		t.Fatalf("Float() after SetFloat = %v, %v; want 2.5, nil", v, err)
+	}
+}
+
+// TestDeleteElemsZeroValueObject covers the nil-object guard. Its condition changed
+// when Object.tobj became a value field, since a value can never be nil.
+func TestDeleteElemsZeroValueObject(t *testing.T) {
+	var o Object
+	err := o.DeleteElems(func(key []byte, i Iter) bool { return true }, nil)
+	if err == nil {
+		t.Fatal("DeleteElems on a zero Object returned no error")
+	}
+	if !strings.Contains(err.Error(), "nil object") {
+		t.Errorf("err = %q, want a nil-object error", err)
 	}
 }

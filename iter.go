@@ -38,7 +38,7 @@ type Iter struct {
 
 // Object represents a JSON object for key-value access.
 type Object struct {
-	tobj        *TapeObject
+	tobj        TapeObject
 	iterPos     int // current position for NextElement
 	copyStrings bool
 	useNumber   bool
@@ -173,19 +173,31 @@ func (i *Iter) Object(reuse *Object) (*Object, error) {
 	return &Object{tobj: tobj, iterPos: tobj.startIdx, copyStrings: i.copyStrings, useNumber: i.useNumber}, nil
 }
 
-// FindKey finds a key in the object and returns an Element.
-// Returns nil if the key is not found.
-func (o *Object) FindKey(key string, reuse *Element) *Element {
-	ti := o.tobj.FindKey(key)
-	if ti == nil {
-		return nil
-	}
+// element wraps a tape position as an Element. This is the only place reuse is
+// written, so a lookup that fails before reaching here leaves it untouched.
+func (o *Object) element(name string, ti TapeIter, reuse *Element) *Element {
+	t := ti.Type()
 	iter := Iter{tape: ti.tape, tapeIdx: ti.idx, copyStrings: o.copyStrings, useNumber: o.useNumber}
 	if reuse != nil {
+		reuse.Name = name
+		reuse.Type = t
 		reuse.Iter = iter
 		return reuse
 	}
-	return &Element{Iter: iter}
+	return &Element{Name: name, Type: t, Iter: iter}
+}
+
+// FindKey finds a key in the object and returns an Element.
+// Returns nil if the key is not found.
+//
+// A non-nil reuse is overwritten and returned, invalidating any Element already
+// sharing that storage.
+func (o *Object) FindKey(key string, reuse *Element) *Element {
+	ti, ok := o.tobj.FindKey(key)
+	if !ok {
+		return nil
+	}
+	return o.element(key, ti, reuse)
 }
 
 // ForEach iterates over all key-value pairs in O(n) time.
@@ -196,13 +208,15 @@ func (o *Object) ForEach(fn func(key string, i Iter) error) error {
 }
 
 // Count returns the number of key-value pairs in the object.
+// This is the count recorded at parse time; it may be stale after DeleteElems
+// (deleted entries become NOPs but the header count is not decremented).
 func (o *Object) Count() (int, error) {
 	return o.tobj.Count(), nil
 }
 
 // Array represents a JSON array for element access.
 type Array struct {
-	tarr        *TapeArray
+	tarr        TapeArray
 	copyStrings bool
 	useNumber   bool
 }
@@ -231,6 +245,8 @@ func (a *Array) ForEach(fn func(i Iter) error) error {
 }
 
 // Count returns the number of elements in the array.
+// This is the count recorded at parse time; it may be stale after DeleteElems
+// (deleted entries become NOPs but the header count is not decremented).
 func (a *Array) Count() (int, error) {
 	return a.tarr.Count(), nil
 }
@@ -282,29 +298,21 @@ func (i *Iter) StringBytes() ([]byte, error) {
 	return b, nil
 }
 
-// FindPath navigates a dot-separated path of object keys from the current element.
+// FindPath navigates a path of object keys from the current element.
+//
+// A non-nil reuse is overwritten and returned, invalidating any Element already
+// sharing that storage. Only the final result is written, so a failed lookup
+// leaves reuse intact.
 func (o *Object) FindPath(reuse *Element, path ...string) (*Element, error) {
-	if len(path) == 0 {
-		return nil, fmt.Errorf("empty path")
+	ti, err := o.tobj.findPath(path)
+	if err != nil {
+		return nil, err
 	}
-	elem := o.FindKey(path[0], reuse)
-	if elem == nil {
-		return nil, fmt.Errorf("key %q not found", path[0])
-	}
-	for _, key := range path[1:] {
-		obj, err := elem.Iter.Object(nil)
-		if err != nil {
-			return nil, fmt.Errorf("key %q: %w", key, err)
-		}
-		elem = obj.FindKey(key, reuse)
-		if elem == nil {
-			return nil, fmt.Errorf("key %q not found", key)
-		}
-	}
-	return elem, nil
+	return o.element(path[len(path)-1], ti, reuse), nil
 }
 
 // FindElement navigates a path of object keys from the root.
+// reuse follows Object.FindPath's contract.
 func (i *Iter) FindElement(reuse *Element, path ...string) (*Element, error) {
 	obj, err := i.Object(nil)
 	if err != nil {
@@ -469,6 +477,10 @@ type Elements struct {
 }
 
 // Lookup returns the element with the given key, or nil if not found.
+//
+// The result points into the Elements slice and is only valid until the next
+// Object.Parse into that same Elements, which overwrites entries in place — the
+// slice does not have to grow. Copy it (`e := *els.Lookup(k)`) to outlive that.
 func (e Elements) Lookup(key string) *Element {
 	idx, ok := e.Index[key]
 	if !ok {
@@ -478,7 +490,7 @@ func (e Elements) Lookup(key string) *Element {
 }
 
 // Parse collects all key-value pairs into an Elements collection.
-// If dst is non-nil it is reused.
+// A non-nil dst is reused, invalidating every *Element from its Lookup.
 func (o *Object) Parse(dst *Elements) (*Elements, error) {
 	if dst == nil {
 		dst = &Elements{
@@ -907,7 +919,7 @@ func (i *Iter) SetNull() error {
 		return nil
 	case tagObject, tagArray:
 		// Container: first entry becomes null, everything through closing tag becomes NOP.
-		endIdx := int(i.tape.data[i.tapeIdx] & 0xffffffff)
+		endIdx := int(i.tape.data[i.tapeIdx] & containerEndMask)
 		i.tape.tapeSetTag(i.tapeIdx, tagNull)
 		i.tape.tapeNopRange(i.tapeIdx+1, endIdx+1)
 		return nil
@@ -919,7 +931,7 @@ func (i *Iter) SetNull() error {
 // If onlyKeys is non-nil, only keys in the set are considered.
 // Deleted entries are replaced with NOP entries in the tape.
 func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[string]struct{}) error {
-	if o.tobj == nil {
+	if o.tobj.tape == nil {
 		return fmt.Errorf("nil object")
 	}
 	t := o.tobj.tape
@@ -1094,7 +1106,7 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 		return append(dst, "null"...), nil
 
 	case tagObject:
-		endIdx := int(t.data[idx] & 0xffffffff)
+		endIdx := int(t.data[idx] & containerEndMask)
 		dst = append(dst, '{')
 		first := true
 		pos := idx + 1
@@ -1131,7 +1143,7 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 		return dst, nil
 
 	case tagArray:
-		endIdx := int(t.data[idx] & 0xffffffff)
+		endIdx := int(t.data[idx] & containerEndMask)
 		dst = append(dst, '[')
 		first := true
 		pos := idx + 1

@@ -34,6 +34,12 @@ const (
 
 	payloadMask = 0x00ffffffffffffff
 
+	// Container entry layout: [tag:8 | count:24 | endIdx:32]
+	// endIdx = one past the closing '}' or ']' tape entry (exclusive end).
+	// count  = number of elements (array) or key-value pairs (object); saturates at 0xffffff.
+	containerEndMask   = 0xffffffff // lower 32 bits: end index
+	containerCountMask = 0xffffff   // bits 32-55 (after >>32): element count
+
 	// Internal byte aliases for tape walking.
 	tagRoot   = byte(TagRoot)
 	tagObject = byte(TagObjectStart)
@@ -234,23 +240,29 @@ func (ti *TapeIter) Bool() (bool, error) {
 }
 
 // Object returns a TapeObject for key-value access.
-func (ti *TapeIter) Object() (*TapeObject, error) {
+func (ti *TapeIter) Object() (obj TapeObject, err error) {
+	if ti.pastEnd() {
+		return obj, fmt.Errorf("iterator past end of tape")
+	}
 	if ti.tag() != tagObject {
-		return nil, fmt.Errorf("element is not an object")
+		return obj, fmt.Errorf("element is not an object")
 	}
 	entry := ti.tape.data[ti.idx]
-	endIdx := int(entry & 0xffffffff)
-	return &TapeObject{tape: ti.tape, startIdx: ti.idx + 1, endIdx: endIdx - 1}, nil
+	endIdx := int(entry & containerEndMask)
+	return TapeObject{tape: ti.tape, startIdx: ti.idx + 1, endIdx: endIdx - 1}, nil
 }
 
 // Array returns a TapeArray for element access.
-func (ti *TapeIter) Array() (*TapeArray, error) {
+func (ti *TapeIter) Array() (arr TapeArray, err error) {
+	if ti.pastEnd() {
+		return arr, fmt.Errorf("iterator past end of tape")
+	}
 	if ti.tag() != tagArray {
-		return nil, fmt.Errorf("element is not an array")
+		return arr, fmt.Errorf("element is not an array")
 	}
 	entry := ti.tape.data[ti.idx]
-	endIdx := int(entry & 0xffffffff)
-	return &TapeArray{tape: ti.tape, startIdx: ti.idx + 1, endIdx: endIdx - 1}, nil
+	endIdx := int(entry & containerEndMask)
+	return TapeArray{tape: ti.tape, startIdx: ti.idx + 1, endIdx: endIdx - 1}, nil
 }
 
 // Interface converts the element to its Go native equivalent.
@@ -320,7 +332,7 @@ func (t *Tape) skipValue(idx int) int {
 	case tagNop:
 		return t.tapeSkipNop(idx)
 	case tagObject, tagArray:
-		return int(t.data[idx] & 0xffffffff) // end index (past closing tag)
+		return int(t.data[idx] & containerEndMask) // end index (past closing tag)
 	case tagInt64, tagUint64, tagDouble:
 		return idx + 2
 	default:
@@ -337,7 +349,7 @@ type TapeObject struct {
 
 // FindKey finds a key in the object. Returns nil if not found.
 // NOP padding left behind by DeleteElems is skipped.
-func (o *TapeObject) FindKey(key string) *TapeIter {
+func (o *TapeObject) FindKey(key string) (iter TapeIter, ok bool) {
 	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	for pos < o.endIdx {
 		if o.tape.tapeTagAt(pos) != tagString {
@@ -345,14 +357,14 @@ func (o *TapeObject) FindKey(key string) *TapeIter {
 		}
 		// A key that fails to decode cannot match, so skip past it. FindKey has
 		// no error return; use ForEach if you need the failure reported.
-		k, _ := o.tape.readString(o.tape.tapePayloadAt(pos))
+		k, err := o.tape.readString(o.tape.tapePayloadAt(pos))
 		valIdx := pos + 1
-		if k == key {
-			return &TapeIter{tape: o.tape, idx: valIdx}
+		if err == nil && k == key {
+			return TapeIter{tape: o.tape, idx: valIdx}, true
 		}
 		pos = o.tape.skipNopsUntil(o.tape.skipValue(valIdx), o.endIdx)
 	}
-	return nil
+	return iter, false
 }
 
 // ForEach iterates over all key-value pairs.
@@ -401,30 +413,46 @@ func (o *TapeObject) Map(dst map[string]interface{}) (map[string]interface{}, er
 }
 
 // Count returns the number of key-value pairs.
+// This is the count recorded at parse time; it may be stale after tape mutations
+// (deleted entries become NOPs but the header count is not decremented).
 func (o *TapeObject) Count() int {
-	return int((o.tape.data[o.startIdx-1] >> 32) & 0xffffff)
+	return int((o.tape.data[o.startIdx-1] >> 32) & containerCountMask)
 }
 
-// FindPath navigates a path of nested keys.
-func (o *TapeObject) FindPath(path ...string) *TapeIter {
+// findPath walks a path of object keys and returns the final value, naming the key
+// that failed. FindPath and Object.FindPath share it so the descent exists once.
+func (o *TapeObject) findPath(path []string) (iter TapeIter, err error) {
 	if len(path) == 0 {
-		return nil
+		return iter, fmt.Errorf("empty path")
 	}
-	iter := o.FindKey(path[0])
-	if iter == nil {
-		return nil
-	}
-	for _, key := range path[1:] {
-		obj, err := iter.Object()
+	cur := *o
+	for _, key := range path[:len(path)-1] {
+		ti, ok := cur.FindKey(key)
+		if !ok {
+			return iter, fmt.Errorf("key %q not found", key)
+		}
+		next, err := ti.Object()
 		if err != nil {
-			return nil
+			return iter, fmt.Errorf("key %q: %w", key, err)
 		}
-		iter = obj.FindKey(key)
-		if iter == nil {
-			return nil
-		}
+		cur = next
 	}
-	return iter
+	last := path[len(path)-1]
+	ti, ok := cur.FindKey(last)
+	if !ok {
+		return iter, fmt.Errorf("key %q not found", last)
+	}
+	return ti, nil
+}
+
+// FindPath finds a nested value by a path of object keys.
+// ok is false if any key is missing or an intermediate value is not an object.
+func (o *TapeObject) FindPath(path ...string) (iter TapeIter, ok bool) {
+	iter, err := o.findPath(path)
+	if err != nil {
+		return TapeIter{}, false
+	}
+	return iter, true
 }
 
 // TapeArray provides element access over the tape.
@@ -449,8 +477,10 @@ func (a *TapeArray) ForEach(fn func(val TapeIter) error) error {
 }
 
 // Count returns the number of elements.
+// This is the count recorded at parse time; it may be stale after tape mutations
+// (deleted entries become NOPs but the header count is not decremented).
 func (a *TapeArray) Count() int {
-	return int((a.tape.data[a.startIdx-1] >> 32) & 0xffffff)
+	return int((a.tape.data[a.startIdx-1] >> 32) & containerCountMask)
 }
 
 // AsInteger returns all elements as []int64.
@@ -572,8 +602,8 @@ func (t *Tape) readValue(idx int) (interface{}, int, error) {
 
 func (t *Tape) readObject(idx int) (map[string]interface{}, int, error) {
 	entry := t.data[idx]
-	endIdx := int(entry & 0xffffffff)
-	count := int((entry >> 32) & 0xffffff)
+	endIdx := int(entry & containerEndMask)
+	count := int((entry >> 32) & containerCountMask)
 	result := make(map[string]interface{}, count)
 	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
@@ -597,8 +627,8 @@ func (t *Tape) readObject(idx int) (map[string]interface{}, int, error) {
 
 func (t *Tape) readArray(idx int) ([]interface{}, int, error) {
 	entry := t.data[idx]
-	endIdx := int(entry & 0xffffffff)
-	count := int((entry >> 32) & 0xffffff)
+	endIdx := int(entry & containerEndMask)
+	count := int((entry >> 32) & containerCountMask)
 	result := make([]interface{}, 0, count)
 	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
@@ -698,8 +728,8 @@ func (t *Tape) readValueNum(idx int) (interface{}, int, error) {
 
 func (t *Tape) readObjectNum(idx int) (map[string]interface{}, int, error) {
 	entry := t.data[idx]
-	endIdx := int(entry & 0xffffffff)
-	count := int((entry >> 32) & 0xffffff)
+	endIdx := int(entry & containerEndMask)
+	count := int((entry >> 32) & containerCountMask)
 	result := make(map[string]interface{}, count)
 	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
@@ -723,8 +753,8 @@ func (t *Tape) readObjectNum(idx int) (map[string]interface{}, int, error) {
 
 func (t *Tape) readArrayNum(idx int) ([]interface{}, int, error) {
 	entry := t.data[idx]
-	endIdx := int(entry & 0xffffffff)
-	count := int((entry >> 32) & 0xffffff)
+	endIdx := int(entry & containerEndMask)
+	count := int((entry >> 32) & containerCountMask)
 	result := make([]interface{}, 0, count)
 	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
@@ -793,13 +823,13 @@ func (ti *TapeIter) AdvanceInto() Type {
 }
 
 // FindElement navigates a path of object keys from the current element.
-func (ti *TapeIter) FindElement(path ...string) *TapeIter {
+func (ti *TapeIter) FindElement(path ...string) (iter TapeIter, ok bool) {
 	if len(path) == 0 {
-		return nil
+		return iter, false
 	}
 	obj, err := ti.Object()
 	if err != nil {
-		return nil
+		return iter, false
 	}
 	return obj.FindPath(path...)
 }

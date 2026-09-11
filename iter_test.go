@@ -807,7 +807,7 @@ func TestNextElementBytesTruncatedTape(t *testing.T) {
 		copyStrings: true,
 	}
 	obj := &Object{
-		tobj:        &TapeObject{tape: tape, startIdx: 1, endIdx: 2},
+		tobj:        TapeObject{tape: tape, startIdx: 1, endIdx: 2},
 		iterPos:     1,
 		copyStrings: true,
 	}
@@ -833,7 +833,7 @@ func TestNextElementBytesPropagatesStringError(t *testing.T) {
 		copyStrings: true,
 	}
 	obj := &Object{
-		tobj:        &TapeObject{tape: tape, startIdx: 1, endIdx: 3},
+		tobj:        TapeObject{tape: tape, startIdx: 1, endIdx: 3},
 		iterPos:     1,
 		copyStrings: true,
 	}
@@ -957,7 +957,7 @@ func TestNextElementBytesUsesTagType(t *testing.T) {
 		copyStrings: true,
 	}
 	obj := &Object{
-		tobj:        &TapeObject{tape: tape, startIdx: 1, endIdx: 4},
+		tobj:        TapeObject{tape: tape, startIdx: 1, endIdx: 4},
 		iterPos:     1,
 		copyStrings: true,
 	}
@@ -1311,5 +1311,249 @@ func TestIterRootIntoAliasedDst(t *testing.T) {
 	m, ok := v.(map[string]interface{})
 	if !ok || m["n"] != int64(2) {
 		t.Errorf("Root(&self) = %#v, want the second document", v)
+	}
+}
+
+// --- #22: Element aliasing and lifetime ---
+
+// FindKey set only Iter, so a fresh Element had Name "" / Type(0) and a reused one
+// kept the Name and Type of whatever key it held before — describing a different
+// key than its own Iter.
+func TestFindKeyPopulatesNameAndType(t *testing.T) {
+	pj, err := Parse([]byte(`{"name":"alice","age":30}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+
+	t.Run("fresh", func(t *testing.T) {
+		e := obj.FindKey("name", nil)
+		if e == nil {
+			t.Fatal("FindKey returned nil")
+		}
+		if e.Name != "name" {
+			t.Errorf("Name = %q, want \"name\"", e.Name)
+		}
+		if e.Type != TypeString {
+			t.Errorf("Type = %v, want %v", e.Type, TypeString)
+		}
+	})
+
+	t.Run("reused_does_not_keep_stale_fields", func(t *testing.T) {
+		// Parse does populate the fields, so use it to seed a mismatched Element.
+		els, err := obj.Parse(nil)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		seeded := els.Lookup("age")
+		if seeded == nil || seeded.Name != "age" || seeded.Type != TypeInt64 {
+			t.Fatalf("seed Element = %+v, want Name \"age\" Type int64", seeded)
+		}
+
+		got := obj.FindKey("name", seeded)
+		if got.Name != "name" {
+			t.Errorf("Name = %q, want \"name\" (stale value retained)", got.Name)
+		}
+		if got.Type != TypeString {
+			t.Errorf("Type = %v, want %v (stale value retained)", got.Type, TypeString)
+		}
+		v, err := got.Iter.String()
+		if err != nil || v != "alice" {
+			t.Fatalf("Iter.String() = %q, %v; want \"alice\", nil", v, err)
+		}
+	})
+}
+
+// FindPath wrote reuse at every level, so a lookup failing partway left the
+// caller's Element holding an interior value.
+func TestFindPathLeavesReuseIntactOnFailure(t *testing.T) {
+	pj, err := Parse([]byte(`{"name":"alice","Image":{"Width":800,"Deep":{"X":1}}}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path []string
+	}{
+		{"fails_at_level_2", []string{"Image", "NoSuchKey"}},
+		{"fails_at_level_3", []string{"Image", "Deep", "Nope"}},
+		{"fails_at_level_1", []string{"NoSuchTop", "Width"}},
+		{"intermediate_not_an_object", []string{"name", "Width"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reuse Element
+			held := obj.FindKey("name", &reuse)
+			wantName, wantType := held.Name, held.Type
+			wantVal, err := held.Iter.String()
+			if err != nil {
+				t.Fatalf("seed String: %v", err)
+			}
+
+			if _, err := obj.FindPath(&reuse, tc.path...); err == nil {
+				t.Fatalf("FindPath(%v) succeeded, want an error", tc.path)
+			}
+
+			if held.Name != wantName || held.Type != wantType {
+				t.Errorf("after a failed FindPath the held Element became Name=%q Type=%v, want Name=%q Type=%v",
+					held.Name, held.Type, wantName, wantType)
+			}
+			got, err := held.Iter.String()
+			if err != nil || got != wantVal {
+				t.Errorf("after a failed FindPath the held Element reads %q (%v), want %q",
+					got, err, wantVal)
+			}
+		})
+	}
+}
+
+// The behaviour the aliasing fix must not disturb.
+func TestFindPathSuccess(t *testing.T) {
+	pj, err := Parse([]byte(`{"Image":{"Width":800,"Deep":{"X":1}}}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+
+	t.Run("two_levels_into_reuse", func(t *testing.T) {
+		var reuse Element
+		e, err := obj.FindPath(&reuse, "Image", "Width")
+		if err != nil {
+			t.Fatalf("FindPath: %v", err)
+		}
+		if e != &reuse {
+			t.Error("FindPath did not return the reuse storage it was given")
+		}
+		if e.Name != "Width" || e.Type != TypeInt64 {
+			t.Errorf("Name=%q Type=%v, want \"Width\" int64", e.Name, e.Type)
+		}
+		v, err := e.Iter.Int()
+		if err != nil || v != 800 {
+			t.Fatalf("Int() = %v, %v; want 800, nil", v, err)
+		}
+	})
+
+	t.Run("three_levels", func(t *testing.T) {
+		var reuse Element
+		e, err := obj.FindPath(&reuse, "Image", "Deep", "X")
+		if err != nil {
+			t.Fatalf("FindPath: %v", err)
+		}
+		v, err := e.Iter.Int()
+		if err != nil || v != 1 {
+			t.Fatalf("Int() = %v, %v; want 1, nil", v, err)
+		}
+		if e.Name != "X" {
+			t.Errorf("Name = %q, want \"X\"", e.Name)
+		}
+	})
+
+	t.Run("nil_reuse", func(t *testing.T) {
+		e, err := obj.FindPath(nil, "Image", "Width")
+		if err != nil {
+			t.Fatalf("FindPath: %v", err)
+		}
+		v, _ := e.Iter.Int()
+		if v != 800 || e.Name != "Width" {
+			t.Errorf("got Name=%q value=%v, want \"Width\" 800", e.Name, v)
+		}
+	})
+
+	t.Run("single_level", func(t *testing.T) {
+		var reuse Element
+		e, err := obj.FindPath(&reuse, "Image")
+		if err != nil {
+			t.Fatalf("FindPath: %v", err)
+		}
+		if e.Name != "Image" || e.Type != TypeObject {
+			t.Errorf("Name=%q Type=%v, want \"Image\" object", e.Name, e.Type)
+		}
+	})
+
+	t.Run("empty_path", func(t *testing.T) {
+		if _, err := obj.FindPath(nil); err == nil {
+			t.Error("FindPath with no keys returned no error")
+		}
+	})
+}
+
+// Locks Lookup's documented lifetime. Not a fix: Lookup still returns a pointer
+// into the slice, since changing that is an API break. Note the hazard does not
+// need the slice to grow — Parse overwrites in place.
+func TestElementsLookupInvalidatedByParseReuse(t *testing.T) {
+	first, err := Parse([]byte(`{"a":1,"b":2}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer first.Close()
+	i1, _ := first.Iter()
+	o1, err := i1.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	els, err := o1.Parse(nil)
+	if err != nil {
+		t.Fatalf("Object.Parse: %v", err)
+	}
+
+	held := els.Lookup("a")
+	if held == nil {
+		t.Fatal("Lookup(\"a\") = nil")
+	}
+	if v, err := held.Iter.Int(); err != nil || v != 1 {
+		t.Fatalf("held reads %v, %v; want 1, nil", v, err)
+	}
+	safe := *held // the documented workaround
+	capBefore := cap(els.Elements)
+
+	// Same key count, so no reallocation is needed for the hazard to bite.
+	second, err := Parse([]byte(`{"x":10,"y":20}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer second.Close()
+	i2, _ := second.Iter()
+	o2, err := i2.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	if _, err := o2.Parse(els); err != nil {
+		t.Fatalf("Object.Parse into the same Elements: %v", err)
+	}
+	if cap(els.Elements) != capBefore {
+		t.Logf("note: cap changed %d -> %d; the hazard does not depend on it",
+			capBefore, cap(els.Elements))
+	}
+
+	// The held pointer now reads the second document.
+	if held.Name != "x" {
+		t.Errorf("held.Name = %q, want \"x\" — Lookup's documented invalidation no longer holds", held.Name)
+	}
+	if v, err := held.Iter.Int(); err != nil || v != 10 {
+		t.Errorf("held reads %v, %v; want 10, nil — Lookup's documented invalidation no longer holds", v, err)
+	}
+
+	// The copy is unaffected.
+	if safe.Name != "a" {
+		t.Errorf("copied Element Name = %q, want \"a\"", safe.Name)
+	}
+	if v, err := safe.Iter.Int(); err != nil || v != 1 {
+		t.Errorf("copied Element reads %v, %v; want 1, nil", v, err)
 	}
 }

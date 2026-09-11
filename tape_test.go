@@ -2,6 +2,7 @@ package simdjson
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -90,8 +91,8 @@ func TestTapeIter(t *testing.T) {
 	obj, _ := iter.Object()
 
 	t.Run("FindKey string", func(t *testing.T) {
-		v := obj.FindKey("name")
-		if v == nil {
+		v, ok := obj.FindKey("name")
+		if !ok {
 			t.Fatal("not found")
 		}
 		s, _ := v.String()
@@ -101,7 +102,7 @@ func TestTapeIter(t *testing.T) {
 	})
 
 	t.Run("FindKey int", func(t *testing.T) {
-		v := obj.FindKey("count")
+		v, _ := obj.FindKey("count")
 		n, _ := v.Int()
 		if n != 42 {
 			t.Fatalf("expected 42, got %d", n)
@@ -109,7 +110,7 @@ func TestTapeIter(t *testing.T) {
 	})
 
 	t.Run("FindKey float", func(t *testing.T) {
-		v := obj.FindKey("pi")
+		v, _ := obj.FindKey("pi")
 		f, _ := v.Float()
 		if f != 3.14 {
 			t.Fatalf("expected 3.14, got %f", f)
@@ -117,7 +118,7 @@ func TestTapeIter(t *testing.T) {
 	})
 
 	t.Run("FindKey bool", func(t *testing.T) {
-		v := obj.FindKey("ok")
+		v, _ := obj.FindKey("ok")
 		b, _ := v.Bool()
 		if !b {
 			t.Fatal("expected true")
@@ -125,8 +126,8 @@ func TestTapeIter(t *testing.T) {
 	})
 
 	t.Run("FindKey missing", func(t *testing.T) {
-		if obj.FindKey("missing") != nil {
-			t.Fatal("expected nil")
+		if _, ok := obj.FindKey("missing"); ok {
+			t.Fatal("expected not-found")
 		}
 	})
 
@@ -181,8 +182,8 @@ func TestTapeFindPath(t *testing.T) {
 	iter := tape.Iter()
 	obj, _ := iter.Object()
 
-	v := obj.FindPath("Image", "Thumbnail", "Url")
-	if v == nil {
+	v, ok := obj.FindPath("Image", "Thumbnail", "Url")
+	if !ok {
 		t.Fatal("not found")
 	}
 	s, _ := v.String()
@@ -190,8 +191,8 @@ func TestTapeFindPath(t *testing.T) {
 		t.Fatalf("expected URL, got %q", s)
 	}
 
-	if obj.FindPath("Image", "Missing") != nil {
-		t.Fatal("expected nil for missing path")
+	if _, ok := obj.FindPath("Image", "Missing"); ok {
+		t.Fatal("expected not-found for missing path")
 	}
 }
 
@@ -266,7 +267,7 @@ func deleteFromArray(t *testing.T, input string, drop func(i Iter) bool) (*Parse
 	if err != nil {
 		t.Fatalf("TapeIter.Array: %v", err)
 	}
-	return pj, *tarr
+	return pj, tarr
 }
 
 // deleteFromObject is the object counterpart of deleteFromArray.
@@ -297,7 +298,7 @@ func deleteFromObject(t *testing.T, input string, drop func(key []byte, i Iter) 
 	if err != nil {
 		t.Fatalf("TapeIter.Object: %v", err)
 	}
-	return pj, *tobj
+	return pj, tobj
 }
 
 // TestTapeArrayForEachSkipsNops covers the NOP padding DeleteElems leaves on the
@@ -850,8 +851,8 @@ func TestTapeFindElement(t *testing.T) {
 	tape, _ := pj.GetTape()
 	iter := tape.Iter()
 
-	v := iter.FindElement("Image", "Width")
-	if v == nil {
+	v, ok := iter.FindElement("Image", "Width")
+	if !ok {
 		t.Fatal("not found")
 	}
 	n, _ := v.Int()
@@ -958,8 +959,8 @@ func TestUseNumberAppliesToTapeAPI(t *testing.T) {
 	}
 
 	// TapeArray.Interface
-	arrIter := obj.FindKey("arr")
-	if arrIter == nil {
+	arrIter, ok := obj.FindKey("arr")
+	if !ok {
 		t.Fatal("key 'arr' not found")
 	}
 	arr, err := arrIter.Array()
@@ -1038,16 +1039,16 @@ func TestTapeObjectFindKeySkipsNops(t *testing.T) {
 		key string
 		val int64
 	}{{"b", 2}, {"c", 3}} {
-		it := obj.FindKey(want.key)
-		if it == nil {
-			t.Fatalf("FindKey(%q) = nil after deleting a preceding key", want.key)
+		it, ok := obj.FindKey(want.key)
+		if !ok {
+			t.Fatalf("FindKey(%q) not found after deleting a preceding key", want.key)
 		}
 		v, err := it.Int()
 		if err != nil || v != want.val {
 			t.Fatalf("FindKey(%q).Int() = %v, %v; want %d, nil", want.key, v, err, want.val)
 		}
 	}
-	if obj.FindKey("a") != nil {
+	if _, ok := obj.FindKey("a"); ok {
 		t.Error("FindKey found the deleted key")
 	}
 }
@@ -1530,6 +1531,114 @@ func TestRootDocGuardIsConsistentAcrossEntryPoints(t *testing.T) {
 			}
 			if calls != 0 {
 				t.Errorf("ForEach called fn %d times for a tape with no root document", calls)
+			}
+		})
+	}
+}
+
+// TestTapeObjectFindKeyIgnoresUndecodableKey covers the failed-decode path. FindKey
+// discarded readString's error, so an undecodable key decoded to "" and then
+// matched a lookup for the empty key, handing back an unrelated value. The fix must
+// not also skip a key that is genuinely the empty string.
+func TestTapeObjectFindKeyIgnoresUndecodableKey(t *testing.T) {
+	// keyOffset lands in data[2]; strs backs the string buffer.
+	build := func(keyOffset uint64, strs []byte) TapeObject {
+		tp := &Tape{
+			data: []uint64{
+				uint64(tagRoot) << 56,
+				uint64(tagObject)<<56 | 5, // '{' at 1, endIdx 5
+				uint64(tagString)<<56 | keyOffset,
+				uint64(tagTrue) << 56,   // value at 3
+				uint64(tagObjEnd) << 56, // '}' at 4
+			},
+			strings: strs,
+		}
+		return TapeObject{tape: tp, startIdx: 2, endIdx: 4}
+	}
+
+	t.Run("undecodable key never matches", func(t *testing.T) {
+		obj := build(999, []byte{}) // offset past an empty buffer
+		if ti, ok := obj.FindKey(""); ok {
+			got, _ := ti.Bool()
+			t.Errorf("FindKey(\"\") matched an undecodable key and returned %v", got)
+		}
+	})
+
+	t.Run("genuinely empty key still matches", func(t *testing.T) {
+		obj := build(0, []byte{0, 0, 0, 0}) // uint32 length 0 => ("", nil)
+		ti, ok := obj.FindKey("")
+		if !ok {
+			t.Fatal("FindKey(\"\") missed a key that is genuinely the empty string")
+		}
+		if got, err := ti.Bool(); err != nil || !got {
+			t.Errorf("value = %v, %v; want true, nil", got, err)
+		}
+	})
+}
+
+// TestTapeIterObjectArrayPastEnd covers the guards on Object and Array. Without
+// them a past-end iterator fell through to the tag check and reported the wrong
+// reason ("element is not an object" rather than being out of range).
+func TestTapeIterObjectArrayPastEnd(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	tape, err := pj.GetTape()
+	if err != nil {
+		t.Fatalf("GetTape: %v", err)
+	}
+
+	for _, idx := range []int{len(tape.data), len(tape.data) + 10, -1} {
+		ti := TapeIter{tape: tape, idx: idx}
+		if _, err := ti.Object(); err == nil {
+			t.Errorf("idx %d: Object() returned no error past end of tape", idx)
+		} else if !strings.Contains(err.Error(), "past end") {
+			t.Errorf("idx %d: Object() = %q, want a past-end error", idx, err)
+		}
+		if _, err := ti.Array(); err == nil {
+			t.Errorf("idx %d: Array() returned no error past end of tape", idx)
+		} else if !strings.Contains(err.Error(), "past end") {
+			t.Errorf("idx %d: Array() = %q, want a past-end error", idx, err)
+		}
+	}
+}
+
+// TestTapeLookupsZeroValueOnMiss pins the by-value not-found contract: a failed
+// lookup must yield a zero TapeIter, not a half-populated one that reads the tape.
+func TestTapeLookupsZeroValueOnMiss(t *testing.T) {
+	pj, err := Parse([]byte(`{"Image":{"Width":800},"n":1}`), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	root := tape.Iter()
+	obj, err := root.Object()
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+
+	var zero TapeIter
+	for _, tc := range []struct {
+		name string
+		got  func() (TapeIter, bool)
+	}{
+		{"FindKey", func() (TapeIter, bool) { return obj.FindKey("nope") }},
+		{"FindPath missing leaf", func() (TapeIter, bool) { return obj.FindPath("Image", "nope") }},
+		{"FindPath non-object intermediate", func() (TapeIter, bool) { return obj.FindPath("n", "Width") }},
+		{"FindPath empty", func() (TapeIter, bool) { return obj.FindPath() }},
+		{"FindElement", func() (TapeIter, bool) { return root.FindElement("nope") }},
+		{"FindElement empty", func() (TapeIter, bool) { return root.FindElement() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ti, ok := tc.got()
+			if ok {
+				t.Fatal("lookup unexpectedly succeeded")
+			}
+			if ti != zero {
+				t.Errorf("not-found returned %+v, want the zero TapeIter", ti)
 			}
 		})
 	}
