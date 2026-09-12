@@ -279,12 +279,18 @@ func (ti *TapeIter) Array() (arr TapeArray, err error) {
 // by Serializer.Deserialize is arbitrary bytes, so it must be validated here before
 // any walker touches it.
 //
-// The walk visits only real entries: it follows the root-block chain and steps over
-// numeric value words and NOP runs. That matters because the word after each closing
-// root is padding that simdjson never writes, so it holds whatever was previously in
-// that memory; a naive linear scan would read it as a tag and could reject a valid
-// tape. It is iterative rather than recursive because nesting depth here is untrusted
-// (Deserialize bypasses simdjson's depth limit).
+// What it does NOT establish: that an object's entries alternate key then value. It
+// classifies entries, and a string is just an entry, so a deserialized object can hold
+// a bare value and still pass here. The object readers report that as
+// "expected string key at N" — those checks are load-bearing, not redundant.
+//
+// The walk inspects every word rather than following NOP skips, and requires each skip
+// to stay inside its own run, because the readers DO honour skips: the two must agree
+// on where an entry begins. It never reads the word after a closing root — simdjson
+// does not write that padding, so it holds whatever was previously in that memory, and
+// reading it as a tag could reject a VALID tape. It is iterative rather than recursive
+// because nesting depth here is untrusted (Deserialize bypasses simdjson's depth
+// limit).
 func (t *Tape) validate() error {
 	if len(t.data) == 0 {
 		return nil
@@ -530,8 +536,14 @@ type TapeObject struct {
 	endIdx   int // index of closing '}'
 }
 
-// FindKey finds a key in the object. Returns nil if not found.
+// FindKey finds a key in the object. Returns the zero TapeIter and false if not found.
 // NOP padding left behind by DeleteElems is skipped.
+//
+// Unlike ForEach, a non-string tag where a key belongs is reported as "not found"
+// rather than as an error, because this signature has nowhere to put one. That state is
+// reachable: Tape.validate classifies entries and does not enforce that objects
+// alternate key then value, so a deserialized object can hold a bare value. Use ForEach
+// or Map if a malformed object must be distinguished from an absent key.
 func (o *TapeObject) FindKey(key string) (iter TapeIter, ok bool) {
 	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	for pos < o.endIdx {
@@ -552,11 +564,23 @@ func (o *TapeObject) FindKey(key string) (iter TapeIter, ok bool) {
 
 // ForEach iterates over all key-value pairs.
 // NOP padding left behind by DeleteElems is skipped.
+//
+// A non-string tag where a key belongs is reported rather than treated as the end of
+// iteration, matching Tape.readObject so the two layers agree. This is NOT a redundant
+// guard: Tape.validate does not enforce that objects alternate key then value, so a
+// deserialized tape can hold an object containing a bare value and still pass the
+// boundary. Reporting it is what keeps that from becoming a silently short result.
+//
+// It is not needed for termination — the pos < endIdx bound handles that, and removing
+// this check breaks no test that uses a well-formed tape. So once validation covers
+// alternation, this check and its three siblings (FindKey, readObject, readObjectNum,
+// plus marshalTape) should be DELETED rather than kept as backstops: the layers should
+// agree by all trusting the tape, not by all re-checking it.
 func (o *TapeObject) ForEach(fn func(key string, val TapeIter) error) error {
 	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	for pos < o.endIdx {
 		if o.tape.tapeTagAt(pos) != tagString {
-			break
+			return fmt.Errorf("expected string key at %d", pos)
 		}
 		key, err := o.tape.readString(o.tape.tapePayloadAt(pos))
 		if err != nil {

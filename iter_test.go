@@ -1557,3 +1557,143 @@ func TestElementsLookupInvalidatedByParseReuse(t *testing.T) {
 		t.Errorf("copied Element reads %v, %v; want 1, nil", v, err)
 	}
 }
+
+// TestObjectWalkersAgreeOnAMalformedObject covers the two layers disagreeing about an
+// object whose entries stop looking like key/value pairs before its end index.
+// Tape.readObject reported it; TapeObject.ForEach broke out of its loop and returned
+// nil, so Iter.Interface errored on a tape that TapeObject.ForEach called clean.
+//
+// Only constructible in-package: Deserialize rejects such a tape, so this pins the
+// consistency rather than a reachable failure.
+func TestObjectWalkersAgreeOnAMalformedObject(t *testing.T) {
+	// An object with one valid pair, then a stray null where the next key belongs.
+	//   0 root | 1 '{' end 6 | 2 "k" | 3 null (value) | 4 null (not a key) | 5 '}'
+	//   6 closing root | 7 padding
+	strs := make([]byte, 8)
+	binary.NativeEndian.PutUint32(strs[0:4], 1)
+	strs[4] = 'k'
+	tp := &Tape{
+		data: []uint64{
+			tapeEntry(tagRoot, 7),
+			uint64(tagObject)<<56 | 1<<32 | 6,
+			tapeEntry(tagString, 0),
+			tapeEntry(tagNull, 0),
+			tapeEntry(tagNull, 0),
+			tapeEntry(tagObjEnd, 1),
+			tapeEntry(tagRoot, 0),
+			0,
+		},
+		strings: strs,
+	}
+
+	// The tape layer's own reader has always reported this.
+	if _, _, err := tp.readObject(1); err == nil {
+		t.Error("readObject accepted a malformed object")
+	}
+
+	ti := tp.Iter()
+	obj, err := ti.Object()
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	if err := obj.ForEach(func(string, TapeIter) error { return nil }); err == nil {
+		t.Error("TapeObject.ForEach reported success on a malformed object")
+	}
+	if _, err := obj.Map(nil); err == nil {
+		t.Error("TapeObject.Map reported success on a malformed object")
+	}
+
+	// The Iter layer delegates, so it must agree.
+	it := Iter{tape: tp, tapeIdx: 1}
+	o, err := it.Object(nil)
+	if err != nil {
+		t.Fatalf("Iter.Object: %v", err)
+	}
+	if err := o.ForEach(func(string, Iter) error { return nil }); err == nil {
+		t.Error("Object.ForEach reported success on a malformed object")
+	}
+	if _, err := it.Interface(); err == nil {
+		t.Error("Iter.Interface reported success on a malformed object")
+	}
+	// marshalTape had the same silent break, so it emitted a truncated document
+	// with a nil error.
+	if b, err := it.MarshalJSON(); err == nil {
+		t.Errorf("Iter.MarshalJSON reported success on a malformed object, emitting %s", b)
+	}
+
+	// FindKey cannot report it — its signature has nowhere to put an error — so it
+	// reports the key as absent. Documented, and asserted so the asymmetry is
+	// deliberate rather than accidental.
+	if _, ok := obj.FindKey("nope"); ok {
+		t.Error("FindKey claimed to find a key in a malformed object")
+	}
+}
+
+// TestIterBigIntMatchesTapeIter covers the Iter layer having had no BigInt at all,
+// despite TypeBigInt existing and Iter.StringCvt handling it — the only scalar
+// accessor that was missing from the pair.
+func TestIterBigIntMatchesTapeIter(t *testing.T) {
+	const big = `{"v":123456789012345678901234567890}`
+	pj, err := Parse([]byte(big), nil, UseBigInt())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatalf("Object: %v", err)
+	}
+	elem := obj.FindKey("v", nil)
+	if elem == nil {
+		t.Fatal("key v not found")
+	}
+	if elem.Iter.Type() != TypeBigInt {
+		t.Fatalf("Type = %v, want %v", elem.Iter.Type(), TypeBigInt)
+	}
+
+	got, err := elem.Iter.BigInt()
+	if err != nil {
+		t.Fatalf("Iter.BigInt: %v", err)
+	}
+	if got != json.Number("123456789012345678901234567890") {
+		t.Errorf("Iter.BigInt = %q, want the full digits", got)
+	}
+
+	// Wrong type must error, not return a zero value.
+	root, _ := pj.Iter()
+	if _, err := root.BigInt(); err == nil {
+		t.Error("BigInt on an object returned no error")
+	}
+}
+
+// TestArrayFirstTypeMatchesTapeArray covers FirstType existing only on the tape layer.
+func TestArrayFirstTypeMatchesTapeArray(t *testing.T) {
+	for _, tt := range []struct {
+		json string
+		want Type
+	}{
+		{`{"a":["x",1]}`, TypeString},
+		{`{"a":[1,"x"]}`, TypeInt64},
+		{`{"a":[[1]]}`, TypeArray},
+		{`{"a":[]}`, Type(-1)},
+	} {
+		t.Run(tt.json, func(t *testing.T) {
+			pj, err := Parse([]byte(tt.json), nil)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			defer pj.Close()
+			iter, _ := pj.Iter()
+			obj, _ := iter.Object(nil)
+			arr, err := obj.FindKey("a", nil).Iter.Array(nil)
+			if err != nil {
+				t.Fatalf("Array: %v", err)
+			}
+			if got := arr.FirstType(); got != tt.want {
+				t.Errorf("Array.FirstType = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

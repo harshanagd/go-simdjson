@@ -6,6 +6,7 @@ package simdjson
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -144,6 +145,13 @@ func (i *Iter) Uint() (uint64, error) {
 	return ti.Uint()
 }
 
+// BigInt returns a JSON integer too large for int64 or uint64 as a json.Number.
+// Only valid on TypeBigInt elements, which appear when UseBigInt or UseNumber is set.
+func (i *Iter) BigInt() (json.Number, error) {
+	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
+	return ti.BigInt()
+}
+
 // Float returns the element value as float64.
 func (i *Iter) Float() (float64, error) {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
@@ -249,6 +257,12 @@ func (a *Array) ForEach(fn func(i Iter) error) error {
 // (deleted entries become NOPs but the header count is not decremented).
 func (a *Array) Count() (int, error) {
 	return a.tarr.Count(), nil
+}
+
+// FirstType returns the type of the first element without consuming it, or Type(-1)
+// for an empty array. NOP padding left by DeleteElems is skipped.
+func (a *Array) FirstType() Type {
+	return a.tarr.FirstType()
 }
 
 // Interface converts the element to its Go native equivalent:
@@ -1131,7 +1145,7 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 				continue
 			}
 			if ptag != tagString {
-				break
+				return nil, fmt.Errorf("expected string key at %d", pos)
 			}
 			if !first {
 				dst = append(dst, ',')

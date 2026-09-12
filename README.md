@@ -90,9 +90,25 @@ iter, _ = pj.Iter()
 v, _ := iter.Interface() // map[string]interface{}, []interface{}, etc.
 ```
 
-## Tape Navigation (Recommended)
+## Tape Navigation
 
-The tape API provides pure Go navigation with zero CGo overhead per element:
+Both navigation APIs are pure Go with zero CGo per element — `Iter` is a thin
+delegation to `TapeIter`, so the choice between them is not about CGo overhead.
+The difference is allocation:
+
+| | ns/op | B/op | allocs |
+|---|---|---|---|
+| `TapeObject.FindKey` | 15 | 8 | 1 |
+| `Object.FindKey(key, nil)` | 53 | 104 | 3 |
+| `Object.FindKey(key, &reuse)` | 22 | 8 | 1 |
+
+The tape layer returns values and materialises no `Element`, so it allocates less;
+passing a `reuse` brings `Iter` to parity for lookups, and `Advance` is already equal
+on both (`TapeIter.Advance` and `Iter.Advance` are both zero-alloc).
+
+Use `Iter` by default — it has the larger surface, including mutation, marshalling,
+`Root` and `FindElement` with reuse. Reach for the tape layer in allocation-sensitive
+hot loops where you do not need those.
 
 ```go
 pj, _ := simdjson.Parse(data, nil)
@@ -202,6 +218,7 @@ func (i *Iter) StringBytes() ([]byte, error)
 func (i *Iter) StringCvt() (string, error)
 func (i *Iter) Int() (int64, error)
 func (i *Iter) Uint() (uint64, error)
+func (i *Iter) BigInt() (json.Number, error)
 func (i *Iter) Float() (float64, error)
 func (i *Iter) FloatFlags() (float64, FloatFlags, error)
 func (i *Iter) Bool() (bool, error)
@@ -253,6 +270,7 @@ func (a *Array) AsUint64() ([]uint64, error)
 func (a *Array) AsString() ([]string, error)
 func (a *Array) AsStringCvt() ([]string, error)
 func (a *Array) Count() (int, error)
+func (a *Array) FirstType() Type
 func (a *Array) DeleteElems(fn func(i Iter) bool)
 func (a *Array) MarshalJSON() ([]byte, error)
 func (a *Array) MarshalJSONBuffer(dst []byte) ([]byte, error)
@@ -394,7 +412,7 @@ These show the cost of individual API calls (twitter.json, 632KB, pre-parsed):
 | Operation | Time | Allocs | Bytes |
 |-----------|------|--------|-------|
 | `Elements.Lookup` | 18ns | 0 | 0 |
-| `TapeIter.Advance` (tape cursor) | 42ns | 1 | 24 |
+| `TapeIter.Advance` (tape cursor) | 42ns | 0 | 0 |
 | `NextElementBytes` (key as `[]byte`) | 56ns | 2 | 48 |
 | `NextElement` (key as `string`) | 62ns | 2 | 48 |
 | `Object.ForEach` | 92ns | 4 | 72 |
@@ -405,9 +423,9 @@ These show the cost of individual API calls (twitter.json, 632KB, pre-parsed):
 | `AsInteger` (10K ints) | 67µs | 3 | 82KB |
 | `Clone` (full document) | 172µs | 2 | 713KB |
 
-Allocation counts for `FindKey` and `FindPath` reflect the by-value tape navigation; the
-timings predate it and are pending a re-run on the reference machine, so both are faster
-than shown.
+Allocation counts for `TapeIter.Advance`, `FindKey` and `FindPath` reflect the by-value
+tape navigation; the timings predate it and are pending a re-run on the reference
+machine, so all three are faster than shown.
 
 Use `reuse` parameters to eliminate `Object`/`Array`/`Element` heap allocations in hot loops:
 
