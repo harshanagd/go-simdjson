@@ -215,9 +215,9 @@ func (o *Object) ForEach(fn func(key string, i Iter) error) error {
 	})
 }
 
-// Count returns the number of key-value pairs in the object.
-// This is the count recorded at parse time; it may be stale after DeleteElems
-// (deleted entries become NOPs but the header count is not decremented).
+// Count returns the number of key-value pairs in the object. DeleteElems keeps it
+// current. The tape's count field saturates at 16777215, so for an object larger
+// than that this is a lower bound and deletions do not lower it.
 func (o *Object) Count() (int, error) {
 	return o.tobj.Count(), nil
 }
@@ -252,9 +252,9 @@ func (a *Array) ForEach(fn func(i Iter) error) error {
 	})
 }
 
-// Count returns the number of elements in the array.
-// This is the count recorded at parse time; it may be stale after DeleteElems
-// (deleted entries become NOPs but the header count is not decremented).
+// Count returns the number of elements in the array. DeleteElems keeps it current.
+// The tape's count field saturates at 16777215, so for an array larger than that
+// this is a lower bound and deletions do not lower it.
 func (a *Array) Count() (int, error) {
 	return a.tarr.Count(), nil
 }
@@ -805,6 +805,30 @@ func (t *Tape) tapeNopRange(start, end int) {
 	}
 }
 
+// tapeCountObjectEntries counts the key-value pairs in [from, to), stepping over NOP
+// runs. It reads tags and end indices only, never string payloads, so it is safe on
+// the tape that made a key read fail.
+func (t *Tape) tapeCountObjectEntries(from, to int) int {
+	n := 0
+	for p := t.skipNopsUntil(from, to); p < to; p = t.skipNopsUntil(t.skipValue(p+1), to) {
+		n++
+	}
+	return n
+}
+
+// tapeSetContainerCount writes n as the element count of the container header at
+// headerIdx, clamping to containerCountMask the way simdjson's stage 2 does. Callers
+// pass a counted number of surviving elements rather than an adjustment, so a count
+// that reached the field's ceiling at parse time becomes exact again once the
+// container holds few enough elements to represent.
+func (t *Tape) tapeSetContainerCount(headerIdx, n int) {
+	if n > containerCountMask {
+		n = containerCountMask
+	}
+	w := t.data[headerIdx]
+	t.data[headerIdx] = w&^(uint64(containerCountMask)<<32) | uint64(n)<<32
+}
+
 // tapeAppendString appends a string to the string buffer and returns the offset.
 // Format: [4-byte LE length][UTF-8 bytes][null terminator].
 // The buffer is already well-sized from parse; append handles growth if needed.
@@ -954,14 +978,23 @@ func (i *Iter) SetNull() error {
 
 // DeleteElems removes key-value pairs from the object where fn returns true.
 // If onlyKeys is non-nil, only keys in the set are considered.
-// Deleted entries are replaced with NOP entries in the tape.
+// Deleted entries are replaced with NOP entries in the tape, and the object's
+// element count is rewritten from the surviving pairs.
 func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[string]struct{}) error {
 	if o.tobj.tape == nil {
 		return fmt.Errorf("nil object")
 	}
 	t := o.tobj.tape
+	hdr := o.tobj.startIdx - 1
+	count := int((t.data[hdr] >> 32) & containerCountMask)
+	// A saturated header carries no usable total, so this object cannot take the O(1)
+	// shortcut below: it declines the early exit and is walked in full, which restores
+	// an exact count whenever one now fits.
+	saturated := count == containerCountMask
+
 	pos := o.tobj.startIdx
 	n := 0
+	deleted, survived, walkedAll := 0, 0, true
 	for pos < o.tobj.endIdx {
 		tag := t.tapeTagAt(pos)
 		if tag == tagNop {
@@ -971,6 +1004,10 @@ func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[stri
 		startPos := pos
 		keyBytes, err := t.readStringBytes(t.tapePayloadAt(pos))
 		if err != nil {
+			// A bad payload abandons the walk part-way. Counting the untouched tail is
+			// O(tail), but it is exact even for a saturated header, and this path only
+			// runs on a tape whose string offsets are already corrupt.
+			t.tapeSetContainerCount(hdr, survived+t.tapeCountObjectEntries(pos, o.tobj.endIdx))
 			return err
 		}
 		pos++ // past key entry (string tag is 1 entry in DOM tape; length is next)
@@ -978,6 +1015,7 @@ func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[stri
 		if len(onlyKeys) > 0 {
 			if _, ok := onlyKeys[string(keyBytes)]; !ok {
 				pos = t.skipValue(pos)
+				survived++
 				continue
 			}
 		}
@@ -986,22 +1024,36 @@ func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[stri
 		if fn == nil || fn(keyBytes, Iter{tape: t, tapeIdx: pos, copyStrings: o.copyStrings, useNumber: o.useNumber}) {
 			// NOP-fill from key through value (inclusive).
 			t.tapeNopRange(startPos, valueEnd)
+			deleted++
+		} else {
+			survived++
 		}
 		pos = valueEnd
 		n++
-		if len(onlyKeys) > 0 && n == len(onlyKeys) {
-			return nil
+		if len(onlyKeys) > 0 && n == len(onlyKeys) && !saturated {
+			walkedAll = false
+			break
 		}
+	}
+	if walkedAll {
+		t.tapeSetContainerCount(hdr, survived)
+	} else {
+		// Both tape sources declare an exact count -- simdjson at parse time, Validate at
+		// the deserialize boundary -- and each deletion consumed a distinct element, so
+		// this cannot go negative. Saturated headers never reach here.
+		t.tapeSetContainerCount(hdr, count-deleted)
 	}
 	return nil
 }
 
 // DeleteElems removes elements from the array where fn returns true.
-// Deleted entries are replaced with NOP entries in the tape.
+// Deleted entries are replaced with NOP entries in the tape, and the array's
+// element count is rewritten from the surviving elements.
 func (a *Array) DeleteElems(fn func(i Iter) bool) {
 	t := a.tarr.tape
 	pos := a.tarr.startIdx
 	endIdx := a.tarr.endIdx
+	survived := 0
 	for pos < endIdx {
 		tag := t.tapeTagAt(pos)
 		if tag == tagNop {
@@ -1012,9 +1064,12 @@ func (a *Array) DeleteElems(fn func(i Iter) bool) {
 		if fn(Iter{tape: t, tapeIdx: pos, copyStrings: a.copyStrings}) {
 			// NOP-fill the entire element.
 			t.tapeNopRange(pos, valueEnd)
+		} else {
+			survived++
 		}
 		pos = valueEnd
 	}
+	t.tapeSetContainerCount(a.tarr.startIdx-1, survived)
 }
 
 // AdvanceInto steps into a container (object/array), positioning at the first

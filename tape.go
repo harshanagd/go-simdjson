@@ -322,11 +322,14 @@ func (t *Tape) Validate() error {
 	return nil
 }
 
-// validateFrame is one open container. wantKey carries the key/value phase for objects.
-// end is a uint32 to keep the frame at 8 bytes: container end indices come from a 32-bit
-// field, so this is exact, and the stack stays a 256-byte stack-allocated buffer.
+// validateFrame is one open container. wantKey carries the key/value phase for objects,
+// and want/seen the declared against the counted element total. The three fields are
+// uint32 because container end indices and counts both come from 32-bit fields, so a
+// frame is 16 bytes and the cap-32 stack stays a 512-byte stack-allocated buffer.
 type validateFrame struct {
 	end      uint32 // exclusive; the closing tag sits at end-1
+	want     uint32 // element count the header declares
+	seen     uint32 // elements actually counted
 	isObject bool
 	wantKey  bool
 }
@@ -387,12 +390,22 @@ func (t *Tape) validateEntries(start, end int) error {
 			if stack[n-1].isObject && !stack[n-1].wantKey {
 				return fmt.Errorf("object closing at %d has a key with no value", pos)
 			}
+			// The count is what Count() reports and what DeleteElems adjusts, so it has
+			// to describe the contents rather than merely fit inside them. A saturated
+			// field is exempt: it means "at least this many".
+			if w := stack[n-1].want; w != containerCountMask && w != stack[n-1].seen {
+				return fmt.Errorf("container closing at %d declares %d elements but holds %d", pos, w, stack[n-1].seen)
+			}
 			stack = stack[:n-1]
 			pos++
-			// The closed container was its parent object's value. Inlined: a closure
-			// over stack forces it to escape, measured ~2.5x on this walk.
-			if p := len(stack); p > 0 && stack[p-1].isObject {
-				stack[p-1].wantKey = true
+			// The closed container was one element of its parent, and its parent object's
+			// value. Inlined: a closure over stack forces it to escape, measured ~2.5x
+			// on this walk.
+			if p := len(stack); p > 0 {
+				if stack[p-1].isObject {
+					stack[p-1].wantKey = true
+				}
+				stack[p-1].seen++
 			}
 			continue
 		}
@@ -426,9 +439,10 @@ func (t *Tape) validateEntries(start, end int) error {
 			if got := byte(t.data[endIdx-1] >> 56); got != want {
 				return fmt.Errorf("container at %d: end index %d does not close it (found %q)", pos, endIdx, got)
 			}
-			// The count sizes result collections. Every element takes at least one entry,
-			// so the extent bounds it; the field saturates rather than wrapping.
-			if count := int((t.data[pos] >> 32) & containerCountMask); count > endIdx-pos {
+			// Every element takes at least one entry, so the extent bounds the count.
+			// The exact check happens at the pop, once the elements have been counted.
+			count := uint32((t.data[pos] >> 32) & containerCountMask)
+			if int(count) > endIdx-pos {
 				return fmt.Errorf("container at %d: count %d exceeds its extent", pos, count)
 			}
 			// The value readers and marshalTape recurse per level, and a stack overflow
@@ -439,7 +453,7 @@ func (t *Tape) validateEntries(start, end int) error {
 			}
 			// A container is its parent's value but is not complete until it closes, so
 			// the phase advances at the pop and this entry skips the write below.
-			stack = append(stack, validateFrame{end: uint32(endIdx), isObject: tag == tagObject, wantKey: true})
+			stack = append(stack, validateFrame{end: uint32(endIdx), want: count, isObject: tag == tagObject, wantKey: true})
 			pos++
 			continue
 
@@ -463,9 +477,15 @@ func (t *Tape) validateEntries(start, end int) error {
 
 		// An object wants a key next unless the entry just consumed was that key. Only a
 		// string can be a key and the guard above rejected any other tag there, so !key
-		// is correct for every tag reaching this point.
-		if n := len(stack); n > 0 && stack[n-1].isObject {
-			stack[n-1].wantKey = !key
+		// is correct for every tag reaching this point. A consumed value completes one
+		// element: an array entry, or an object's key-value pair.
+		if n := len(stack); n > 0 {
+			if stack[n-1].isObject {
+				stack[n-1].wantKey = !key
+			}
+			if !key {
+				stack[n-1].seen++
+			}
 		}
 	}
 	if n := len(stack); n > 0 {
@@ -621,9 +641,9 @@ func (o *TapeObject) Map(dst map[string]interface{}) (map[string]interface{}, er
 	return dst, err
 }
 
-// Count returns the number of key-value pairs.
-// This is the count recorded at parse time; it may be stale after tape mutations
-// (deleted entries become NOPs but the header count is not decremented).
+// Count returns the number of key-value pairs. DeleteElems keeps it current.
+// The tape's count field saturates at 16777215, so for an object larger than that
+// this is a lower bound and deletions do not lower it.
 func (o *TapeObject) Count() int {
 	return int((o.tape.data[o.startIdx-1] >> 32) & containerCountMask)
 }
@@ -685,9 +705,9 @@ func (a *TapeArray) ForEach(fn func(val TapeIter) error) error {
 	return nil
 }
 
-// Count returns the number of elements.
-// This is the count recorded at parse time; it may be stale after tape mutations
-// (deleted entries become NOPs but the header count is not decremented).
+// Count returns the number of elements. DeleteElems keeps it current.
+// The tape's count field saturates at 16777215, so for an array larger than that
+// this is a lower bound and deletions do not lower it.
 func (a *TapeArray) Count() int {
 	return int((a.tape.data[a.startIdx-1] >> 32) & containerCountMask)
 }

@@ -1839,6 +1839,18 @@ func TestValidateRejectsCorruptTape(t *testing.T) {
 			"exceeds its extent",
 		},
 		{
+			// Count() reports this field and DeleteElems rewrites it, so a count that
+			// merely fits inside the extent is not enough: it must match the contents.
+			// One pair here ("k":true), declared as none.
+			"element count disagrees with the contents",
+			[]uint64{
+				tapeEntry(tagRoot, 6), uint64(tagObject)<<56 | 0<<32 | 5,
+				tapeEntry(tagString, 0), tapeEntry(tagTrue, 0),
+				tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0,
+			},
+			"declares 0 elements but holds 1",
+		},
+		{
 			// A numeric in the block's final slot would borrow the closing root marker
 			// as its value word.
 			"numeric entry has no value word inside its block",
@@ -2041,7 +2053,8 @@ func TestValidateRejectsExcessiveNesting(t *testing.T) {
 		d := make([]uint64, 2*depth+5)
 		d[0] = tapeEntry(tagRoot, uint64(closeIdx+1))
 		for p := 1; p <= depth; p++ {
-			d[p] = uint64(tagArray)<<56 | uint64(2*depth+4-p)
+			// Each level holds exactly one element: the next array, or the int.
+			d[p] = uint64(tagArray)<<56 | 1<<32 | uint64(2*depth+4-p)
 		}
 		d[depth+1] = tapeEntry(tagInt64, 0)
 		d[depth+2] = 7

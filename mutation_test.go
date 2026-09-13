@@ -1005,3 +1005,129 @@ func TestMutationsKeepTheTapeValid(t *testing.T) {
 		})
 	}
 }
+
+// Count sizes the collections built from a container (AsInteger, Map and friends
+// pre-allocate from it), so DeleteElems has to keep it in step with what the
+// readers actually return.
+func TestDeleteElemsKeepsCountCurrent(t *testing.T) {
+	t.Run("object", func(t *testing.T) {
+		pj, _ := Parse([]byte(`{"a":1,"b":2,"c":3}`), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+		if err := obj.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "b" }, nil); err != nil {
+			t.Fatal(err)
+		}
+		m, _ := obj.Map(nil)
+		if got, _ := obj.Count(); got != len(m) {
+			t.Errorf("Count() = %d, want %d to match Map", got, len(m))
+		}
+	})
+
+	t.Run("array", func(t *testing.T) {
+		pj, _ := Parse([]byte(`[1,2,3,4]`), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		arr, _ := iter.Array(nil)
+		arr.DeleteElems(func(i Iter) bool { v, _ := i.Int(); return v == 2 })
+		ints, _ := arr.AsInteger()
+		if got, _ := arr.Count(); got != len(ints) {
+			t.Errorf("Count() = %d, want %d to match AsInteger", got, len(ints))
+		}
+	})
+
+	t.Run("every_entry_deleted_reports_zero", func(t *testing.T) {
+		pj, _ := Parse([]byte(`{"a":1,"b":2}`), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+		if err := obj.DeleteElems(func(k []byte, i Iter) bool { return true }, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := obj.Count(); got != 0 {
+			t.Errorf("Count() = %d after deleting everything, want 0", got)
+		}
+	})
+
+	t.Run("inner_delete_leaves_outer_count_alone", func(t *testing.T) {
+		// A count is of direct children, so only the immediately enclosing
+		// container may move.
+		pj, _ := Parse([]byte(`{"outer":{"x":1,"y":2},"sib":3}`), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+		inner, _ := obj.FindKey("outer", nil).Iter.Object(nil)
+		if err := inner.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "x" }, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := obj.Count(); got != 2 {
+			t.Errorf("outer Count() = %d, want 2", got)
+		}
+		if got, _ := inner.Count(); got != 1 {
+			t.Errorf("inner Count() = %d, want 1", got)
+		}
+	})
+
+	t.Run("onlyKeys_early_exit", func(t *testing.T) {
+		// Stopping once every requested key is seen leaves the tail unwalked, so the
+		// count comes from the declared total rather than a survivor tally.
+		pj, _ := Parse([]byte(`{"a":1,"b":2,"c":3,"d":4,"e":5}`), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+		if err := obj.DeleteElems(nil, map[string]struct{}{"a": {}, "b": {}}); err != nil {
+			t.Fatal(err)
+		}
+		m, _ := obj.Map(nil)
+		if got, _ := obj.Count(); got != len(m) {
+			t.Errorf("Count() = %d, want %d to match Map %v", got, len(m), m)
+		}
+	})
+
+	t.Run("saturated_with_unreadable_key", func(t *testing.T) {
+		// The only partial exit a saturated header can reach: a key whose payload is out
+		// of range abandons the walk, and the header's own figure would give a fabricated
+		// total. The untouched tail is counted instead.
+		pj, _ := Parse([]byte(`{"a":1,"b":2,"c":3}`), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+		hdr := obj.tobj.startIdx - 1
+		pj.tape.data[hdr] |= uint64(containerCountMask) << 32
+		// Point the second key's payload past the string buffer. Entries here are
+		// key, numeric tag, value word, so the second key sits three on from the first.
+		bad := obj.tobj.startIdx + 3
+		pj.tape.data[bad] = pj.tape.data[bad]&^payloadMask | 1<<20
+
+		if err := obj.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "a" }, nil); err == nil {
+			t.Fatal("expected a key read error")
+		}
+		// One pair deleted, one abandoned unread, one in the tail: two survive.
+		if got, _ := obj.Count(); got != 2 {
+			t.Errorf("Count() = %d, want 2", got)
+		}
+	})
+
+	t.Run("saturated_count_is_recounted", func(t *testing.T) {
+		// simdjson clamps the count field at containerCountMask, so a saturated header
+		// carries no usable total. Deleting recounts the survivors, which restores an
+		// exact count. Not reachable by parsing, so the header is set directly.
+		pj, _ := Parse([]byte(`{"a":1,"b":2,"c":3}`), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+		hdr := obj.tobj.startIdx - 1
+		before := pj.tape.data[hdr]
+		pj.tape.data[hdr] = before&^(uint64(containerCountMask)<<32) | uint64(containerCountMask)<<32
+
+		if err := obj.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "b" }, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := obj.Count(); got != 2 {
+			t.Errorf("saturated Count() = %d after deleting one of three, want 2", got)
+		}
+		if got := pj.tape.data[hdr] & containerEndMask; got != before&containerEndMask {
+			t.Errorf("end index changed to %d, want %d", got, before&containerEndMask)
+		}
+	})
+}
