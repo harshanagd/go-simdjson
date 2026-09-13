@@ -3,6 +3,7 @@ package simdjson
 import (
 	"encoding/binary"
 	"encoding/json"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -1659,7 +1660,7 @@ func TestValidateAcceptsEveryRealTape(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: Parse: %v", f, err)
 			}
-			if err := pj.tape.validate(); err != nil {
+			if err := pj.tape.Validate(); err != nil {
 				t.Errorf("%s: rejected a parsed tape: %v", f, err)
 			}
 			pj.Close()
@@ -1676,7 +1677,7 @@ func TestValidateAcceptsEveryRealTape(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: Parse: %v", js, err)
 			}
-			if err := pj.tape.validate(); err != nil {
+			if err := pj.tape.Validate(); err != nil {
 				t.Errorf("%s: rejected: %v", js, err)
 			}
 			pj.Close()
@@ -1691,7 +1692,7 @@ func TestValidateAcceptsEveryRealTape(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%q: ParseND: %v", nd, err)
 			}
-			if err := pj.tape.validate(); err != nil {
+			if err := pj.tape.Validate(); err != nil {
 				t.Errorf("%q: rejected: %v", nd, err)
 			}
 			pj.Close()
@@ -1747,7 +1748,7 @@ func TestValidateAcceptsEveryRealTape(t *testing.T) {
 				}
 				defer pj.Close()
 				tc.fn(pj)
-				if err := pj.tape.validate(); err != nil {
+				if err := pj.tape.Validate(); err != nil {
 					t.Fatalf("rejected a mutated tape: %v", err)
 				}
 				after, _ := pj.Iter()
@@ -1865,6 +1866,62 @@ func TestValidateRejectsCorruptTape(t *testing.T) {
 			"unknown tag",
 		},
 		{
+			"object holds a bare value with no key",
+			[]uint64{
+				tapeEntry(tagRoot, 5), uint64(tagObject)<<56 | 4,
+				tapeEntry(tagNull, 0), tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0,
+			},
+			"expected a string key",
+		},
+		{
+			"numeric where an object key belongs",
+			[]uint64{
+				tapeEntry(tagRoot, 7), uint64(tagObject)<<56 | 6,
+				tapeEntry(tagInt64, 0), 7, tapeEntry(tagNull, 0),
+				tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0,
+			},
+			"expected a string key",
+		},
+		{
+			"container where an object key belongs",
+			[]uint64{
+				tapeEntry(tagRoot, 7), uint64(tagObject)<<56 | 6,
+				uint64(tagArray)<<56 | 5, tapeEntry(tagArrEnd, 2),
+				tapeEntry(tagNull, 0), tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0,
+			},
+			"expected a string key",
+		},
+		{
+			// A valid pair first, so the phase must flip back, not just start right.
+			"valid pair followed by a stray value",
+			[]uint64{
+				tapeEntry(tagRoot, 7), uint64(tagObject)<<56 | 1<<32 | 6,
+				tapeEntry(tagString, 0), tapeEntry(tagNull, 0), tapeEntry(tagNull, 0),
+				tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0,
+			},
+			"expected a string key",
+		},
+		{
+			"object closes with a key that has no value",
+			[]uint64{
+				tapeEntry(tagRoot, 5), uint64(tagObject)<<56 | 4,
+				tapeEntry(tagString, 0), tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0,
+			},
+			"has a key with no value",
+		},
+		{
+			// No object reader skips NOPs between a key and its value, so a NOP in a
+			// value slot desyncs them by one entry: ForEach yielded the same key twice,
+			// with the NOP and then the closing tag as its value.
+			"NOP where an object value belongs",
+			[]uint64{
+				tapeEntry(tagRoot, 7), uint64(tagObject)<<56 | 1<<32 | 6,
+				tapeEntry(tagString, 0), uint64(tagNop)<<56 | 1, tapeEntry(tagNull, 0),
+				tapeEntry(tagObjEnd, 1), tapeEntry(tagRoot, 0), 0,
+			},
+			"NOP where a value belongs",
+		},
+		{
 			// The readers jump to a container's end index rather than walking tags in
 			// order, so validate must not honour a NOP's skip: a hostile skip would
 			// hide entries a reader still reaches. Here the NOP at 3 claims skip 5,
@@ -1959,7 +2016,7 @@ func TestValidateRejectsCorruptTape(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tp := &Tape{data: tt.data}
-			err := tp.validate()
+			err := tp.Validate()
 			if err == nil {
 				t.Fatal("accepted a corrupt tape")
 			}
@@ -1999,7 +2056,7 @@ func TestValidateRejectsExcessiveNesting(t *testing.T) {
 	// must still be accepted, and the readers must handle it.
 	for _, depth := range []int{1, 2, 64, maxTapeDepth - 1, maxTapeDepth} {
 		tp := nested(depth)
-		if err := tp.validate(); err != nil {
+		if err := tp.Validate(); err != nil {
 			t.Fatalf("depth %d rejected: %v", depth, err)
 		}
 		if _, err := tp.Interface(); err != nil {
@@ -2008,7 +2065,7 @@ func TestValidateRejectsExcessiveNesting(t *testing.T) {
 	}
 
 	for _, depth := range []int{maxTapeDepth + 1, maxTapeDepth * 4} {
-		err := nested(depth).validate()
+		err := nested(depth).Validate()
 		if err == nil {
 			t.Errorf("depth %d accepted", depth)
 		} else if !strings.Contains(err.Error(), "nesting deeper than") {
@@ -2041,7 +2098,7 @@ func TestStringOffsetsAreGuardedAtReadTime(t *testing.T) {
 				data:    []uint64{tapeEntry(tagRoot, 3), tapeEntry(tagString, tt.payload), tapeEntry(tagRoot, 0), 0},
 				strings: tt.strings,
 			}
-			if err := tp.validate(); err != nil {
+			if err := tp.Validate(); err != nil {
 				t.Errorf("validate should not inspect string offsets, got %v", err)
 			}
 			defer func() {
@@ -2057,4 +2114,341 @@ func TestStringOffsetsAreGuardedAtReadTime(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Validate's contract is that a tape it accepts can be walked by every reader without
+// panicking or failing to terminate. The readers hold no bounds checks of their own, so
+// these two tests are what keeps that contract honest.
+//
+// Both drive the real trust boundary: a candidate tape is serialized and handed to
+// Deserialize, which calls Validate. Only tapes it accepts get walked. A panic fails the
+// test directly; non-termination shows up as budget exhaustion, and a loop inside a
+// reader that the budget cannot reach shows up as the ambient go test timeout.
+
+// contractWalker bounds the walk. Real documents measure at most 1 step per tape word on
+// either layer, so the 16x budget is slack for correct readers and a trip wire otherwise.
+type contractWalker struct {
+	t    *testing.T
+	left int
+}
+
+func contractBudget(n int) int { return 16*n + 1024 }
+
+func (w *contractWalker) step() {
+	w.left--
+	if w.left <= 0 {
+		w.t.Fatal("walk budget exhausted: a reader is not making progress")
+	}
+}
+
+// contractWalkTape covers the tape layer, including the four readers that used to check
+// for a string key themselves: TapeObject.FindKey, TapeObject.ForEach, readObject (via
+// Interface) and readObjectNum (via InterfaceUseNumber, the only route to it).
+func contractWalkTape(t *testing.T, tp *Tape) {
+	w := &contractWalker{t: t, left: contractBudget(len(tp.data))}
+	_, _ = tp.Interface()
+	_, _ = tp.InterfaceUseNumber()
+	_ = tp.RootType()
+	_ = tp.Clone()
+	ti := tp.Iter()
+	for ti.Type() != Type(-1) {
+		w.step()
+		contractWalkValue(ti, w, 0)
+		if ti.Advance() == Type(-1) {
+			return
+		}
+	}
+}
+
+// contractWalkValue inspects one value and recurses into its children, never advancing to
+// a sibling, which keeps the walk linear in the tape length.
+func contractWalkValue(ti TapeIter, w *contractWalker, depth int) {
+	if depth > maxTapeDepth {
+		return
+	}
+	w.step()
+	switch ti.Type() {
+	case TypeObject:
+		o, err := ti.Object()
+		if err != nil {
+			return
+		}
+		_, _ = o.FindKey("a")
+		_, _ = o.FindPath("a", "b")
+		_ = o.Count()
+		_, _ = o.Map(nil)
+		_ = o.ForEach(func(key string, val TapeIter) error {
+			_ = key
+			contractWalkValue(val, w, depth+1)
+			return nil
+		})
+	case TypeArray:
+		a, err := ti.Array()
+		if err != nil {
+			return
+		}
+		_ = a.Count()
+		_, _ = a.Interface()
+		_, _ = a.AsFloat()
+		_, _ = a.AsInteger()
+		_, _ = a.AsString()
+		_ = a.ForEach(func(val TapeIter) error {
+			contractWalkValue(val, w, depth+1)
+			return nil
+		})
+	default:
+		_, _ = ti.String()
+		_, _ = ti.Int()
+		_, _ = ti.Float()
+		_, _ = ti.Interface()
+	}
+}
+
+// contractWalkParsed covers the Iter layer, including the three remaining readers that
+// used to check for a string key: NextElementBytes, DeleteElems and marshalTape.
+func contractWalkParsed(t *testing.T, pj *ParsedJson) {
+	w := &contractWalker{t: t, left: contractBudget(len(pj.tape.data))}
+	_ = pj.RootType()
+	_, _ = pj.FindString("a")
+	_ = pj.ForEach(func(i Iter) error {
+		w.step()
+		_, _ = i.Interface()
+		return nil
+	})
+	it, err := pj.Iter()
+	if err != nil {
+		return
+	}
+	var root Iter
+	if _, r, err := it.Root(&root); err == nil && r != nil {
+		_, _ = r.MarshalJSON()
+		_, _ = r.Interface()
+		_, _ = r.FindElement(nil, "a", "b")
+	}
+	for it.Type() != Type(-1) {
+		w.step()
+		contractWalkIterValue(&it, w, 0)
+		if it.Advance() == Type(-1) {
+			break
+		}
+	}
+	contractWalkDeletes(t, pj)
+}
+
+func contractWalkIterValue(it *Iter, w *contractWalker, depth int) {
+	if it == nil || depth > maxTapeDepth {
+		return
+	}
+	w.step()
+	_, _ = it.MarshalJSON()
+	_, _ = it.Interface()
+	switch it.Type() {
+	case TypeObject:
+		o, err := it.Object(nil)
+		if err != nil {
+			return
+		}
+		_, _ = o.Count()
+		_, _ = o.Parse(nil)
+		_, _ = o.Map(nil)
+		_ = o.ForEach(func(key string, v Iter) error {
+			_ = key
+			contractWalkIterValue(&v, w, depth+1)
+			return nil
+		})
+		// A fresh Object: ForEach consumed the one above. NextElementBytes reports the
+		// end as a nil name with TypeNull, which a genuine null element shares (#32), so
+		// the name distinguishes them and the element count bounds the loop.
+		if o2, err := it.Object(nil); err == nil {
+			n, _ := o2.Count()
+			var dst Iter
+			for k := 0; k <= n+1; k++ {
+				w.step()
+				name, typ, err := o2.NextElementBytes(&dst)
+				if err != nil || (name == nil && typ == TypeNull) || typ == Type(-1) {
+					break
+				}
+			}
+		}
+	case TypeArray:
+		a, err := it.Array(nil)
+		if err != nil {
+			return
+		}
+		_, _ = a.Count()
+		_, _ = a.MarshalJSON()
+		_, _ = a.Interface()
+		_ = a.ForEach(func(v Iter) error {
+			contractWalkIterValue(&v, w, depth+1)
+			return nil
+		})
+	default:
+		_, _ = it.String()
+		_, _ = it.Int()
+		_, _ = it.Float()
+		_, _ = it.Bool()
+	}
+}
+
+// contractWalkDeletes runs both delete paths on clones, after the read walk rather than
+// during it, and requires the result to still satisfy the boundary.
+func contractWalkDeletes(t *testing.T, pj *ParsedJson) {
+	for _, del := range []func(*ParsedJson){
+		func(p *ParsedJson) {
+			if it, err := p.Iter(); err == nil {
+				if o, err := it.Object(nil); err == nil {
+					_ = o.DeleteElems(func(key []byte, i Iter) bool { return true }, nil)
+				}
+			}
+		},
+		func(p *ParsedJson) {
+			if it, err := p.Iter(); err == nil {
+				if a, err := it.Array(nil); err == nil {
+					a.DeleteElems(func(i Iter) bool { return true })
+				}
+			}
+		},
+	} {
+		clone := pj.Clone(nil)
+		del(clone)
+		if err := clone.tape.Validate(); err != nil {
+			t.Fatalf("a delete produced a tape that fails the boundary: %v", err)
+		}
+	}
+}
+
+// contractCheck runs candidate tape words through Deserialize and, if accepted, walks
+// every reader. Reports whether the tape was accepted.
+func contractCheck(t *testing.T, data []uint64, strs []byte) bool {
+	ser := NewSerializer()
+	in := ParsedJson{tape: Tape{data: data, strings: strs}, hasTape: true}
+	got, err := ser.Deserialize(ser.Serialize(nil, in), nil)
+	if err != nil {
+		return false
+	}
+	contractWalkTape(t, &got.tape)
+	contractWalkParsed(t, got)
+	return true
+}
+
+var contractSeeds = []string{
+	`{}`, `[]`, `{"":null}`, `{"a":1}`, `[1,2,3]`,
+	`{"a":1,"b":"x","c":[1,2,{"d":null}],"e":{"f":true}}`,
+	`[{"k":1},{"k":2},[[1]],"s",1.5,18446744073709551615]`,
+	`{"n":{"n":{"n":{"n":[1,{"z":false}]}}}}`,
+}
+
+// TestTapeContractUnderMutation mutates real tapes so plain go test exercises the
+// contract, not just the fuzz seed corpus.
+//
+// Most mutations are width-preserving retags. A mutation that changes an entry's width
+// desynchronises the container end indices and is rejected on framing alone, so it never
+// reaches the key/value rules.
+func TestTapeContractUnderMutation(t *testing.T) {
+	// One-word tags, so a retag leaves every container's extent intact.
+	oneWord := []byte{tagString, tagNull, tagTrue, tagFalse, tagNop, tagBigint}
+	anyTag := []byte{
+		tagRoot, tagString, tagInt64, tagUint64, tagDouble, tagNull, tagTrue, tagFalse,
+		tagObject, tagObjEnd, tagArray, tagArrEnd, tagNop, tagBigint, 'Q',
+	}
+	rng := rand.New(rand.NewSource(0xC0FFEE))
+	accepted := 0
+
+	for _, seed := range contractSeeds {
+		pj, err := Parse([]byte(seed), nil)
+		if err != nil {
+			t.Fatalf("Parse %q: %v", seed, err)
+		}
+		base, strs := pj.tape.data, pj.tape.strings
+
+		for i := 0; i < 1500; i++ {
+			data := make([]uint64, len(base))
+			copy(data, base)
+			for m := 0; m < 1+rng.Intn(3); m++ {
+				j := rng.Intn(len(data))
+				switch rng.Intn(6) {
+				case 0, 1, 2: // width-preserving retag, keeps the framing valid
+					data[j] = uint64(oneWord[rng.Intn(len(oneWord))])<<56 | (data[j] & payloadMask)
+				case 3:
+					data[j] = uint64(anyTag[rng.Intn(len(anyTag))])<<56 | (data[j] & payloadMask)
+				case 4:
+					data[j] = (data[j] & ^uint64(payloadMask)) | uint64(rng.Intn(len(data)+4))
+				case 5:
+					k := rng.Intn(len(data))
+					data[j], data[k] = data[k], data[j]
+				}
+			}
+			if contractCheck(t, data, strs) {
+				accepted++
+			}
+		}
+	}
+	// Guards against the mutation scheme drifting into producing only rejects, which
+	// would leave the readers unexercised and the test silently vacuous.
+	if accepted < 100 {
+		t.Fatalf("only %d mutants were accepted; the readers are barely exercised", accepted)
+	}
+	t.Logf("%d accepted mutants walked", accepted)
+}
+
+// FuzzTapeContract explores the contract without a bound on shapes.
+//
+// The input drives mutations against a real parsed tape rather than supplying tape words
+// directly. Raw words almost always break a container's framing and get rejected before
+// the key/value rules run — measured: 25M raw-word executions failed to place a NOP in an
+// object's value slot, a shape the structured form reaches in seconds.
+//
+// Input layout: byte 0 selects the seed document, then each following 4-byte group is one
+// mutation as (op, index low, index high, argument).
+func FuzzTapeContract(f *testing.F) {
+	seeds := make([][]uint64, 0, len(contractSeeds))
+	strs := make([][]byte, 0, len(contractSeeds))
+	for _, seed := range contractSeeds {
+		pj, err := Parse([]byte(seed), nil)
+		if err != nil {
+			f.Fatalf("Parse %q: %v", seed, err)
+		}
+		seeds = append(seeds, pj.tape.data)
+		strs = append(strs, pj.tape.strings)
+	}
+
+	oneWord := []byte{tagString, tagNull, tagTrue, tagFalse, tagNop, tagBigint}
+	anyTag := []byte{
+		tagRoot, tagString, tagInt64, tagUint64, tagDouble, tagNull, tagTrue, tagFalse,
+		tagObject, tagObjEnd, tagArray, tagArrEnd, tagNop, tagBigint, 'Q',
+	}
+
+	// Seed the corpus with one mutation per document, including a NOP retag.
+	for i := range contractSeeds {
+		f.Add([]byte{byte(i), 0, 2, 0, 4})
+		f.Add([]byte{byte(i), 1, 3, 0, 1})
+		f.Add([]byte{byte(i), 3, 2, 0, 9})
+	}
+
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) < 5 || len(raw) > 4096 {
+			return
+		}
+		which := int(raw[0]) % len(seeds)
+		base := seeds[which]
+		data := make([]uint64, len(base))
+		copy(data, base)
+
+		for p := 1; p+3 < len(raw); p += 4 {
+			idx := (int(raw[p+1]) | int(raw[p+2])<<8) % len(data)
+			arg := int(raw[p+3])
+			switch raw[p] % 5 {
+			case 0, 1: // width-preserving retag: keeps container extents intact
+				data[idx] = uint64(oneWord[arg%len(oneWord)])<<56 | (data[idx] & payloadMask)
+			case 2:
+				data[idx] = uint64(anyTag[arg%len(anyTag)])<<56 | (data[idx] & payloadMask)
+			case 3:
+				data[idx] = (data[idx] & ^uint64(payloadMask)) | uint64(arg%(len(data)+4))
+			case 4:
+				other := arg % len(data)
+				data[idx], data[other] = data[other], data[idx]
+			}
+		}
+		contractCheck(t, data, strs[which])
+	})
 }

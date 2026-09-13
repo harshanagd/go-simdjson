@@ -454,9 +454,6 @@ func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
 	if o.iterPos >= o.tobj.endIdx {
 		return nil, TypeNull, nil
 	}
-	if o.tobj.tape.tapeTagAt(o.iterPos) != tagString {
-		return nil, TypeNull, nil
-	}
 	keyEntry := o.tobj.tape.data[o.iterPos]
 	s, err := o.tobj.tape.readStringBytes(keyEntry & payloadMask)
 	if err != nil {
@@ -971,9 +968,6 @@ func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[stri
 			pos = t.tapeSkipNop(pos)
 			continue
 		}
-		if tag != tagString {
-			break
-		}
 		startPos := pos
 		keyBytes, err := t.readStringBytes(t.tapePayloadAt(pos))
 		if err != nil {
@@ -1143,9 +1137,6 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 			if ptag == tagNop {
 				pos = t.tapeSkipNop(pos)
 				continue
-			}
-			if ptag != tagString {
-				return nil, fmt.Errorf("expected string key at %d", pos)
 			}
 			if !first {
 				dst = append(dst, ',')

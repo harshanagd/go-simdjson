@@ -271,27 +271,29 @@ func (ti *TapeIter) Array() (arr TapeArray, err error) {
 	return TapeArray{tape: ti.tape, startIdx: ti.idx + 1, endIdx: endIdx - 1}, nil
 }
 
-// validate checks the structural invariants every tape walker relies on.
+// Validate reports whether the tape is safe to walk, returning nil if it is.
 //
-// This is the package's trust boundary. Parse produces a tape from simdjson's own
-// structural pass, so its output always satisfies these invariants and the walkers
-// index the tape directly on that basis — no walker re-checks a bound. A tape rebuilt
-// by Serializer.Deserialize is arbitrary bytes, so it must be validated here before
-// any walker touches it.
+// Readers index the tape directly and do not re-check bounds, so a passing tape cannot
+// cause an out-of-range read, a non-terminating walk, or an unbounded allocation. It
+// guarantees:
 //
-// What it does NOT establish: that an object's entries alternate key then value. It
-// classifies entries, and a string is just an entry, so a deserialized object can hold
-// a bare value and still pass here. The object readers report that as
-// "expected string key at N" — those checks are load-bearing, not redundant.
+//   - Root blocks are well formed and each closing root points back to its opener.
+//   - Container end indices are in range, at least two past the container, within the
+//     parent, and land on a matching closing tag.
+//   - Container element counts are within their own extent.
+//   - Two-word numerics have their value word in the same container.
+//   - Object entries alternate string key then value, the value immediately follows its
+//     key, and no key is left without a value.
+//   - NOP skips stay inside their own run, so skipping and walking agree on entry starts.
+//   - Nesting is within maxTapeDepth, so the recursive readers cannot overflow the stack.
 //
-// The walk inspects every word rather than following NOP skips, and requires each skip
-// to stay inside its own run, because the readers DO honour skips: the two must agree
-// on where an entry begins. It never reads the word after a closing root — simdjson
-// does not write that padding, so it holds whatever was previously in that memory, and
-// reading it as a tag could reject a VALID tape. It is iterative rather than recursive
-// because nesting depth here is untrusted (Deserialize bypasses simdjson's depth
-// limit).
-func (t *Tape) validate() error {
+// String payload offsets are not checked: readStringBytes must read the length prefix to
+// slice at all, so its bounds check is intrinsic and a bad offset surfaces there.
+//
+// Parse and ParseND always satisfy this and do not call it — the walk costs roughly a
+// quarter of a parse. Serializer.Deserialize always does. Call it for a tape from an
+// untrusted source, or to assert the invariant in tests and fuzzing.
+func (t *Tape) Validate() error {
 	if len(t.data) == 0 {
 		return nil
 	}
@@ -313,46 +315,49 @@ func (t *Tape) validate() error {
 		}
 		if err := t.validateEntries(idx+1, closeIdx); err != nil {
 			return err
-		} // Skip the closing root and its uninitialised padding word.
+		}
+		// Skip the closing root and its uninitialised padding word.
 		idx = closeIdx + 2
 	}
 	return nil
 }
 
-// validateEntries checks every real entry in [start, end).
-//
-// It inspects every word rather than following NOP skips, and tracks open containers
-// on an explicit stack so a container's declared end must be exactly where its
-// matching closing tag sits. Both matter because the readers traverse by jumping to a
-// container's end index, not by walking tags in order: honouring a NOP's skip here
-// would let a hostile skip hide entries a reader still reaches, and checking a close
-// tag only pointwise would let an end index point somewhere it does not close. The
-// stack also gives the true nesting depth, which is the depth the recursive readers
-// experience.
+// validateFrame is one open container. wantKey carries the key/value phase for objects.
+// end is a uint32 to keep the frame at 8 bytes: container end indices come from a 32-bit
+// field, so this is exact, and the stack stays a 256-byte stack-allocated buffer.
+type validateFrame struct {
+	end      uint32 // exclusive; the closing tag sits at end-1
+	isObject bool
+	wantKey  bool
+}
+
+// validateEntries checks every entry in [start, end). The stack enforces exact nesting,
+// object key/value alternation, and gives the depth the recursive readers see.
 func (t *Tape) validateEntries(start, end int) error {
-	// stack holds the end index of each open container, so the innermost container's
-	// closing tag sits at stack[len-1]-1.
-	stack := make([]int, 0, 16)
+	stack := make([]validateFrame, 0, 32)
 	pos := start
 	for pos < end {
 		// Entries must fall inside the innermost open container, or the block itself.
 		limit := end
 		if n := len(stack); n > 0 {
-			limit = stack[n-1] - 1
+			limit = int(stack[n-1].end) - 1
 		}
 
-		switch tag := byte(t.data[pos] >> 56); tag {
-		case tagNop:
-			// Readers DO honour a NOP's skip (tapeSkipNop), so a skip must land where
-			// this walk's next entry begins. Otherwise a reader can be steered onto a
-			// word the walk consumed opaquely — a numeric's value word is 64 bits of
-			// tape data that is never tag-checked, so landing there hands the reader an
-			// entry of the attacker's choosing.
-			//
-			// The bound is the end of the contiguous NOP run rather than each skip
-			// agreeing on a single target: two adjacent deletes merge into one run
-			// whose skips point at different ends (measured: skips 3,2,1 then 3,2,1),
-			// and that is a tape Parse plus DeleteElems really produces.
+		tag := byte(t.data[pos] >> 56)
+
+		// NOP runs carry no key/value phase: deletes NOP-fill whole pairs, setters only
+		// a shrunk value's second word.
+		if tag == tagNop {
+			// No object reader skips NOPs between a key and its value — they all take
+			// the value at key+1 — so a NOP in a value slot desyncs them by one entry.
+			if n := len(stack); n > 0 && stack[n-1].isObject && !stack[n-1].wantKey {
+				return fmt.Errorf("object entry at %d: NOP where a value belongs", pos)
+			}
+			// Readers honour a skip, so it must land where this walk's next entry
+			// begins, or a reader can be steered onto a numeric's value word — 64 bits
+			// that are never tag-checked. Bounded by the run rather than a single shared
+			// target, because two adjacent deletes merge into one run whose skips point
+			// at different ends (measured: 3,2,1 then 3,2,1).
 			runEnd := pos
 			for runEnd < limit && byte(t.data[runEnd]>>56) == tagNop {
 				runEnd++
@@ -362,14 +367,47 @@ func (t *Tape) validateEntries(start, end int) error {
 				if skip == 0 {
 					skip = 1 // tapeSkipNop floors a zero skip
 				}
-				// Compared as a distance so a 56-bit skip cannot overflow the addition
-				// on a 32-bit platform.
+				// A distance, so a 56-bit skip cannot overflow the addition on 32-bit.
 				if skip > runEnd-j {
 					return fmt.Errorf("NOP at %d: skip %d leaves its run, which ends at %d", j, skip, runEnd)
 				}
 			}
 			pos = runEnd
+			continue
+		}
 
+		if tag == tagObjEnd || tag == tagArrEnd {
+			n := len(stack)
+			if n == 0 {
+				return fmt.Errorf("tape index %d: closing tag with no open container", pos)
+			}
+			if int(stack[n-1].end) != pos+1 {
+				return fmt.Errorf("tape index %d: closing tag is not where end index %d points", pos, stack[n-1].end)
+			}
+			if stack[n-1].isObject && !stack[n-1].wantKey {
+				return fmt.Errorf("object closing at %d has a key with no value", pos)
+			}
+			stack = stack[:n-1]
+			pos++
+			// The closed container was its parent object's value. Inlined: a closure
+			// over stack forces it to escape, measured ~2.5x on this walk.
+			if p := len(stack); p > 0 && stack[p-1].isObject {
+				stack[p-1].wantKey = true
+			}
+			continue
+		}
+
+		// Keys are single-word strings, so anything else where a key belongs would make
+		// a reader decode some other entry as the key.
+		key := false
+		if n := len(stack); n > 0 && stack[n-1].isObject {
+			key = stack[n-1].wantKey
+		}
+		if key && tag != tagString {
+			return fmt.Errorf("object entry at %d: expected a string key, found %q", pos, tag)
+		}
+
+		switch tag {
 		case tagObject, tagArray:
 			endIdx := int(t.data[pos] & containerEndMask)
 			// Smallest legal value is pos+2, an empty container whose closing tag sits
@@ -388,47 +426,32 @@ func (t *Tape) validateEntries(start, end int) error {
 			if got := byte(t.data[endIdx-1] >> 56); got != want {
 				return fmt.Errorf("container at %d: end index %d does not close it (found %q)", pos, endIdx, got)
 			}
-			// The count sizes result collections, so an inflated one buys a large
-			// preallocation. Every element occupies at least one entry, so the
-			// container's extent bounds it; the field saturates rather than wrapping,
-			// so a real count never exceeds this.
+			// The count sizes result collections. Every element takes at least one entry,
+			// so the extent bounds it; the field saturates rather than wrapping.
 			if count := int((t.data[pos] >> 32) & containerCountMask); count > endIdx-pos {
 				return fmt.Errorf("container at %d: count %d exceeds its extent", pos, count)
 			}
-			// readValue, readObject, readArray and marshalTape recurse once per level,
-			// and a stack overflow is fatal — recover cannot catch it. simdjson will not
-			// parse deeper than this, so the bound rejects nothing Parse can emit.
+			// The value readers and marshalTape recurse per level, and a stack overflow
+			// is fatal. simdjson will not parse deeper, so this rejects nothing Parse
+			// can emit.
 			if len(stack) >= maxTapeDepth {
 				return fmt.Errorf("container at %d: nesting deeper than %d", pos, maxTapeDepth)
 			}
-			stack = append(stack, endIdx)
+			// A container is its parent's value but is not complete until it closes, so
+			// the phase advances at the pop and this entry skips the write below.
+			stack = append(stack, validateFrame{end: uint32(endIdx), isObject: tag == tagObject, wantKey: true})
 			pos++
-
-		case tagObjEnd, tagArrEnd:
-			n := len(stack)
-			if n == 0 {
-				return fmt.Errorf("tape index %d: closing tag with no open container", pos)
-			}
-			if stack[n-1] != pos+1 {
-				return fmt.Errorf("tape index %d: closing tag is not where end index %d points", pos, stack[n-1])
-			}
-			stack = stack[:n-1]
-			pos++
+			continue
 
 		case tagInt64, tagUint64, tagDouble:
-			// The value word must sit inside the same container, or a reader would take
-			// a closing tag as the value.
+			// The value word must sit inside the same container, or a reader takes a
+			// closing tag as the value.
 			if pos+1 >= limit {
 				return fmt.Errorf("numeric entry at %d has no value word", pos)
 			}
 			pos += 2
 
 		case tagString, tagBigint:
-			// String payloads are deliberately NOT validated here. readStringBytes is
-			// the only path to the string buffer and must read the length prefix to
-			// slice at all, so its bounds check is intrinsic rather than an extra
-			// guard — validating offsets here would repeat it and cost 45% of this
-			// walk. A bad offset surfaces as an error from the read instead.
 			pos++
 
 		case tagTrue, tagFalse, tagNull:
@@ -437,13 +460,16 @@ func (t *Tape) validateEntries(start, end int) error {
 		default:
 			return fmt.Errorf("tape index %d: unknown tag %q", pos, tag)
 		}
+
+		// An object wants a key next unless the entry just consumed was that key. Only a
+		// string can be a key and the guard above rejected any other tag there, so !key
+		// is correct for every tag reaching this point.
+		if n := len(stack); n > 0 && stack[n-1].isObject {
+			stack[n-1].wantKey = !key
+		}
 	}
 	if n := len(stack); n > 0 {
-		// A backstop, not a reachable branch on current logic: every container's end
-		// index is bounded by its parent's close, and the numeric bound keeps the
-		// cursor from straddling a closing tag, so the walk lands on each close and
-		// pops it. Kept because it is one comparison and it fails closed if either of
-		// those arguments stops holding.
+		// Not reachable on current logic, but one comparison that fails closed.
 		return fmt.Errorf("%d container(s) left unclosed at tape index %d", n, end)
 	}
 	return nil
@@ -538,18 +564,9 @@ type TapeObject struct {
 
 // FindKey finds a key in the object. Returns the zero TapeIter and false if not found.
 // NOP padding left behind by DeleteElems is skipped.
-//
-// Unlike ForEach, a non-string tag where a key belongs is reported as "not found"
-// rather than as an error, because this signature has nowhere to put one. That state is
-// reachable: Tape.validate classifies entries and does not enforce that objects
-// alternate key then value, so a deserialized object can hold a bare value. Use ForEach
-// or Map if a malformed object must be distinguished from an absent key.
 func (o *TapeObject) FindKey(key string) (iter TapeIter, ok bool) {
 	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	for pos < o.endIdx {
-		if o.tape.tapeTagAt(pos) != tagString {
-			break
-		}
 		// A key that fails to decode cannot match, so skip past it. FindKey has
 		// no error return; use ForEach if you need the failure reported.
 		k, err := o.tape.readString(o.tape.tapePayloadAt(pos))
@@ -564,24 +581,9 @@ func (o *TapeObject) FindKey(key string) (iter TapeIter, ok bool) {
 
 // ForEach iterates over all key-value pairs.
 // NOP padding left behind by DeleteElems is skipped.
-//
-// A non-string tag where a key belongs is reported rather than treated as the end of
-// iteration, matching Tape.readObject so the two layers agree. This is NOT a redundant
-// guard: Tape.validate does not enforce that objects alternate key then value, so a
-// deserialized tape can hold an object containing a bare value and still pass the
-// boundary. Reporting it is what keeps that from becoming a silently short result.
-//
-// It is not needed for termination — the pos < endIdx bound handles that, and removing
-// this check breaks no test that uses a well-formed tape. So once validation covers
-// alternation, this check and its three siblings (FindKey, readObject, readObjectNum,
-// plus marshalTape) should be DELETED rather than kept as backstops: the layers should
-// agree by all trusting the tape, not by all re-checking it.
 func (o *TapeObject) ForEach(fn func(key string, val TapeIter) error) error {
 	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	for pos < o.endIdx {
-		if o.tape.tapeTagAt(pos) != tagString {
-			return fmt.Errorf("expected string key at %d", pos)
-		}
 		key, err := o.tape.readString(o.tape.tapePayloadAt(pos))
 		if err != nil {
 			return err
@@ -814,9 +816,6 @@ func (t *Tape) readObject(idx int) (map[string]interface{}, int, error) {
 	result := make(map[string]interface{}, count)
 	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
-		if t.tapeTagAt(pos) != tagString {
-			return nil, pos, fmt.Errorf("expected string key at %d", pos)
-		}
 		key, err := t.readString(t.tapePayloadAt(pos))
 		if err != nil {
 			return nil, pos, err
@@ -940,9 +939,6 @@ func (t *Tape) readObjectNum(idx int) (map[string]interface{}, int, error) {
 	result := make(map[string]interface{}, count)
 	pos := t.skipNopsUntil(idx+1, endIdx-1)
 	for pos < endIdx-1 {
-		if t.tapeTagAt(pos) != tagString {
-			return nil, pos, fmt.Errorf("expected string key at %d", pos)
-		}
 		key, err := t.readString(t.tapePayloadAt(pos))
 		if err != nil {
 			return nil, pos, err

@@ -110,8 +110,8 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 		copyStrings: true,
 	}
 	// Everything downstream trusts the tape's structure, so it is established here
-	// once rather than re-checked by each walker. See Tape.validate.
-	if err := dst.tape.validate(); err != nil {
+	// once rather than re-checked by each walker. See Tape.Validate.
+	if err := dst.tape.Validate(); err != nil {
 		dst.tape = Tape{}
 		dst.hasTape = false
 		return nil, fmt.Errorf("invalid tape: %w", err)

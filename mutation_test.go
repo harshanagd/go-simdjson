@@ -866,3 +866,142 @@ func TestSettersRejectTruncatedNumeric(t *testing.T) {
 		})
 	}
 }
+
+// TestMutationsKeepTheTapeValid asserts Validate after every mutation, across every
+// setter/value-width pair and each delete shape. Mutations rewrite a valid tape in place
+// and nothing re-validates in production, so this is where that invariant is checked.
+//
+// It exists because SetNull once NOP-filled one entry too far and destroyed the following
+// key on an ordinary parsed document — an arithmetic error no precondition check would
+// have caught, but which this harness fails on immediately.
+func TestMutationsKeepTheTapeValid(t *testing.T) {
+	sources := []struct{ name, json string }{
+		{"string", `{"v":"xx","after":1}`},
+		{"int64", `{"v":7,"after":1}`},
+		{"uint64", `{"v":18446744073709551615,"after":1}`},
+		{"double", `{"v":1.5,"after":1}`},
+		{"bool", `{"v":true,"after":1}`},
+		{"null", `{"v":null,"after":1}`},
+		{"object", `{"v":{"k":1},"after":1}`},
+		{"array", `{"v":[1,2],"after":1}`},
+	}
+	setters := []struct {
+		name string
+		fn   func(*Iter) error
+	}{
+		{"SetInt", func(i *Iter) error { return i.SetInt(42) }},
+		{"SetUInt", func(i *Iter) error { return i.SetUInt(42) }},
+		{"SetFloat", func(i *Iter) error { return i.SetFloat(4.5) }},
+		{"SetStringShort", func(i *Iter) error { return i.SetString("s") }},
+		{"SetStringLong", func(i *Iter) error { return i.SetString("a much longer replacement") }},
+		{"SetBool", func(i *Iter) error { return i.SetBool(false) }},
+		{"SetNull", func(i *Iter) error { return i.SetNull() }},
+	}
+
+	for _, src := range sources {
+		for _, st := range setters {
+			t.Run(src.name+"/"+st.name, func(t *testing.T) {
+				pj, err := Parse([]byte(src.json), nil)
+				if err != nil {
+					t.Fatalf("Parse: %v", err)
+				}
+				defer pj.Close()
+				iter, _ := pj.Iter()
+				obj, err := iter.Object(nil)
+				if err != nil {
+					t.Fatalf("Object: %v", err)
+				}
+				elem := obj.FindKey("v", nil)
+				if elem == nil {
+					t.Fatal("key v not found")
+				}
+
+				setErr := st.fn(&elem.Iter)
+				if err := pj.tape.Validate(); err != nil {
+					t.Fatalf("mutation left the tape invalid: %v", err)
+				}
+				// A refused setter must leave the document untouched; an applied one must
+				// leave the neighbouring key intact.
+				after, _ := pj.Iter()
+				got, err := after.MarshalJSON()
+				if err != nil {
+					t.Fatalf("MarshalJSON: %v", err)
+				}
+				if setErr != nil && string(got) != src.json {
+					t.Errorf("setter refused but changed the tape: %s, want %s", got, src.json)
+				}
+				if !strings.Contains(string(got), `"after":1`) {
+					t.Errorf("lost the neighbouring key: %s", got)
+				}
+			})
+		}
+	}
+
+	deletes := []struct {
+		name, json, want string
+		fn               func(*ParsedJson)
+	}{
+		{"middle key", `{"a":1,"b":2,"c":3}`, `{"a":1,"c":3}`, func(pj *ParsedJson) {
+			it, _ := pj.Iter()
+			o, _ := it.Object(nil)
+			_ = o.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "b" }, nil)
+		}},
+		{"all keys", `{"a":1,"b":2}`, `{}`, func(pj *ParsedJson) {
+			it, _ := pj.Iter()
+			o, _ := it.Object(nil)
+			_ = o.DeleteElems(func(k []byte, i Iter) bool { return true }, nil)
+		}},
+		{"container value", `{"a":{"x":1},"b":2}`, `{"b":2}`, func(pj *ParsedJson) {
+			it, _ := pj.Iter()
+			o, _ := it.Object(nil)
+			_ = o.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "a" }, nil)
+		}},
+		{"array element", `{"a":[1,2,3]}`, `{"a":[1,3]}`, func(pj *ParsedJson) {
+			it, _ := pj.Iter()
+			o, _ := it.Object(nil)
+			a, _ := o.FindKey("a", nil).Iter.Array(nil)
+			a.DeleteElems(func(i Iter) bool { v, _ := i.Int(); return v == 2 })
+		}},
+		{"all array elements", `{"a":[1,2]}`, `{"a":[]}`, func(pj *ParsedJson) {
+			it, _ := pj.Iter()
+			o, _ := it.Object(nil)
+			a, _ := o.FindKey("a", nil).Iter.Array(nil)
+			a.DeleteElems(func(i Iter) bool { return true })
+		}},
+		{"nested container element", `{"a":[{"x":1},2]}`, `{"a":[2]}`, func(pj *ParsedJson) {
+			it, _ := pj.Iter()
+			o, _ := it.Object(nil)
+			a, _ := o.FindKey("a", nil).Iter.Array(nil)
+			a.DeleteElems(func(i Iter) bool { return i.Type() == TypeObject })
+		}},
+		{"two separate deletes", `{"a":1,"b":2,"c":3,"d":4}`, `{"a":1,"d":4}`, func(pj *ParsedJson) {
+			it, _ := pj.Iter()
+			o, _ := it.Object(nil)
+			_ = o.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "b" }, nil)
+			it2, _ := pj.Iter()
+			o2, _ := it2.Object(nil)
+			_ = o2.DeleteElems(func(k []byte, i Iter) bool { return string(k) == "c" }, nil)
+		}},
+	}
+	for _, d := range deletes {
+		t.Run("delete/"+d.name, func(t *testing.T) {
+			pj, err := Parse([]byte(d.json), nil)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			defer pj.Close()
+			d.fn(pj)
+			if err := pj.tape.Validate(); err != nil {
+				t.Fatalf("delete left the tape invalid: %v", err)
+			}
+			after, _ := pj.Iter()
+			got, err := after.MarshalJSON()
+			if err != nil {
+				t.Fatalf("MarshalJSON: %v", err)
+			}
+			if string(got) != d.want {
+				t.Errorf("got %s, want %s", got, d.want)
+			}
+		})
+	}
+}
