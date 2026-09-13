@@ -2269,16 +2269,15 @@ func contractWalkIterValue(it *Iter, w *contractWalker, depth int) {
 			contractWalkIterValue(&v, w, depth+1)
 			return nil
 		})
-		// A fresh Object: ForEach consumed the one above. NextElementBytes reports the
-		// end as a nil name with TypeNull, which a genuine null element shares (#32), so
-		// the name distinguishes them and the element count bounds the loop.
+		// A fresh Object: ForEach consumed the one above. The element count bounds the
+		// loop independently of the terminator.
 		if o2, err := it.Object(nil); err == nil {
 			n, _ := o2.Count()
 			var dst Iter
 			for k := 0; k <= n+1; k++ {
 				w.step()
-				name, typ, err := o2.NextElementBytes(&dst)
-				if err != nil || (name == nil && typ == TypeNull) || typ == Type(-1) {
+				_, typ, err := o2.NextElementBytes(&dst)
+				if err != nil || typ == Type(-1) {
 					break
 				}
 			}

@@ -488,9 +488,9 @@ func TestNextElement(t *testing.T) {
 	}
 
 	// Done
-	name, _, err = obj.NextElement(&dst)
-	if err != nil || name != "" {
-		t.Fatalf("expected done, got name=%q err=%v", name, err)
+	name, typ, err = obj.NextElement(&dst)
+	if err != nil || typ != Type(-1) {
+		t.Fatalf("expected done, got name=%q type=%v err=%v", name, typ, err)
 	}
 }
 
@@ -1625,4 +1625,79 @@ func TestArrayFirstTypeMatchesTapeArray(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An entry whose key is "" and whose value is null used to be indistinguishable
+// from the end of iteration, so a cursor loop stopped on it and reported success.
+// The terminator is Type(-1), which no real entry can carry.
+func TestObjectCursorOutlastsEmptyKeyNull(t *testing.T) {
+	const input = `{"":null,"b":1}`
+
+	t.Run("NextElementBytes", func(t *testing.T) {
+		pj, _ := Parse([]byte(input), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+
+		var keys []string
+		var dst Iter
+		// Bounded so a terminator regression fails here instead of spinning.
+		for i := 0; i < 8; i++ {
+			name, typ, err := obj.NextElementBytes(&dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if typ == Type(-1) {
+				break
+			}
+			keys = append(keys, string(name))
+		}
+		if len(keys) != 2 || keys[0] != "" || keys[1] != "b" {
+			t.Errorf("keys = %q, want [\"\" \"b\"]", keys)
+		}
+	})
+
+	t.Run("NextElement", func(t *testing.T) {
+		pj, _ := Parse([]byte(input), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+
+		var keys []string
+		var dst Iter
+		// Bounded so a terminator regression fails here instead of spinning.
+		for i := 0; i < 8; i++ {
+			name, typ, err := obj.NextElement(&dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if typ == Type(-1) {
+				break
+			}
+			keys = append(keys, name)
+		}
+		if len(keys) != 2 || keys[0] != "" || keys[1] != "b" {
+			t.Errorf("keys = %q, want [\"\" \"b\"]", keys)
+		}
+	})
+
+	t.Run("Object.Parse", func(t *testing.T) {
+		// Parse loops on the same terminator, so it dropped everything after the
+		// empty-key null.
+		pj, _ := Parse([]byte(input), nil)
+		defer pj.Close()
+		iter, _ := pj.Iter()
+		obj, _ := iter.Object(nil)
+
+		elems, err := obj.Parse(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(elems.Elements) != 2 {
+			t.Errorf("Elements = %d, want 2", len(elems.Elements))
+		}
+		if elems.Lookup("b") == nil {
+			t.Error(`Lookup("b") = nil, want the entry after the empty-key null`)
+		}
+	})
 }

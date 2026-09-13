@@ -711,9 +711,9 @@ func TestNextElementBytes(t *testing.T) {
 	if string(name) != "b" || typ != TypeString {
 		t.Fatalf("expected b/string, got %s/%v", name, typ)
 	}
-	name, _, _ = obj.NextElementBytes(&dst)
-	if name != nil {
-		t.Fatalf("expected nil at end, got %s", name)
+	name, typ, _ = obj.NextElementBytes(&dst)
+	if typ != Type(-1) {
+		t.Fatalf("expected Type(-1) at end, got %s/%v", name, typ)
 	}
 }
 

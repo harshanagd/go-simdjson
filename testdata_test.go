@@ -282,8 +282,8 @@ func BenchmarkNextElement(b *testing.B) {
 		obj, _ := iter.Object(nil)
 		var dst Iter
 		for {
-			name, t, _ := obj.NextElement(&dst)
-			if name == "" && t == TypeNull {
+			_, t, _ := obj.NextElement(&dst)
+			if t == Type(-1) {
 				break
 			}
 		}
@@ -304,8 +304,8 @@ func BenchmarkNextElementBytes(b *testing.B) {
 		obj, _ := iter.Object(nil)
 		var dst Iter
 		for {
-			name, t, _ := obj.NextElementBytes(&dst)
-			if name == nil && t == TypeNull {
+			_, t, _ := obj.NextElementBytes(&dst)
+			if t == Type(-1) {
 				break
 			}
 		}

@@ -429,35 +429,32 @@ func (i *Iter) FloatFlags() (float64, FloatFlags, error) {
 }
 
 // NextElement returns the next key-value pair. Initialize the iterator by
-// calling Object() first. Returns empty name when done.
+// calling Object() first. At end it returns Type(-1); the name is "" then, but so
+// is a legitimate empty key, so test the type rather than the name.
 func (o *Object) NextElement(dst *Iter) (name string, t Type, err error) {
 	n, t, err := o.NextElementBytes(dst)
 	return string(n), t, err
 }
 
 // NextElementBytes is like NextElement but returns the key as []byte,
-// avoiding a string allocation. Returns nil name when done.
+// avoiding a string allocation. At end it returns a nil name with Type(-1), the
+// same end-of-tape sentinel Advance and TapeIter.Type use; no real entry can carry
+// that type, so testing it is safe where testing len(name) == 0 is not.
 // The key is copied when WithCopyStrings(true) (the default); when false it is a
 // cap-bounded slice into the tape's string buffer.
 //
 // NOP entries left behind by DeleteElems are skipped, so deleting a key does not
 // end iteration early.
-//
-// Note: an object with an empty-string key ("") whose value is null yields an
-// empty but non-nil name with TypeNull, which differs from the end-of-iteration
-// sentinel only in that the name is non-nil. Callers that test len(name) == 0
-// instead of name == nil will stop early on such an entry — use ForEach for
-// objects that may contain one.
 func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
 	// Skip any NOP padding left by a prior delete before reading the key.
 	o.iterPos = o.tobj.tape.skipNopsUntil(o.iterPos, o.tobj.endIdx)
 	if o.iterPos >= o.tobj.endIdx {
-		return nil, TypeNull, nil
+		return nil, Type(-1), nil
 	}
 	keyEntry := o.tobj.tape.data[o.iterPos]
 	s, err := o.tobj.tape.readStringBytes(keyEntry & payloadMask)
 	if err != nil {
-		return nil, TypeNull, err
+		return nil, Type(-1), err
 	}
 	if o.copyStrings {
 		cp := make([]byte, len(s))
@@ -466,7 +463,7 @@ func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
 	}
 	valIdx := o.iterPos + 1
 	if valIdx >= len(o.tobj.tape.data) {
-		return nil, TypeNull, fmt.Errorf("truncated tape: key at %d has no value", o.iterPos)
+		return nil, Type(-1), fmt.Errorf("truncated tape: key at %d has no value", o.iterPos)
 	}
 	if dst != nil {
 		dst.tape = o.tobj.tape
@@ -522,7 +519,7 @@ func (o *Object) Parse(dst *Elements) (*Elements, error) {
 		if err != nil {
 			return dst, err
 		}
-		if name == "" && t == TypeNull {
+		if t == Type(-1) {
 			break
 		}
 		dst.Index[name] = len(dst.Elements)
