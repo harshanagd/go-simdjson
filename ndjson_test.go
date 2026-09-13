@@ -5,8 +5,10 @@
 package simdjson
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -923,4 +925,40 @@ func TestParseNDTruncatedFinalDocument(t *testing.T) {
 		}
 		pj.Close()
 	})
+}
+
+// A root scalar whose token spans parse_many's batch edge must come back as one
+// document with its full value. The 1 MB figure is simdjson's DEFAULT_BATCH_SIZE:
+// the test exercises a real edge only while that holds, hence the setup guard.
+func TestParseNDScalarSpanningBatchBoundary(t *testing.T) {
+	const batch = 1000000
+
+	var buf bytes.Buffer
+	buf.WriteString("\"ppp\"\n") // shifts later lines so a token straddles the edge
+	for line := 1; buf.Len() < batch+2000; line++ {
+		fmt.Fprintf(&buf, "%d\n", 1000000000000000000+int64(line))
+	}
+	data := buf.Bytes()
+
+	start := bytes.LastIndexByte(data[:batch], '\n') + 1
+	end := start + bytes.IndexByte(data[start:], '\n')
+	if start >= batch || end <= batch {
+		t.Fatalf("test setup no longer straddles the edge: token spans %d..%d, edge %d", start, end, batch)
+	}
+	want := string(data[start:end])
+	wantIdx := bytes.Count(data[:start], []byte("\n"))
+
+	pj, err := ParseND(data, nil, UseNumber())
+	if err != nil {
+		t.Fatalf("ParseND rejected a valid stream: %v", err)
+	}
+	defer pj.Close()
+
+	got := collectViaForEach(t, pj)
+	if len(got) != bytes.Count(data, []byte("\n")) {
+		t.Fatalf("document count %d, want %d", len(got), bytes.Count(data, []byte("\n")))
+	}
+	if fmt.Sprint(got[wantIdx]) != want {
+		t.Errorf("document %d spanning the batch edge = %v, want %s", wantIdx, got[wantIdx], want)
+	}
 }

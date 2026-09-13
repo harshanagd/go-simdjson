@@ -1,4 +1,4 @@
-VERSION=4.6.4
-SOURCE=https://github.com/simdjson/simdjson/releases/download/v4.6.4/
-SHA256_H=fec0cb4559e25456789efb153b7e5eaa27b50ce2bc2c9d3b531ea2000928380a
-SHA256_CPP=826660ed60cf467641ab2f93a0e1a2dacf603c444f76d835358c814bc2caba3a
+VERSION=4.6.11
+SOURCE=https://github.com/simdjson/simdjson/releases/download/v4.6.11/
+SHA256_H=a5c467c33c7871262eb4c82775490430758939c1c516fbdaeb662f8255860a60
+SHA256_CPP=66c818d1a6b3841febef7a8336ff297f0a52e250a436b598bcdecf010d626243
