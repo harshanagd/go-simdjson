@@ -89,12 +89,31 @@ func TestParseNDStreamReuse(t *testing.T) {
 	reuse := make(chan *ParsedJson, 2)
 	ParseNDStream(strings.NewReader(input), res, reuse)
 
+	var got []interface{}
 	for s := range res {
 		if s.Error != nil {
 			t.Fatal(s.Error)
 		}
-		// Return to reuse channel
+		// Each document is a view into its parser, so read it BEFORE handing the
+		// parser back for recycling.
+		iter, err := s.Value.Iter()
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, err := iter.Interface()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, v)
 		reuse <- s.Value
+	}
+
+	want := []interface{}{
+		map[string]interface{}{"a": int64(1)},
+		map[string]interface{}{"b": int64(2)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("documents = %v, want %v", got, want)
 	}
 }
 
@@ -724,18 +743,21 @@ func TestParseNDForEachPropagatesOptions(t *testing.T) {
 	// useless: BOTH modes satisfy it — the no-copy path returns a cap-pinned
 	// sub-slice and the copy path returns a make()'d slice whose cap equals its
 	// len. The discriminating property is ALIASING, so mutate the tape's string
-	// buffer and see whether the returned slice observes the change.
+	// buffer and see whether the returned slice observes the change. That probe
+	// has to run on a CLONE: a tape straight from ParseND views C++ memory, where
+	// the no-copy path is disabled whatever the flag says.
 	for _, copyStrings := range []bool{false, true} {
 		name := "nocopy"
 		if copyStrings {
 			name = "copy"
 		}
 		t.Run(name, func(t *testing.T) {
-			pj, err := ParseND([]byte("\"aaaa\"\n\"bbbb\"\n"), nil, WithCopyStrings(copyStrings))
+			src, err := ParseND([]byte("\"aaaa\"\n\"bbbb\"\n"), nil, WithCopyStrings(copyStrings))
 			if err != nil {
 				t.Fatalf("ParseND: %v", err)
 			}
-			defer pj.Close()
+			pj := src.Clone(nil)
+			src.Close()
 
 			var got [][]byte
 			if err := pj.ForEach(func(i Iter) error {
@@ -960,5 +982,46 @@ func TestParseNDScalarSpanningBatchBoundary(t *testing.T) {
 	}
 	if fmt.Sprint(got[wantIdx]) != want {
 		t.Errorf("document %d spanning the batch edge = %v, want %s", wantIdx, got[wantIdx], want)
+	}
+}
+
+// The combined NDJSON tape is now owned by the parser, not the thread, so two
+// parsers used alternately must not overwrite each other's view. As thread_locals
+// the second ParseND cleared the first parser's buffers, which only the old
+// per-call copy hid.
+func TestParseNDParsersDoNotShareBuffers(t *testing.T) {
+	a, err := ParseND([]byte("\"a1\"\n\"a2\"\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	b, err := ParseND([]byte("\"b1\"\n\"b2\"\n\"b3\"\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	collect := func(pj *ParsedJson) []string {
+		var got []string
+		if err := pj.ForEach(func(i Iter) error {
+			s, err := i.String()
+			if err != nil {
+				return err
+			}
+			got = append(got, s)
+			return nil
+		}); err != nil {
+			t.Fatalf("ForEach: %v", err)
+		}
+		return got
+	}
+
+	// Read the FIRST parser after the second has parsed.
+	if got := collect(a); !reflect.DeepEqual(got, []string{"a1", "a2"}) {
+		t.Errorf("first parser = %q, want [a1 a2]", got)
+	}
+	if got := collect(b); !reflect.DeepEqual(got, []string{"b1", "b2", "b3"}) {
+		t.Errorf("second parser = %q, want [b1 b2 b3]", got)
 	}
 }

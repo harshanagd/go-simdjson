@@ -62,6 +62,9 @@ pj, err = simdjson.Parse(data2, pj) // reuses internal buffers
 // use pj...
 ```
 
+Reusing a parser re-parses over the memory the previous document's tape pointed at,
+so finish with `data1` before parsing `data2`, or `Clone()` to keep it.
+
 ## Tree Walking
 
 Navigate nested JSON using Iter, Object, and Array:
@@ -342,7 +345,7 @@ make clean     # clear test cache
 
 go-simdjson uses a two-phase approach:
 
-1. **Parse (CGo)**: A single CGo call invokes C++ simdjson which SIMD-parses the JSON into a tape (flat `[]uint64` array) and string buffer, copied into Go memory. This is the only CGo call.
+1. **Parse (CGo)**: A single CGo call invokes C++ simdjson which SIMD-parses the JSON into a tape (flat `[]uint64` array) and string buffer. Go wraps both with `unsafe.Slice` — no copy — and the C++ parser retains ownership. This is the only CGo call.
 2. **Navigate (pure Go)**: All navigation — `Type()`, `String()`, `FindKey()`, `ForEach()`, `Interface()` — is pure Go pointer arithmetic on the tape. Zero CGo overhead per element.
 
 ```
@@ -352,15 +355,20 @@ go-simdjson uses a two-phase approach:
 │  Parse(json) ──CGo──► C++ simdjson (SIMD parse)     │
 │       │                     │                       │
 │       ▼                     ▼                       │
-│  ┌─────────┐  memcpy  ┌──────────┐                  │
-│  │  Tape   │◄─────────│ C++ tape │                  │
-│  │ []uint64│          └──────────┘                  │
+│  ┌─────────┐  view    ┌──────────┐                  │
+│  │  Tape   │─ ─ ─ ─ ─►│ C++ tape │ (parser-owned)   │
+│  │ []uint64│  no copy └──────────┘                  │
 │  └────┬────┘                                        │
 │       │ pure Go                                     │
 │       ▼                                             │
 │  Iter/Object/Array/TapeIter (zero CGo)              │
 └─────────────────────────────────────────────────────┘
 ```
+
+`Tape` holds an `unsafe.Slice` over the C++ parser's buffers, plus a back-reference
+to the owning `ParsedJson` so the GC keeps the parser alive while any iterator
+exists. The view is valid until the next `Parse` on that `ParsedJson` or until
+`Close`; `Clone()` returns an independent Go-owned copy that outlives both.
 
 ## Benchmarks
 
@@ -370,12 +378,12 @@ Measured on Intel Xeon Platinum 8488C (x86_64, AVX2).
 
 | File | go-simdjson | encoding/json | Speedup |
 |------|------------|---------------|---------|
-| twitter.json (632KB) | 378µs, 1671 MB/s, 2 allocs | 5.2ms, 121 MB/s, 32K allocs | **14x** |
-| canada.json (2.3MB) | 2.7ms, 849 MB/s, 2 allocs | 26.3ms, 86 MB/s, 393K allocs | **10x** |
-| citm_catalog.json (1.7MB) | 765µs, 2259 MB/s, 2 allocs | 11.9ms, 145 MB/s, 96K allocs | **16x** |
-| github_events.json (65KB) | 35µs, 1846 MB/s, 2 allocs | 460µs, 142 MB/s, 3K allocs | **13x** |
-| mesh.json (724KB) | 855µs, 846 MB/s, 2 allocs | 10.8ms, 67 MB/s, 150K allocs | **13x** |
-| numbers.json (150KB) | 161µs, 932 MB/s, 1 alloc | 1.5ms, 102 MB/s, 20K allocs | **9x** |
+| twitter.json (632KB) | 378µs, 1671 MB/s, 0 allocs | 5.2ms, 121 MB/s, 32K allocs | **14x** |
+| canada.json (2.3MB) | 2.7ms, 849 MB/s, 0 allocs | 26.3ms, 86 MB/s, 393K allocs | **10x** |
+| citm_catalog.json (1.7MB) | 765µs, 2259 MB/s, 0 allocs | 11.9ms, 145 MB/s, 96K allocs | **16x** |
+| github_events.json (65KB) | 35µs, 1846 MB/s, 0 allocs | 460µs, 142 MB/s, 3K allocs | **13x** |
+| mesh.json (724KB) | 855µs, 846 MB/s, 0 allocs | 10.8ms, 67 MB/s, 150K allocs | **13x** |
+| numbers.json (150KB) | 161µs, 932 MB/s, 0 allocs | 1.5ms, 102 MB/s, 20K allocs | **9x** |
 
 ### Interface(): go-simdjson vs encoding/json
 
@@ -391,19 +399,23 @@ Full materialization to `map[string]interface{}` / `[]interface{}`:
 
 ### WithCopyStrings(false)
 
-Zero-copy string access eliminates string allocations (strings point into Go-owned tape memory):
+`WithCopyStrings(false)` lets a string read alias the tape's buffer instead of
+allocating — but only on a **cloned** tape, which owns Go memory. A tape straight
+from `Parse` is a view into the C++ parser, where an aliased string would have no
+owner the GC can see, so those reads copy whatever the flag says. The fastest
+iteration path is therefore `Clone()` followed by `WithCopyStrings(false)`:
 
-| File | Copy (default) | NoCopy | Speedup | Alloc reduction |
-|------|---------------|--------|---------|-----------------|
-| twitter.json | 1.35ms, 28K allocs | 881µs, 10K allocs | **1.5x** | 64% |
-| citm_catalog.json | 3.1ms, 76K allocs | 2.6ms, 50K allocs | **1.2x** | 35% |
-| github_events.json | 121µs, 3.2K allocs | 71µs, 1.3K allocs | **1.7x** | 60% |
-| apache_builds.json | 359µs, 9.7K allocs | 228µs, 4.4K allocs | **1.6x** | 55% |
-| instruments.json | 482µs, 9.6K allocs | 361µs, 3.1K allocs | **1.3x** | 68% |
-| random.json | 2.3ms, 59K allocs | 1.7ms, 26K allocs | **1.4x** | 56% |
-| update-center.json | 2.1ms, 48K allocs | 1.3ms, 21K allocs | **1.6x** | 56% |
+```go
+pj, _ := simdjson.Parse(data, nil, simdjson.WithCopyStrings(false))
+cloned := pj.Clone(nil) // Go-owned; the no-copy path applies from here
+pj.Close()
+```
 
-NoCopy has no effect on numeric-heavy files (canada, mesh, numbers) since they have few strings.
+The measurements previously in this section were taken when `Parse` copied both
+buffers into Go memory, so they described the parsed-tape path this change removed.
+They are pending a re-run against the clone path on the reference machine. String-heavy
+documents (twitter, github_events, apache_builds, update-center) benefited most, and
+numeric-heavy ones (canada, mesh, numbers) never did, having few strings.
 
 ### Targeted Access Benchmarks
 
@@ -441,9 +453,9 @@ for {
 
 | Operation | Allocations | Notes |
 |-----------|------------|-------|
-| Parse | 2 | tape `[]uint64` + string buffer `[]byte` |
+| Parse | 0 | zero-copy view over the C++ parser's buffers |
 | Interface() | O(elements) | Unavoidable: `interface{}` boxing, map/slice creation |
-| Interface() NoCopy | ~64% fewer | Eliminates string copies |
+| Interface() on a clone, NoCopy | fewer | Skips string copies; clone required, see above |
 | Targeted access | 0–5 per call | Use `reuse` params to minimize |
 | Elements.Lookup | 0 | Zero-alloc after initial `Object.Parse` |
 | AsFloat/AsInteger | 3 | Single slice allocation for result |

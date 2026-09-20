@@ -4,11 +4,19 @@
 #include "simdjson.h"
 
 #include <cstring>
+#include <vector>
 
 struct parser_state {
     simdjson::dom::parser parser;
     simdjson::dom::element root;
     bool has_doc;
+    // NDJSON documents are concatenated into one tape here. These belong to the
+    // parser rather than the thread so the Go side can hold a zero-copy view:
+    // they are overwritten only by another parse_many on THIS parser, and freed
+    // with it. As thread_locals they were shared by every parser on the thread,
+    // which a per-parser Go back-reference could not have made safe.
+    std::vector<uint64_t> nd_tape;
+    std::vector<uint8_t> nd_strings;
 };
 
 extern "C" {
@@ -90,9 +98,10 @@ simdjson_nd_result simdjson_parse_many(simdjson_parser p, const char* buf, size_
         return r;
     }
 
-    // Collect all document tapes into one combined tape + string buffer.
-    thread_local std::vector<uint64_t> combined_tape;
-    thread_local std::vector<uint8_t> combined_strings;
+    // Collect all document tapes into one combined tape + string buffer, owned by
+    // the parser so Go can view it without copying.
+    std::vector<uint64_t>& combined_tape = state->nd_tape;
+    std::vector<uint8_t>& combined_strings = state->nd_strings;
     combined_tape.clear();
     combined_strings.clear();
 

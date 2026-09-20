@@ -4,7 +4,9 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"reflect"
+	"runtime"
 	"testing"
+	"time"
 )
 
 func TestIterType(t *testing.T) {
@@ -1700,4 +1702,145 @@ func TestObjectCursorOutlastsEmptyKeyNull(t *testing.T) {
 			t.Error(`Lookup("b") = nil, want the entry after the empty-key null`)
 		}
 	})
+}
+
+// A tape from Parse views the C++ parser's memory, so every string read has to be
+// copied even under WithCopyStrings(false) -- an aliased one would have no owner the
+// GC can see, and would dangle once the parser is freed. Reads taken before Close
+// must therefore still be intact after it.
+func TestZeroCopyTapeCopiesStringsDespiteFlag(t *testing.T) {
+	pj, err := Parse([]byte(`{"":null,"key":"hello","nested":{"deep":"world"}}`), nil, WithCopyStrings(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+	s, err := obj.FindKey("key", nil).Iter.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iter2, _ := pj.Iter()
+	obj2, _ := iter2.Object(nil)
+	inner, err := obj2.FindKey("nested", nil).Iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := inner.FindKey("deep", nil).Iter.StringBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iter3, _ := pj.Iter()
+	obj3, _ := iter3.Object(nil)
+	var keys [][]byte
+	var dst Iter
+	for i := 0; i < 8; i++ {
+		name, typ, err := obj3.NextElementBytes(&dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ == Type(-1) {
+			break
+		}
+		keys = append(keys, name)
+	}
+
+	pj.Close() // frees the C++ buffers the tape pointed at
+
+	if s != "hello" {
+		t.Errorf("String() = %q after Close, want %q", s, "hello")
+	}
+	if string(sb) != "world" {
+		t.Errorf("StringBytes() = %q after Close, want %q", sb, "world")
+	}
+	if len(keys) != 3 {
+		t.Fatalf("collected %d keys, want 3", len(keys))
+	}
+	for i, want := range []string{"", "key", "nested"} {
+		if string(keys[i]) != want {
+			t.Errorf("key %d = %q after Close, want %q", i, keys[i], want)
+		}
+	}
+}
+
+// The tape views C++ memory that a finalizer frees, and the GC cannot trace into it.
+// Navigating from a Tape held BY VALUE is the case that needs Tape.pj: the TapeIter
+// points at the caller's copy, not into the ParsedJson, so the back-reference is the
+// only thing left keeping the parser alive. The read is numeric, so this tests
+// reachability of the tape alone rather than the string-copy rule.
+func TestTapeValueCopyKeepsParserAliveAcrossGC(t *testing.T) {
+	// Scoped so the *ParsedJson local dies here and the copy is the only referent.
+	mk := func() TapeIter {
+		pj, err := Parse([]byte(`{"n":1234567890123}`), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tp, err := pj.GetTape()
+		if err != nil {
+			t.Fatal(err)
+		}
+		byValue := *tp // drops the interior pointer into pj; only byValue.pj remains
+		return byValue.Iter()
+	}
+	ti := mk()
+
+	// Finalizers need a cycle to be queued and another to run.
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	obj, err := ti.Object()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, ok := obj.FindKey("n")
+	if !ok {
+		t.Fatal(`key "n" not found`)
+	}
+	n, err := v.Int()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1234567890123 {
+		t.Errorf("read %d after GC, want 1234567890123 -- the parser was collected from under the tape", n)
+	}
+}
+
+// Mutating a tape that views C++ memory writes through to the parser's buffers, and
+// SetString grows the string buffer into Go memory while the tape stays in C memory.
+// The result must still read back consistently.
+func TestMutateParsedTapeInPlace(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":"xx","b":1}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+	if err := obj.FindKey("a", nil).Iter.SetString("replaced"); err != nil {
+		t.Fatal(err)
+	}
+	if err := obj.FindKey("b", nil).Iter.SetInt(99); err != nil {
+		t.Fatal(err)
+	}
+	if err := pj.tape.Validate(); err != nil {
+		t.Fatalf("mutation left the tape invalid: %v", err)
+	}
+
+	iter2, _ := pj.Iter()
+	v, err := iter2.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := v.(map[string]interface{})
+	if m["a"] != "replaced" {
+		t.Errorf(`m["a"] = %v, want "replaced"`, m["a"])
+	}
+	if m["b"] != int64(99) {
+		t.Errorf(`m["b"] = %v, want 99`, m["b"])
+	}
 }

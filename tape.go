@@ -89,15 +89,19 @@ func (tag Tag) Type() Type {
 //     string is stored as a 4-byte native-endian length prefix followed by the
 //     UTF-8 bytes and a null terminator. This is NOT the original input buffer.
 //
-// Both C++ buffers are owned by the parser and are overwritten on the next
-// Parse() call or freed on Close(). The Tape does NOT point into them: Parse
-// copies both into Go-managed slices, so a Tape and every string obtained from it
-// remain valid for the lifetime of the Tape, independently of the C++ parser.
+// Both buffers are owned by the C++ parser. The Tape is a zero-copy view into
+// them, so it is valid until the next Parse on the same ParsedJson or until
+// Close. Clone() returns an independent Go-owned copy that outlives both.
 type Tape struct {
 	data        []uint64
 	strings     []byte
 	copyStrings bool
 	useNumber   bool
+	// pj keeps the owning ParsedJson reachable, so the GC cannot finalize it --
+	// and free the C++ buffers -- while a TapeIter or Iter still points here.
+	// Go's GC cannot trace data/strings, which live in C memory. Nil on a cloned
+	// tape, which owns Go memory; that also makes it the "is this C memory?" test.
+	pj *ParsedJson
 }
 
 // GetTape returns the tape extracted during Parse. Zero-cost after parse.
@@ -876,7 +880,9 @@ func (t *Tape) readString(offset uint64) (string, error) {
 	if len(b) == 0 {
 		return "", nil
 	}
-	if t.copyStrings {
+	if t.copyStrings || t.pj != nil {
+		// Copy when asked, and always on a zero-copy tape: an unsafe.String over C
+		// memory would outlive nothing the GC can see.
 		return string(b), nil
 	}
 	return unsafe.String(&b[0], len(b)), nil

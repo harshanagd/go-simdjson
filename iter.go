@@ -75,8 +75,9 @@ func (i *Iter) String() (string, error) {
 }
 
 // StringRef extracts a string value without copying.
-// Equivalent to String() — tape strings are stored in Go-managed memory and
-// remain valid for the lifetime of the Tape.
+// Equivalent to String(), and kept for compatibility with simdjson-go where the
+// two differ. Here a string read from a zero-copy tape is copied regardless, so
+// the result is always safe to retain.
 func (i *Iter) StringRef() (string, error) {
 	return i.String()
 }
@@ -288,10 +289,10 @@ func (o *Object) Map(dst map[string]interface{}) (map[string]interface{}, error)
 }
 
 // StringBytes extracts a string value as []byte.
-// When WithCopyStrings(true) (the default), the result is an independent copy.
-// When false, it is a slice into the tape's string buffer whose capacity is
-// pinned to its length, so appending to it reallocates rather than corrupting
-// the adjacent string.
+// The result is an independent copy under WithCopyStrings(true) (the default),
+// and also on a zero-copy tape whatever the flag says. Only a cloned tape with
+// the flag off returns a slice into the string buffer, whose capacity is pinned
+// to its length so appending reallocates rather than corrupting the next string.
 func (i *Iter) StringBytes() ([]byte, error) {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	if ti.pastEnd() {
@@ -304,7 +305,7 @@ func (i *Iter) StringBytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if i.copyStrings {
+	if i.copyStrings || i.tape.pj != nil {
 		cp := make([]byte, len(b))
 		copy(cp, b)
 		return cp, nil
@@ -456,7 +457,7 @@ func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
 	if err != nil {
 		return nil, Type(-1), err
 	}
-	if o.copyStrings {
+	if o.copyStrings || o.tobj.tape.pj != nil {
 		cp := make([]byte, len(s))
 		copy(cp, s)
 		s = cp

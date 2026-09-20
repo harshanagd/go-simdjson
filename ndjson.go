@@ -60,10 +60,11 @@ func ParseND(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, er
 		return pj, fmt.Errorf("truncated NDJSON: the last %d byte(s) do not form a complete document", truncated)
 	}
 	pj.tape = Tape{
-		data:        copyUint64Slice(unsafe.Pointer(res.tape), int(res.tape_len)),
-		strings:     copyByteSlice(unsafe.Pointer(res.sbuf), int(res.sbuf_len)),
+		data:        unsafe.Slice((*uint64)(unsafe.Pointer(res.tape)), int(res.tape_len)),
+		strings:     unsafe.Slice((*byte)(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
 		copyStrings: pj.copyStrings,
 		useNumber:   pj.useNumber,
+		pj:          pj,
 	}
 	pj.hasTape = true
 	return pj, nil
@@ -79,6 +80,10 @@ type Stream struct {
 // results to the res channel. An optional reuse channel can supply ParsedJson
 // instances for reuse. The method returns immediately; parsing happens in a
 // goroutine. The res channel is closed when parsing is complete.
+//
+// Each Stream.Value holds a view into its own parser, so read a document before
+// putting its ParsedJson on the reuse channel: reusing it re-parses over the memory
+// the previous view pointed at. Clone to keep a document past that point.
 func ParseNDStream(r io.Reader, res chan<- Stream, reuse <-chan *ParsedJson) {
 	go func() {
 		defer close(res)

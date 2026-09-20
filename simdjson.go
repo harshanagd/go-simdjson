@@ -9,7 +9,6 @@ package simdjson
 // #cgo CXXFLAGS: -std=c++17 -O2 -DNDEBUG
 // #cgo LDFLAGS: -lstdc++ -lm
 // #include "bridge.h"
-// #include <string.h>
 import "C"
 
 import (
@@ -35,10 +34,11 @@ type ParserOption func(*ParsedJson)
 // WithCopyStrings controls whether each string value is copied out of the tape's
 // string buffer when it is read.
 //
-// Note both settings are safe to retain: Parse copies the C++ string buffer into
-// Go-managed memory, so a returned string is never invalidated by a later Parse or
-// Close. The flag only controls whether each read allocates a fresh copy or
-// aliases the tape's buffer, which matters for []byte results — see StringBytes.
+// Note a returned string is always safe to retain. When false, a read may alias
+// the tape's buffer to save the allocation -- but only on a cloned tape, which owns
+// Go memory. A tape straight from Parse is a view into the C++ parser, where an
+// aliased string would have no owner the GC can see, so those reads copy whatever
+// this flag says. Clone plus WithCopyStrings(false) is the cheapest iteration path.
 // When true (the default), every string read allocates.
 func WithCopyStrings(copy bool) ParserOption {
 	return func(pj *ParsedJson) {
@@ -87,7 +87,9 @@ func GetParser() *ParsedJson {
 
 // PutParser returns a ParsedJson to the pool for reuse.
 // The parser is reset first, so it does not carry its tape or its parser
-// options over to the next GetParser caller.
+// options over to the next GetParser caller. That reset also zeroes the tape
+// view, so any Tape, TapeIter or Iter taken beforehand is dangling: Clone first
+// if the data has to outlive the pool return.
 func PutParser(pj *ParsedJson) {
 	if pj != nil && pj.parser != nil {
 		pj.Reset()
@@ -96,7 +98,9 @@ func PutParser(pj *ParsedJson) {
 }
 
 // Parse parses JSON bytes using the provided ParsedJson (or a new one if nil).
-// The returned ParsedJson owns the parsed data until the next Parse call.
+// The returned ParsedJson holds a zero-copy view into the C++ parser's tape and
+// string buffer, valid until the next Parse on this same ParsedJson or until
+// Close. Use Clone for an independent copy that survives both.
 //
 // Parser options apply only to this call: they are reset to their defaults
 // before opts are applied, so an option passed for one document does not carry
@@ -136,21 +140,26 @@ func Parse(b []byte, reuse *ParsedJson, opts ...ParserOption) (*ParsedJson, erro
 		return pj, fmt.Errorf("%s", C.GoString(res.result.error_msg))
 	}
 	pj.tape = Tape{
-		data:        copyUint64Slice(unsafe.Pointer(res.tape), int(res.tape_len)),
-		strings:     copyByteSlice(unsafe.Pointer(res.sbuf), int(res.sbuf_len)),
+		data:        unsafe.Slice((*uint64)(unsafe.Pointer(res.tape)), int(res.tape_len)),
+		strings:     unsafe.Slice((*byte)(unsafe.Pointer(res.sbuf)), int(res.sbuf_len)),
 		copyStrings: pj.copyStrings,
 		useNumber:   pj.useNumber,
+		pj:          pj,
 	}
 	pj.hasTape = true
 	return pj, nil
 }
 
 // Close frees the underlying C++ parser. The ParsedJson must not be used after Close.
+// The tape and string buffer go with it: they are views into the parser's memory, so
+// any Tape, TapeIter or Iter taken beforehand is dangling. Clone first to keep data.
 func (pj *ParsedJson) Close() {
 	if pj.parser != nil {
+		// Zero the view before the memory behind it goes away.
+		pj.hasTape = false
+		pj.tape = Tape{}
 		C.simdjson_parser_free(pj.parser)
 		pj.parser = nil
-		pj.hasTape = false
 	}
 }
 
@@ -366,22 +375,4 @@ func SupportedCPU() bool {
 // detected at runtime (e.g. "haswell", "westmere", "arm64", "fallback").
 func ActiveImplementation() string {
 	return C.GoString(C.simdjson_active_implementation())
-}
-
-func copyUint64Slice(ptr unsafe.Pointer, length int) []uint64 {
-	if ptr == nil || length == 0 {
-		return nil
-	}
-	dst := make([]uint64, length)
-	C.memcpy(unsafe.Pointer(&dst[0]), ptr, C.size_t(length*8))
-	return dst
-}
-
-func copyByteSlice(ptr unsafe.Pointer, length int) []byte {
-	if ptr == nil || length == 0 {
-		return nil
-	}
-	dst := make([]byte, length)
-	C.memcpy(unsafe.Pointer(&dst[0]), ptr, C.size_t(length))
-	return dst
 }
