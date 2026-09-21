@@ -54,6 +54,48 @@ jobs:
       - name: Benchmark
         run: go test -bench=. -benchmem -benchtime=1s ./...
 
+  # The opt-in link mode rots unless both paths are built and their linkage checked
+  # on the produced binary: -static-libstdc++ is silently ignored by a driver that
+  # does not implement it, so a zero exit proves nothing. This is also where macOS
+  # is covered, which the README's Xcode claim previously asserted untested.
+  link-modes:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        tags: ['', simdjson_static_cxx]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Test
+        run: go test -count=1 -tags='${{ matrix.tags }}' ./...
+      - name: Assert linkage and record size
+        run: |
+          set -o pipefail
+          go test -c -tags='${{ matrix.tags }}' -o /tmp/sj.test . 2>&1 | tee /tmp/link.log
+          echo "binary: $(wc -c < /tmp/sj.test) bytes (tags='${{ matrix.tags }}')"
+          if [ "$(uname)" = Darwin ]; then
+            otool -L /tmp/sj.test
+            # libc++ is present whatever the tag, so asserting it proves nothing. The
+            # regression worth catching is naming a runtime the c++ driver already
+            # linked, which on darwin is what -lstdc++ does.
+            if grep -q 'ignoring duplicate libraries' /tmp/link.log; then
+              echo "link names a C++ runtime the driver already supplied"; exit 1
+            fi
+          else
+            ldd /tmp/sj.test || true
+            if [ -n '${{ matrix.tags }}' ]; then
+              if ldd /tmp/sj.test | grep -q 'libstdc++'; then
+                echo "static mode still links libstdc++"; exit 1
+              fi
+            elif ! ldd /tmp/sj.test | grep -q 'libstdc++'; then
+              echo "dynamic mode does not link libstdc++"; exit 1
+            fi
+          fi
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

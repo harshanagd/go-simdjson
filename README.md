@@ -12,6 +12,28 @@ The existing Go simdjson port ([minio/simdjson-go](https://github.com/minio/simd
 - C++17 compiler (GCC 8+, Clang 7+, or Xcode 11+)
 - CGo enabled (`CGO_ENABLED=1`, the default for native builds)
 
+### C++ runtime linking
+
+The C++ runtime is linked dynamically by default, so a binary needs a libstdc++ at
+least as new as the one it was built against — an older host refuses to load it with
+`version GLIBCXX_3.4.xx not found`. Build with the `simdjson_static_cxx` tag to bind
+libstdc++ into the binary instead:
+
+```bash
+go build -tags simdjson_static_cxx
+```
+
+It is opt-in for two reasons. glibc stays dynamic either way, so the result is not a
+fully static binary and `GLIBC_2.xx not found` remains possible. And libstdc++ is
+GPLv3 with the GCC Runtime Library Exception, which permits static linking when the
+build uses a GPL-compatible toolchain — ordinary GCC builds qualify, but the default
+should not answer that question on your behalf.
+
+The tag is a no-op on macOS, where the runtime is libc++ and always dynamic. CI
+builds and tests both modes on Linux and macOS and asserts the produced binary's
+linkage, since `-static-libstdc++` is silently ignored by a driver that does not
+implement it — a successful build does not mean the tag took effect.
+
 ## Installation
 
 ```bash
@@ -329,7 +351,7 @@ func (a *TapeArray) ForEach/AsFloat/AsInteger/AsString/Count/Interface/FirstType
 # Quick check (lint + test)
 make
 
-# Full CI-equivalent (lint + build + race tests + benchmarks + fuzzing)
+# Full CI-equivalent (lint + build + both link modes + race + benchmarks + fuzzing)
 make release
 
 # Individual targets
@@ -337,6 +359,7 @@ make build     # compile only
 make test      # tests without race
 make race      # tests with race detector
 make lint      # golangci-lint
+make static    # build and test with -tags simdjson_static_cxx
 make bench     # benchmarks
 make fuzz      # fuzz every target; make fuzz FUZZTIME=5m for longer
 make clean     # clear test cache

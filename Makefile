@@ -1,8 +1,8 @@
-.PHONY: all build test race lint bench fuzz release clean
+.PHONY: all build test race lint bench fuzz static release clean
 
 all: lint test
 
-release: lint build race bench fuzz
+release: lint build static race bench fuzz
 
 build:
 	go build ./...
@@ -15,6 +15,12 @@ race:
 
 lint:
 	golangci-lint run ./...
+
+# The opt-in link mode is invisible to every other target, so it rots without this.
+# CI additionally asserts the produced binary's linkage, which needs ldd/otool.
+static:
+	go build -tags simdjson_static_cxx ./...
+	go test -count=1 -tags simdjson_static_cxx ./...
 
 bench:
 	go test -bench=. -benchmem -benchtime=1s -run='^$$' ./...

@@ -7,7 +7,6 @@
 package simdjson
 
 // #cgo CXXFLAGS: -std=c++17 -O2 -DNDEBUG
-// #cgo LDFLAGS: -lstdc++ -lm
 // #include "bridge.h"
 import "C"
 
@@ -17,6 +16,11 @@ import (
 	"sync"
 	"unsafe"
 )
+
+// The C++ runtime's link flags live in link_dynamic.go and link_static.go. This
+// reference makes exactly one of them mandatory: selecting both redeclares
+// staticCXX, selecting neither leaves it undefined.
+var _ = staticCXX
 
 // ParsedJson holds a parsed JSON document. Safe to reuse via sync.Pool.
 type ParsedJson struct {
