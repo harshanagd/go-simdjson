@@ -3,6 +3,7 @@ package simdjson
 import (
 	"encoding/binary"
 	"encoding/json"
+	"math"
 	"math/rand"
 	"strings"
 	"testing"
@@ -2105,6 +2106,15 @@ func TestStringOffsetsAreGuardedAtReadTime(t *testing.T) {
 			binary.NativeEndian.PutUint32(b[0:4], 9999)
 			return b
 		}(), 0, "length 9999"},
+		// Both bounds are compared before narrowing to int, so these stay errors where
+		// int is 32 bits. Narrowing first would make each one negative, slip past the
+		// check and panic on the slice.
+		{"offset narrows to negative", make([]byte, 8), payloadMask, "out of bounds"},
+		{"length prefix narrows to negative", func() []byte {
+			b := make([]byte, 8)
+			binary.NativeEndian.PutUint32(b[0:4], math.MaxUint32)
+			return b
+		}(), 0, "out of bounds"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			tp := &Tape{

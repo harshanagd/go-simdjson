@@ -72,7 +72,7 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	if off+8 > len(src) {
 		return nil, fmt.Errorf("truncated tape length")
 	}
-	tapeLen := int(binary.NativeEndian.Uint64(src[off:]))
+	tapeLen := int(binary.NativeEndian.Uint64(src[off:])) //nolint:gosec // deliberate: a hostile length above MaxInt64 lands negative and the check below rejects it
 	off += 8
 
 	// Bound by division: tapeLen*8 overflows for a hostile length, wrapping to 0 or
@@ -91,7 +91,7 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	if off+8 > len(src) {
 		return nil, fmt.Errorf("truncated strings length")
 	}
-	strLen := int(binary.NativeEndian.Uint64(src[off:]))
+	strLen := int(binary.NativeEndian.Uint64(src[off:])) //nolint:gosec // deliberate: a hostile length above MaxInt64 lands negative and the check below rejects it
 	off += 8
 
 	// off+strLen overflows for a hostile length; compare against the remaining bytes.

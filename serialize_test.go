@@ -317,3 +317,37 @@ func TestSerializeReuse(t *testing.T) {
 		t.Errorf("reuse mismatch: %s vs %s", b1, b2)
 	}
 }
+
+// FuzzDeserialize asserts the contract Deserialize's boundary check exists to
+// establish: anything it accepts is safe for every reader to walk. It reaches the
+// envelope parser -- version byte and the two length prefixes -- which FuzzTapeContract
+// cannot, because that target always re-serializes a tape and so always produces a
+// well-formed envelope.
+func FuzzDeserialize(f *testing.F) {
+	ser := NewSerializer()
+	for _, seed := range contractSeeds {
+		pj, err := Parse([]byte(seed), nil)
+		if err != nil {
+			f.Fatalf("Parse %q: %v", seed, err)
+		}
+		f.Add(ser.Serialize(nil, *pj))
+		pj.Close()
+	}
+
+	// Envelope edges the corpus above cannot reach: empty, header only, a bad
+	// version, and lengths that overflow when scaled to bytes.
+	f.Add([]byte{})
+	f.Add([]byte{serializerVersion})
+	f.Add([]byte{serializerVersion ^ 0xff, 0, 0, 0, 0, 0, 0, 0, 0})
+	f.Add(blobWithLengths(1<<61, 0, 1))
+	f.Add(blobWithLengths(0, 1<<61, 0))
+
+	f.Fuzz(func(t *testing.T, src []byte) {
+		pj, err := ser.Deserialize(src, nil)
+		if err != nil {
+			return
+		}
+		contractWalkTape(t, &pj.tape)
+		contractWalkParsed(t, pj)
+	})
+}

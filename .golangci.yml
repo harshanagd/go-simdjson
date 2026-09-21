@@ -7,3 +7,21 @@ linters:
     - errcheck
     - ineffassign
     - unused
+    # This package consumes untrusted input through unsafe.Pointer/Slice/String,
+    # so gosec's integer-conversion and unsafe rules are worth the noise. Each
+    # remaining production finding carries a //nolint:gosec with its reason.
+    - gosec
+  exclusions:
+    rules:
+      # Tests build tapes from raw words, shell out to zstd for fixtures, and seed
+      # RNGs deterministically for reproducibility. All three trip gosec by design.
+      - path: _test\.go
+        linters:
+          - gosec
+
+# Report every finding. The defaults cap same-text issues at 3, which hid 7 of the
+# 18 gosec findings when it was first enabled -- including both untrusted length
+# conversions in Deserialize.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

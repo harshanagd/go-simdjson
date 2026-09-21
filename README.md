@@ -329,7 +329,7 @@ func (a *TapeArray) ForEach/AsFloat/AsInteger/AsString/Count/Interface/FirstType
 # Quick check (lint + test)
 make
 
-# Full CI-equivalent (lint + build + race tests + benchmarks)
+# Full CI-equivalent (lint + build + race tests + benchmarks + fuzzing)
 make release
 
 # Individual targets
@@ -338,8 +338,19 @@ make test      # tests without race
 make race      # tests with race detector
 make lint      # golangci-lint
 make bench     # benchmarks
+make fuzz      # fuzz every target; make fuzz FUZZTIME=5m for longer
 make clean     # clear test cache
 ```
+
+`go test` alone only replays each fuzz target's stored seed corpus. `make fuzz`
+mutates, which is what reaches the malformed-tape and serialized-envelope paths:
+
+| target | covers |
+|---|---|
+| `FuzzParse` | arbitrary bytes through `Parse`, then `Iter`/`Interface` |
+| `FuzzCorrect` | agreement with `encoding/json` on inputs it accepts |
+| `FuzzDeserialize` | `Serializer.Deserialize`, including the length-prefix envelope |
+| `FuzzTapeContract` | mutated tapes still satisfying `Tape.Validate` |
 
 ## Architecture
 

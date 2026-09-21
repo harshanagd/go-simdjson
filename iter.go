@@ -667,7 +667,7 @@ func (t *Tape) tapePayloadAt(idx int) uint64 {
 
 // tapeSkipNop advances past a NOP entry, returning the next index.
 func (t *Tape) tapeSkipNop(idx int) int {
-	skip := int(t.tapePayloadAt(idx))
+	skip := int(t.tapePayloadAt(idx)) //nolint:gosec // payloadMask is 56 bits, so this cannot go negative
 	if skip == 0 {
 		skip = 1
 	}
@@ -714,7 +714,7 @@ func (t *Tape) nextRootDoc(rootIdx int) int {
 	if !t.hasRootAt(rootIdx) {
 		return len(t.data)
 	}
-	next := int(t.tapePayloadAt(rootIdx)) + 1
+	next := int(t.tapePayloadAt(rootIdx)) + 1 //nolint:gosec // payloadMask is 56 bits, so this cannot go negative
 	if next <= rootIdx || !t.hasRootDocAt(next) {
 		return len(t.data)
 	}
@@ -764,7 +764,7 @@ func (t *Tape) rootDocContaining(idx int) int {
 		if root > idx {
 			break
 		}
-		if idx < int(t.tapePayloadAt(root)) {
+		if idx < int(t.tapePayloadAt(root)) { //nolint:gosec // payloadMask is 56 bits, so this cannot go negative
 			return root
 		}
 	}
@@ -782,7 +782,7 @@ func (t *Tape) skipRootBoundary(idx int) int {
 	if !t.hasRootAt(idx) {
 		return idx
 	}
-	payload := int(t.tapePayloadAt(idx))
+	payload := int(t.tapePayloadAt(idx)) //nolint:gosec // payloadMask is 56 bits, so this cannot go negative
 	if payload > idx {
 		// An opening root: its document's value is the next entry.
 		return idx + 1
@@ -799,7 +799,7 @@ func (t *Tape) skipRootBoundary(idx int) int {
 // end must be within the tape; callers derive it from a validated container header.
 func (t *Tape) tapeNopRange(start, end int) {
 	for j := start; j < end; j++ {
-		t.tapeSetNop(j, uint64(end-j))
+		t.tapeSetNop(j, uint64(end-j)) //nolint:gosec // j < end by the loop condition, so end-j is positive
 	}
 }
 
@@ -830,10 +830,11 @@ func (t *Tape) tapeSetContainerCount(headerIdx, n int) {
 // tapeAppendString appends a string to the string buffer and returns the offset.
 // Format: [4-byte LE length][UTF-8 bytes][null terminator].
 // The buffer is already well-sized from parse; append handles growth if needed.
+// len(v) must fit a uint32 — SetStringBytes, the only caller, rejects longer.
 func (t *Tape) tapeAppendString(v []byte) uint64 {
 	off := len(t.strings)
 	t.strings = append(t.strings, 0, 0, 0, 0)
-	binary.NativeEndian.PutUint32(t.strings[off:], uint32(len(v)))
+	binary.NativeEndian.PutUint32(t.strings[off:], uint32(len(v))) //nolint:gosec // SetStringBytes rejects a length that would not fit
 	t.strings = append(t.strings, v...)
 	t.strings = append(t.strings, 0)
 	return uint64(off)
@@ -869,7 +870,7 @@ func (i *Iter) SetInt(v int64) error {
 			return fmt.Errorf("truncated tape: numeric entry at %d has no value word", i.tapeIdx)
 		}
 		i.tape.tapeSetTag(i.tapeIdx, tagInt64)
-		i.tape.data[i.tapeIdx+1] = uint64(v)
+		i.tape.data[i.tapeIdx+1] = uint64(v) //nolint:gosec // the tape stores an int64 as its raw bits; tagInt64 marks how to read it back
 		return nil
 	}
 	return fmt.Errorf("cannot set tag '%c' to int", tag)
@@ -896,6 +897,11 @@ func (i *Iter) SetUInt(v uint64) error {
 // Works on string, float, int, and uint elements (all use 2 tape entries).
 // The new string is appended to the string buffer; the old value is orphaned.
 func (i *Iter) SetStringBytes(v []byte) error {
+	// The tape's string format prefixes the length as a uint32, so a longer string
+	// is unrepresentable: appending it would wrap the prefix and read back truncated.
+	if uint64(len(v)) > math.MaxUint32 {
+		return fmt.Errorf("string of %d bytes exceeds the tape's %d-byte limit", len(v), uint64(math.MaxUint32))
+	}
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	tag := ti.tag()
 	switch tag {
@@ -1080,7 +1086,7 @@ func (i *Iter) AdvanceInto() Tag {
 	if int(t) == -1 {
 		return TagEnd
 	}
-	return Tag(t)
+	return Tag(t) //nolint:gosec // a Type other than the -1 sentinel above holds a tag byte
 }
 
 // MarshalJSON serializes the current element and its children to JSON bytes.
@@ -1157,7 +1163,7 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 		if err != nil {
 			return dst, err
 		}
-		return strconv.AppendInt(dst, int64(w), 10), nil
+		return strconv.AppendInt(dst, int64(w), 10), nil //nolint:gosec // tagInt64 means the word holds an int64's raw bits
 
 	case tagUint64:
 		w, err := t.valueWord(idx)

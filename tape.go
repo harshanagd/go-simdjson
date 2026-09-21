@@ -195,7 +195,7 @@ func (ti *TapeIter) Int() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return int64(w), nil
+	return int64(w), nil //nolint:gosec // tagInt64 means the word holds an int64's raw bits
 }
 
 // Uint returns the uint64 value at the current position.
@@ -211,7 +211,7 @@ func (ti *TapeIter) Uint() (uint64, error) {
 	if tag == tagUint64 {
 		return w, nil
 	}
-	if v := int64(w); v >= 0 {
+	if v := int64(w); v >= 0 { //nolint:gosec // reinterprets the word to reject a negative int64 as a uint; the check IS the overflow handling
 		return uint64(v), nil
 	}
 	return 0, fmt.Errorf("element is not a uint64")
@@ -231,7 +231,7 @@ func (ti *TapeIter) Float() (float64, error) {
 	case tagDouble:
 		return math.Float64frombits(w), nil
 	case tagInt64:
-		return float64(int64(w)), nil
+		return float64(int64(w)), nil //nolint:gosec // tagInt64 means the word holds an int64's raw bits
 	default:
 		return float64(w), nil
 	}
@@ -802,7 +802,7 @@ func (t *Tape) readValue(idx int) (interface{}, int, error) {
 		if err != nil {
 			return nil, idx, err
 		}
-		return int64(w), idx + 2, nil
+		return int64(w), idx + 2, nil //nolint:gosec // tagInt64 means the word holds an int64's raw bits
 	case tagUint64:
 		w, err := t.valueWord(idx)
 		if err != nil {
@@ -885,7 +885,7 @@ func (t *Tape) readString(offset uint64) (string, error) {
 		// memory would outlive nothing the GC can see.
 		return string(b), nil
 	}
-	return unsafe.String(&b[0], len(b)), nil
+	return unsafe.String(&b[0], len(b)), nil //nolint:gosec // the zero-copy read this package exists for; the branch above bounds it to Go-owned memory
 }
 
 // readStringBytes reads a string from the string buffer at the given offset.
@@ -895,13 +895,17 @@ func (t *Tape) readString(offset uint64) (string, error) {
 // reallocates instead of writing past the string into the adjacent entry's
 // length prefix, which would corrupt every string after it in the buffer.
 func (t *Tape) readStringBytes(offset uint64) ([]byte, error) {
-	off := int(offset)
-	if off+4 > len(t.strings) {
-		return nil, fmt.Errorf("string offset %d out of bounds", off)
+	// Bounds are compared before narrowing to int. Validate does not range-check
+	// string payloads, so offset is untrusted here, and where int is 32 bits a large
+	// offset would narrow to a negative value and slip past the check.
+	// offset is payloadMask'd by every caller, so offset+4 cannot wrap.
+	if offset+4 > uint64(len(t.strings)) {
+		return nil, fmt.Errorf("string offset %d out of bounds", offset)
 	}
-	slen := int(binary.NativeEndian.Uint32(t.strings[off : off+4]))
-	start := off + 4
-	if start+slen > len(t.strings) {
+	off := int(offset) //nolint:gosec // bounded against len(t.strings) above
+	slen := uint64(binary.NativeEndian.Uint32(t.strings[off : off+4]))
+	start := offset + 4
+	if start+slen > uint64(len(t.strings)) {
 		return nil, fmt.Errorf("string length %d at offset %d out of bounds", slen, off)
 	}
 	b := t.strings[start : start+slen]
@@ -927,7 +931,7 @@ func (t *Tape) readValueNum(idx int) (interface{}, int, error) {
 		if err != nil {
 			return nil, idx, err
 		}
-		return json.Number(strconv.FormatInt(int64(w), 10)), idx + 2, nil
+		return json.Number(strconv.FormatInt(int64(w), 10)), idx + 2, nil //nolint:gosec // tagInt64 means the word holds an int64's raw bits
 	case tagUint64:
 		w, err := t.valueWord(idx)
 		if err != nil {

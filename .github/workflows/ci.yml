@@ -14,27 +14,67 @@ jobs:
         with:
           go-version: stable
       - uses: golangci/golangci-lint-action@v7
+        with:
+          # Pinned so a linter release cannot break CI on an unchanged tree. The
+          # toolchain above is the matrix ceiling, which the test job now also covers.
+          version: v2.12.2
 
   test:
     strategy:
       matrix:
         include:
+          # Both the go.mod floor and the current release, so lint cannot flag a
+          # construct no tested toolchain compiles.
           - os: ubuntu-latest
             arch: x86_64
+            go: '1.21'
+          - os: ubuntu-latest
+            arch: x86_64
+            go: stable
           - os: ubuntu-24.04-arm
             arch: arm64
+            go: '1.21'
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            go: stable
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: ${{ matrix.go }}
       - name: Build
         run: go build ./...
       - name: Test
         run: go test -v -race ./...
       - name: Benchmark
         run: go test -bench=. -benchmem -benchtime=1s ./...
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # go test alone only replays each target's seed corpus. This actually mutates,
+      # which is what reaches the malformed-tape and envelope paths.
+      - name: Fuzz
+        run: |
+          for target in FuzzParse FuzzCorrect FuzzDeserialize FuzzTapeContract; do
+            echo "::group::$target"
+            go test -run='^$' -fuzz="^${target}\$" -fuzztime=60s .
+            echo "::endgroup::"
+          done
+      # A crasher lives only in the runner's workspace, so without this the input
+      # that found the bug is lost when the job ends.
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: testdata/fuzz/
+          if-no-files-found: ignore
 
   test-cross-arch:
     strategy:
