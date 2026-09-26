@@ -9,6 +9,17 @@ import (
 	"testing"
 )
 
+// TagToType deliberately differs from Tag.Type(): only the basic types and the
+// container START tags have an entry, so end tags and unused bytes are TypeNone.
+func TestTagToType(t *testing.T) {
+	if TagToType[TagInteger] != TypeInt64 || TagToType[TagBoolFalse] != TypeBool || TagToType[TagRoot] != TypeRoot {
+		t.Error("TagToType maps a basic tag to the wrong type")
+	}
+	if TagToType[TagObjectEnd] != TypeNone || TagToType[0xff] != TypeNone {
+		t.Error("TagToType should be TypeNone for tags it does not map")
+	}
+}
+
 func TestTapeInterface(t *testing.T) {
 	input := `{"name":"test","count":42,"arr":[1,true,null],"nested":{"x":3.14}}`
 	pj, err := Parse([]byte(input), nil)
@@ -149,8 +160,8 @@ func TestTapeObjectForEach(t *testing.T) {
 	obj, _ := iter.Object()
 
 	var keys []string
-	err := obj.ForEach(func(key string, val TapeIter) error {
-		keys = append(keys, key)
+	err := obj.ForEach(func(key []byte, val TapeIter) error {
+		keys = append(keys, string(key))
 		return nil
 	})
 	if err != nil {
@@ -239,6 +250,32 @@ func TestTapeArrayAsFloat(t *testing.T) {
 	vals, _ := arr.AsFloat()
 	if len(vals) != 3 || vals[0] != 1.1 || vals[1] != 2.2 || vals[2] != 3.3 {
 		t.Fatalf("expected [1.1,2.2,3.3], got %v", vals)
+	}
+}
+
+func TestTapeArrayAsUint64(t *testing.T) {
+	pj, _ := Parse([]byte(`[1,2,18446744073709551615]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+
+	vals, _ := arr.AsUint64()
+	if len(vals) != 3 || vals[0] != 1 || vals[1] != 2 || vals[2] != 18446744073709551615 {
+		t.Fatalf("got %v", vals)
+	}
+}
+
+func TestTapeArrayAsStringCvt(t *testing.T) {
+	pj, _ := Parse([]byte(`[1,"two",true,null]`), nil)
+	defer pj.Close()
+	tape, _ := pj.GetTape()
+	iter := tape.Iter()
+	arr, _ := iter.Array()
+
+	vals, _ := arr.AsStringCvt()
+	if len(vals) != 4 || vals[0] != "1" || vals[1] != "two" || vals[2] != "true" || vals[3] != "null" {
+		t.Fatalf("expected [1,two,true,null], got %v", vals)
 	}
 }
 
@@ -464,8 +501,8 @@ func TestTapeArrayForEachNestedAfterDelete(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return obj.ForEach(func(key string, _ TapeIter) error {
-			keys = append(keys, key)
+		return obj.ForEach(func(key []byte, _ TapeIter) error {
+			keys = append(keys, string(key))
 			return nil
 		})
 	})
@@ -506,8 +543,8 @@ func TestTapeArrayIterAllDeletedIsPastEnd(t *testing.T) {
 	defer pj.Close()
 
 	it := arr.Iter()
-	if got := it.Type(); got != Type(-1) {
-		t.Fatalf("Iter().Type() on fully deleted array = %v, want Type(-1)", got)
+	if got := it.Type(); got != TypeNone {
+		t.Fatalf("Iter().Type() on fully deleted array = %v, want TypeNone", got)
 	}
 }
 
@@ -524,8 +561,8 @@ func TestTapeArrayFirstTypeSkipsNops(t *testing.T) {
 
 	pj2, arr2 := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool { return true })
 	defer pj2.Close()
-	if got := arr2.FirstType(); got != Type(-1) {
-		t.Fatalf("FirstType() on fully deleted array = %v, want Type(-1)", got)
+	if got := arr2.FirstType(); got != TypeNone {
+		t.Fatalf("FirstType() on fully deleted array = %v, want TypeNone", got)
 	}
 }
 
@@ -598,8 +635,8 @@ func TestTapeObjectIterAllDeletedIsPastEnd(t *testing.T) {
 	defer pj.Close()
 
 	it := obj.Iter()
-	if got := it.Type(); got != Type(-1) {
-		t.Fatalf("Iter().Type() on fully deleted object = %v, want Type(-1)", got)
+	if got := it.Type(); got != TypeNone {
+		t.Fatalf("Iter().Type() on fully deleted object = %v, want TypeNone", got)
 	}
 }
 
@@ -695,8 +732,8 @@ func TestTapeIterAdvanceIntoEmptyContainer(t *testing.T) {
 			defer pj.Close()
 			tape, _ := pj.GetTape()
 			ti := tape.Iter()
-			if got := ti.AdvanceInto(); got != Type(-1) {
-				t.Fatalf("AdvanceInto() on %s = %v, want Type(-1)", input, got)
+			if got := ti.AdvanceInto(); got != TypeNone {
+				t.Fatalf("AdvanceInto() on %s = %v, want TypeNone", input, got)
 			}
 		})
 	}
@@ -716,8 +753,8 @@ func TestTapeIterAdvanceIntoFullyDeletedContainer(t *testing.T) {
 
 	tape, _ := pj.GetTape()
 	ti := tape.Iter()
-	if got := ti.AdvanceInto(); got != Type(-1) {
-		t.Fatalf("AdvanceInto() on a fully deleted object = %v, want Type(-1)", got)
+	if got := ti.AdvanceInto(); got != TypeNone {
+		t.Fatalf("AdvanceInto() on a fully deleted object = %v, want TypeNone", got)
 	}
 }
 
@@ -1012,7 +1049,7 @@ func TestTapeObjectForEachPropagatesKeyError(t *testing.T) {
 	obj := &TapeObject{tape: tape, startIdx: 1, endIdx: 3}
 
 	called := false
-	err := obj.ForEach(func(key string, val TapeIter) error {
+	err := obj.ForEach(func(key []byte, val TapeIter) error {
 		called = true
 		return nil
 	})
@@ -1113,7 +1150,7 @@ func TestReadObjectSkipsNops(t *testing.T) {
 //
 // Note this does NOT discriminate the switch to Tag.Type() in FirstType and
 // PeekNext: the inline `if tag == tagFalse` form they replaced maps `false`
-// identically. Tag.Type() differs only on a zero tag (TagEnd -> Type(-1)), which
+// identically. Tag.Type() differs only on a zero tag (TagEnd -> TypeNone), which
 // a well-formed parse never produces — see the RootType issue for that case.
 func TestTapeBoolAfterNop(t *testing.T) {
 	pj, arr := deleteFromArray(t, `[1,false,true]`, func(i Iter) bool {
@@ -1156,8 +1193,8 @@ func TestTapeIterExhaustedAccessorsDoNotPanic(t *testing.T) {
 	defer pj.Close()
 
 	it := arr.Iter()
-	if got := it.Type(); got != Type(-1) {
-		t.Fatalf("Type() = %v, want Type(-1)", got)
+	if got := it.Type(); got != TypeNone {
+		t.Fatalf("Type() = %v, want TypeNone", got)
 	}
 	if _, err := it.Int(); err == nil {
 		t.Error("Int() on an exhausted iterator returned no error")
@@ -1180,16 +1217,16 @@ func TestTapeIterExhaustedAccessorsDoNotPanic(t *testing.T) {
 	if _, err := it.Array(); err == nil {
 		t.Error("Array() on an exhausted iterator returned no error")
 	}
-	if got := it.AdvanceInto(); got != Type(-1) {
-		t.Errorf("AdvanceInto() on an exhausted iterator = %v, want Type(-1)", got)
+	if got := it.AdvanceInto(); got != TypeNone {
+		t.Errorf("AdvanceInto() on an exhausted iterator = %v, want TypeNone", got)
 	}
 	// Advance and PeekNext call skipValue, which reads the tag at the cursor, so
 	// they need the bound checked on the INPUT rather than only on the result.
-	if got := it.Advance(); got != Type(-1) {
-		t.Errorf("Advance() on an exhausted iterator = %v, want Type(-1)", got)
+	if got := it.Advance(); got != TypeNone {
+		t.Errorf("Advance() on an exhausted iterator = %v, want TypeNone", got)
 	}
-	if got := it.PeekNext(); got != Type(-1) {
-		t.Errorf("PeekNext() on an exhausted iterator = %v, want Type(-1)", got)
+	if got := it.PeekNext(); got != TypeNone {
+		t.Errorf("PeekNext() on an exhausted iterator = %v, want TypeNone", got)
 	}
 }
 
@@ -1204,18 +1241,18 @@ func TestIterExhaustedPeekNextTagDoesNotPanic(t *testing.T) {
 	if got := ei.PeekNextTag(); got != TagEnd {
 		t.Errorf("PeekNextTag() on an exhausted iterator = %q, want TagEnd", rune(got))
 	}
-	if got := ei.Advance(); got != Type(-1) {
-		t.Errorf("Iter.Advance() on an exhausted iterator = %v, want Type(-1)", got)
+	if got := ei.Advance(); got != TypeNone {
+		t.Errorf("Iter.Advance() on an exhausted iterator = %v, want TypeNone", got)
 	}
-	if got := ei.PeekNext(); got != Type(-1) {
-		t.Errorf("Iter.PeekNext() on an exhausted iterator = %v, want Type(-1)", got)
+	if got := ei.PeekNext(); got != TypeNone {
+		t.Errorf("Iter.PeekNext() on an exhausted iterator = %v, want TypeNone", got)
 	}
 	if got := ei.AdvanceInto(); got != TagEnd {
 		t.Errorf("Iter.AdvanceInto() on an exhausted iterator = %q, want TagEnd", rune(got))
 	}
 	var dst Iter
-	if got, err := ei.AdvanceIter(&dst); got != Type(-1) || err != nil {
-		t.Errorf("AdvanceIter() on an exhausted iterator = %v, %v; want Type(-1), nil", got, err)
+	if got, err := ei.AdvanceIter(&dst); got != TypeNone || err != nil {
+		t.Errorf("AdvanceIter() on an exhausted iterator = %v, %v; want TypeNone, nil", got, err)
 	}
 }
 
@@ -1271,15 +1308,15 @@ func TestZeroTagReportsEndSentinel(t *testing.T) {
 		0, // zero tag where the root value should be
 	}}
 
-	if got := tape.RootType(); got != Type(-1) {
-		t.Errorf("Tape.RootType() on a zero tag = %v, want Type(-1)", got)
+	if got := tape.RootType(); got != TypeNone {
+		t.Errorf("Tape.RootType() on a zero tag = %v, want TypeNone", got)
 	}
 	ti := TapeIter{tape: tape, idx: 1}
-	if got := ti.Type(); got != Type(-1) {
-		t.Errorf("TapeIter.Type() on a zero tag = %v, want Type(-1)", got)
+	if got := ti.Type(); got != TypeNone {
+		t.Errorf("TapeIter.Type() on a zero tag = %v, want TypeNone", got)
 	}
-	if got := Tag(tape.tapeTagAt(1)).Type(); got != Type(-1) {
-		t.Errorf("Tag.Type() on a zero tag = %v, want Type(-1)", got)
+	if got := Tag(tape.tapeTagAt(1)).Type(); got != TypeNone {
+		t.Errorf("Tag.Type() on a zero tag = %v, want TypeNone", got)
 	}
 }
 
@@ -1471,20 +1508,20 @@ func TestRootDocGuardIsConsistentAcrossEntryPoints(t *testing.T) {
 			name:     "length_ok_but_no_root_marker",
 			data:     []uint64{uint64(tagInt64) << 56, 42},
 			wantDoc:  false,
-			wantType: Type(-1),
+			wantType: TypeNone,
 		},
 		{
 			// Passes hasRootAt(0), fails a length check: a marker with no value.
 			name:     "root_marker_with_no_value",
 			data:     []uint64{uint64(tagRoot) << 56},
 			wantDoc:  false,
-			wantType: Type(-1),
+			wantType: TypeNone,
 		},
 		{
 			name:     "empty",
 			data:     []uint64{},
 			wantDoc:  false,
-			wantType: Type(-1),
+			wantType: TypeNone,
 		},
 	}
 
@@ -2174,10 +2211,10 @@ func contractWalkTape(t *testing.T, tp *Tape) {
 	_ = tp.RootType()
 	_ = tp.Clone()
 	ti := tp.Iter()
-	for ti.Type() != Type(-1) {
+	for ti.Type() != TypeNone {
 		w.step()
 		contractWalkValue(ti, w, 0)
-		if ti.Advance() == Type(-1) {
+		if ti.Advance() == TypeNone {
 			return
 		}
 	}
@@ -2200,7 +2237,7 @@ func contractWalkValue(ti TapeIter, w *contractWalker, depth int) {
 		_, _ = o.FindPath("a", "b")
 		_ = o.Count()
 		_, _ = o.Map(nil)
-		_ = o.ForEach(func(key string, val TapeIter) error {
+		_ = o.ForEach(func(key []byte, val TapeIter) error {
 			_ = key
 			contractWalkValue(val, w, depth+1)
 			return nil
@@ -2248,10 +2285,10 @@ func contractWalkParsed(t *testing.T, pj *ParsedJson) {
 		_, _ = r.Interface()
 		_, _ = r.FindElement(nil, "a", "b")
 	}
-	for it.Type() != Type(-1) {
+	for it.Type() != TypeNone {
 		w.step()
 		contractWalkIterValue(&it, w, 0)
-		if it.Advance() == Type(-1) {
+		if it.Advance() == TypeNone {
 			break
 		}
 	}
@@ -2274,11 +2311,10 @@ func contractWalkIterValue(it *Iter, w *contractWalker, depth int) {
 		_, _ = o.Count()
 		_, _ = o.Parse(nil)
 		_, _ = o.Map(nil)
-		_ = o.ForEach(func(key string, v Iter) error {
+		_ = o.ForEach(func(key []byte, v Iter) {
 			_ = key
 			contractWalkIterValue(&v, w, depth+1)
-			return nil
-		})
+		}, nil)
 		// A fresh Object: ForEach consumed the one above. The element count bounds the
 		// loop independently of the terminator.
 		if o2, err := it.Object(nil); err == nil {
@@ -2287,7 +2323,7 @@ func contractWalkIterValue(it *Iter, w *contractWalker, depth int) {
 			for k := 0; k <= n+1; k++ {
 				w.step()
 				_, typ, err := o2.NextElementBytes(&dst)
-				if err != nil || typ == Type(-1) {
+				if err != nil || typ == TypeNone {
 					break
 				}
 			}
@@ -2300,9 +2336,8 @@ func contractWalkIterValue(it *Iter, w *contractWalker, depth int) {
 		_, _ = a.Count()
 		_, _ = a.MarshalJSON()
 		_, _ = a.Interface()
-		_ = a.ForEach(func(v Iter) error {
+		a.ForEach(func(v Iter) {
 			contractWalkIterValue(&v, w, depth+1)
-			return nil
 		})
 	default:
 		_, _ = it.String()

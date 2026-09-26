@@ -194,9 +194,7 @@ func BenchmarkForEachObject(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		iter, _ := pj.Iter()
 		obj, _ := iter.Object(nil)
-		_ = obj.ForEach(func(key string, val Iter) error {
-			return nil
-		})
+		_ = obj.ForEach(func(key []byte, val Iter) {}, nil)
 	}
 }
 
@@ -221,9 +219,7 @@ func BenchmarkForEachArray(b *testing.B) {
 		elem := obj.FindKey("performances", nil)
 		ai := elem.Iter
 		arr, _ := ai.Array(nil)
-		_ = arr.ForEach(func(val Iter) error {
-			return nil
-		})
+		arr.ForEach(func(val Iter) {})
 	}
 }
 
@@ -283,7 +279,7 @@ func BenchmarkNextElement(b *testing.B) {
 		var dst Iter
 		for {
 			_, t, _ := obj.NextElement(&dst)
-			if t == Type(-1) {
+			if t == TypeNone {
 				break
 			}
 		}
@@ -305,7 +301,7 @@ func BenchmarkNextElementBytes(b *testing.B) {
 		var dst Iter
 		for {
 			_, t, _ := obj.NextElementBytes(&dst)
-			if t == Type(-1) {
+			if t == TypeNone {
 				break
 			}
 		}
@@ -326,7 +322,7 @@ func BenchmarkTapeAdvance(b *testing.B) {
 		ti := tape.Iter()
 		obj, _ := ti.Object()
 		oi := obj.Iter()
-		for oi.Advance() != Type(-1) {
+		for oi.Advance() != TypeNone {
 		}
 	}
 }

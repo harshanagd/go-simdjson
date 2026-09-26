@@ -3,6 +3,7 @@ package simdjson
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"runtime"
 	"testing"
@@ -132,10 +133,9 @@ func TestObjectIteration(t *testing.T) {
 	obj, _ := iter.Object(nil)
 
 	keys := make([]string, 0)
-	err = obj.ForEach(func(key string, i Iter) error {
-		keys = append(keys, key)
-		return nil
-	})
+	err = obj.ForEach(func(key []byte, i Iter) {
+		keys = append(keys, string(key))
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,16 +167,17 @@ func TestArrayIteration(t *testing.T) {
 	}
 
 	var vals []int64
-	err = arr.ForEach(func(i Iter) error {
+	var readErr error
+	arr.ForEach(func(i Iter) {
 		v, err := i.Int()
 		if err != nil {
-			return err
+			readErr = err
+			return
 		}
 		vals = append(vals, v)
-		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
+	if readErr != nil {
+		t.Fatal(readErr)
 	}
 	if len(vals) != 3 || vals[0] != 10 || vals[1] != 20 || vals[2] != 30 {
 		t.Fatalf("expected [10,20,30], got %v", vals)
@@ -356,6 +357,83 @@ func TestStringCvt(t *testing.T) {
 	}
 }
 
+func TestObjectForEachOnlyKeys(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1,"b":2,"c":3}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	var seen []string
+	if err := obj.ForEach(func(key []byte, i Iter) {
+		seen = append(seen, string(key))
+	}, map[string]struct{}{"a": {}, "c": {}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 || seen[0] != "a" || seen[1] != "c" {
+		t.Fatalf("onlyKeys filter: got %v, want [a c]", seen)
+	}
+}
+
+// Object.ForEach keeps an error return where Array.ForEach has none: reading a key
+// can fail on a tape Validate accepts, because Validate does not range-check string
+// payload offsets.
+func TestObjectForEachReportsKeyReadFailure(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":1,"b":2}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	// Clone first: a deserialized tape is Go-owned and writable, a parsed one is not.
+	clone := pj.Clone(nil)
+	tape, err := clone.GetTape()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, e := range tape.data {
+		if byte(e>>56) == tagString {
+			tape.data[i] = tapeEntry(tagString, 1<<40)
+			break
+		}
+	}
+	if err := tape.Validate(); err != nil {
+		t.Fatalf("Validate should not inspect string offsets: %v", err)
+	}
+
+	iter, _ := clone.Iter()
+	obj, err := iter.Object(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := obj.ForEach(func(key []byte, i Iter) {}, nil); err == nil {
+		t.Error("ForEach returned nil for an out-of-bounds key offset")
+	}
+}
+
+// FindPath and FindElement wrap ErrPathNotFound so callers can match on it.
+func TestFindPathWrapsErrPathNotFound(t *testing.T) {
+	pj, err := Parse([]byte(`{"a":{"b":1}}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	if _, err := iter.FindElement(nil, "a", "missing"); !errors.Is(err, ErrPathNotFound) {
+		t.Fatalf("FindElement on a missing key = %v, want ErrPathNotFound", err)
+	}
+}
+
+func TestFloatFlagFlags(t *testing.T) {
+	if got := FloatOverflowedInteger.Flags(); !got.Contains(FloatOverflowedInteger) {
+		t.Fatalf("Flags() = %d, does not contain the flag it was built from", got)
+	}
+}
+
 // Containers have no string form. Iter.StringCvt reached this through its own
 // case before it delegated; it now reaches TapeIter's default arm.
 func TestStringCvtOnContainer(t *testing.T) {
@@ -512,7 +590,7 @@ func TestNextElement(t *testing.T) {
 
 	// Done
 	name, typ, err = obj.NextElement(&dst)
-	if err != nil || typ != Type(-1) {
+	if err != nil || typ != TypeNone {
 		t.Fatalf("expected done, got name=%q type=%v err=%v", name, typ, err)
 	}
 }
@@ -532,6 +610,26 @@ func TestArrayInterface(t *testing.T) {
 	}
 	if len(v) != 3 || v[0] != int64(1) || v[1] != "two" || v[2] != true {
 		t.Fatalf("expected [1,two,true], got %v", v)
+	}
+}
+
+// Array.Interface used to build its own slice and returned nil for an empty array,
+// where the tape layer and Iter.Interface both return an empty non-nil slice.
+func TestEmptyArrayInterfaceIsNotNil(t *testing.T) {
+	pj, err := Parse([]byte(`[]`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	v, err := arr.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v == nil || len(v) != 0 {
+		t.Fatalf("got %#v, want an empty non-nil slice", v)
 	}
 }
 
@@ -752,12 +850,12 @@ func TestIterStringBytesPastEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Walk off the end of the tape. Type() reports Type(-1) once exhausted, so
+	// Walk off the end of the tape. Type() reports TypeNone once exhausted, so
 	// check before each Advance (Advance itself is unguarded).
-	for i := 0; i < 16 && iter.Type() != Type(-1); i++ {
+	for i := 0; i < 16 && iter.Type() != TypeNone; i++ {
 		iter.Advance()
 	}
-	if iter.Type() != Type(-1) {
+	if iter.Type() != TypeNone {
 		t.Fatal("could not position the iterator past the end of the tape")
 	}
 
@@ -964,7 +1062,7 @@ func TestNextElementBytesFalseValueIsBool(t *testing.T) {
 }
 
 // TestNextElementBytesUsesTagType covers the Tag.Type() mapping for a zero tag,
-// which Tag.Type() reports as Type(-1). The previous inline special-case handled
+// which Tag.Type() reports as TypeNone. The previous inline special-case handled
 // only tagFalse and returned Type(0) here.
 func TestNextElementBytesUsesTagType(t *testing.T) {
 	// String buffer: [4-byte native-endian length]["k"][NUL]
@@ -992,8 +1090,8 @@ func TestNextElementBytesUsesTagType(t *testing.T) {
 	if string(name) != "k" {
 		t.Fatalf("got key %q, want %q", string(name), "k")
 	}
-	if typ != Type(-1) {
-		t.Fatalf("got type %v, want Type(-1) via Tag.Type() for a zero tag", typ)
+	if typ != TypeNone {
+		t.Fatalf("got type %v, want TypeNone via Tag.Type() for a zero tag", typ)
 	}
 }
 
@@ -1092,7 +1190,7 @@ func TestIterRootIsCursorRelative(t *testing.T) {
 		if !reflect.DeepEqual(v, want) {
 			t.Errorf("document %d: Root() = %#v, want %#v", doc, v, want)
 		}
-		if doc < 3 && it.Advance() == Type(-1) {
+		if doc < 3 && it.Advance() == TypeNone {
 			t.Fatalf("walk ended early after document %d", doc)
 		}
 	}
@@ -1108,7 +1206,7 @@ func TestIterRootFromNestedCursor(t *testing.T) {
 	defer pj.Close()
 
 	it, _ := pj.Iter()
-	if it.Advance() == Type(-1) {
+	if it.Advance() == TypeNone {
 		t.Fatal("could not reach the second document")
 	}
 	obj, err := it.Object(nil)
@@ -1150,7 +1248,7 @@ func TestIterRootOutsideAnyDocument(t *testing.T) {
 	defer pj.Close()
 
 	it, _ := pj.Iter()
-	for step := 0; step < 8 && it.Advance() != Type(-1); step++ {
+	for step := 0; step < 8 && it.Advance() != TypeNone; step++ {
 	}
 
 	ty, root, err := it.Root(nil)
@@ -1160,11 +1258,11 @@ func TestIterRootOutsideAnyDocument(t *testing.T) {
 	if root == nil {
 		t.Fatal("Root() returned a nil dst alongside the error")
 	}
-	if ty != Type(-1) {
-		t.Errorf("Root() type = %v, want Type(-1)", ty)
+	if ty != TypeNone {
+		t.Errorf("Root() type = %v, want TypeNone", ty)
 	}
-	if got := root.Type(); got != Type(-1) {
-		t.Errorf("dst.Type() = %v, want Type(-1)", got)
+	if got := root.Type(); got != TypeNone {
+		t.Errorf("dst.Type() = %v, want TypeNone", got)
 	}
 }
 
@@ -1289,7 +1387,7 @@ func TestIterRootIsIdempotent(t *testing.T) {
 				t.Errorf("%q doc %d: Root is not idempotent: %d then %d",
 					input, doc, first.tapeIdx, second.tapeIdx)
 			}
-			if it.Advance() == Type(-1) {
+			if it.Advance() == TypeNone {
 				break
 			}
 		}
@@ -1308,7 +1406,7 @@ func TestIterRootIntoAliasedDst(t *testing.T) {
 	defer pj.Close()
 
 	it, _ := pj.Iter()
-	if it.Advance() == Type(-1) {
+	if it.Advance() == TypeNone {
 		t.Fatal("could not reach the second document")
 	}
 	obj, err := it.Object(nil)
@@ -1629,7 +1727,7 @@ func TestArrayFirstTypeMatchesTapeArray(t *testing.T) {
 		{`{"a":["x",1]}`, TypeString},
 		{`{"a":[1,"x"]}`, TypeInt64},
 		{`{"a":[[1]]}`, TypeArray},
-		{`{"a":[]}`, Type(-1)},
+		{`{"a":[]}`, TypeNone},
 	} {
 		t.Run(tt.json, func(t *testing.T) {
 			pj, err := Parse([]byte(tt.json), nil)
@@ -1652,7 +1750,7 @@ func TestArrayFirstTypeMatchesTapeArray(t *testing.T) {
 
 // An entry whose key is "" and whose value is null used to be indistinguishable
 // from the end of iteration, so a cursor loop stopped on it and reported success.
-// The terminator is Type(-1), which no real entry can carry.
+// The terminator is TypeNone, which no real entry can carry.
 func TestObjectCursorOutlastsEmptyKeyNull(t *testing.T) {
 	const input = `{"":null,"b":1}`
 
@@ -1670,7 +1768,7 @@ func TestObjectCursorOutlastsEmptyKeyNull(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if typ == Type(-1) {
+			if typ == TypeNone {
 				break
 			}
 			keys = append(keys, string(name))
@@ -1694,7 +1792,7 @@ func TestObjectCursorOutlastsEmptyKeyNull(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if typ == Type(-1) {
+			if typ == TypeNone {
 				break
 			}
 			keys = append(keys, name)
@@ -1762,7 +1860,7 @@ func TestZeroCopyTapeCopiesStringsDespiteFlag(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if typ == Type(-1) {
+		if typ == TypeNone {
 			break
 		}
 		keys = append(keys, name)

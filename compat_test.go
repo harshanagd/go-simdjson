@@ -678,6 +678,13 @@ func TestIterFloatFlagsFromInt(t *testing.T) {
 	}
 }
 
+// The names simdjson-go uses must keep compiling and keep equalling ours.
+func TestSimdjsonGoTypeAliases(t *testing.T) {
+	if TypeInt != TypeInt64 || TypeUint != TypeUint64 || TypeFloat != TypeDouble {
+		t.Fatal("a compat alias diverged from the type it names")
+	}
+}
+
 func TestTagType(t *testing.T) {
 	if TagString.Type() != TypeString {
 		t.Fatal("TagString.Type() mismatch")
@@ -685,7 +692,7 @@ func TestTagType(t *testing.T) {
 	if TagBoolFalse.Type() != TypeBool {
 		t.Fatal("TagBoolFalse.Type() mismatch")
 	}
-	if TagEnd.Type() != Type(-1) {
+	if TagEnd.Type() != TypeNone {
 		t.Fatal("TagEnd.Type() mismatch")
 	}
 }
@@ -712,8 +719,8 @@ func TestNextElementBytes(t *testing.T) {
 		t.Fatalf("expected b/string, got %s/%v", name, typ)
 	}
 	name, typ, _ = obj.NextElementBytes(&dst)
-	if typ != Type(-1) {
-		t.Fatalf("expected Type(-1) at end, got %s/%v", name, typ)
+	if typ != TypeNone {
+		t.Fatalf("expected TypeNone at end, got %s/%v", name, typ)
 	}
 }
 

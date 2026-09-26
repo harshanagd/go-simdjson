@@ -380,6 +380,24 @@ func TestArrayDeleteElems(t *testing.T) {
 	}
 }
 
+// DeleteElems hands the callback an Iter built from the array's options; Object's
+// equivalent passes useNumber, so this one must too.
+func TestArrayDeleteElemsCallbackHonoursUseNumber(t *testing.T) {
+	pj, _ := Parse([]byte(`[42]`), nil, UseNumber())
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	arr, _ := iter.Array(nil)
+	var got interface{}
+	arr.DeleteElems(func(i Iter) bool {
+		got, _ = i.Interface()
+		return false
+	})
+	if _, ok := got.(json.Number); !ok {
+		t.Fatalf("callback saw %T, want json.Number", got)
+	}
+}
+
 func TestSetStringThenInterface(t *testing.T) {
 	input := `{"a":42,"b":"old"}`
 	pj, _ := Parse([]byte(input), nil)
@@ -567,10 +585,9 @@ func TestForEachAfterDelete(t *testing.T) {
 	}, nil)
 
 	keys := []string{}
-	_ = obj.ForEach(func(key string, i Iter) error {
-		keys = append(keys, key)
-		return nil
-	})
+	_ = obj.ForEach(func(key []byte, i Iter) {
+		keys = append(keys, string(key))
+	}, nil)
 	if len(keys) != 2 {
 		t.Errorf("ForEach after delete: got %v, want [a c]", keys)
 	}

@@ -235,6 +235,9 @@ func (pj *ParsedJson) ForEach(fn func(i Iter) error) error {
 type Type int
 
 const (
+	// TypeNone is the end-of-iteration sentinel. No element carries it, and it is
+	// Tag(0)'s type, so Tag.Type() reports it for TagEnd without a special case.
+	TypeNone   Type = 0
 	TypeArray  Type = '['
 	TypeObject Type = '{'
 	TypeInt64  Type = 'l'
@@ -244,6 +247,17 @@ const (
 	TypeBool   Type = 't'
 	TypeNull   Type = 'n'
 	TypeBigInt Type = 'Z'
+	// TypeRoot is the type of an NDJSON root marker, which Tag.Type() already
+	// returned unnamed.
+	TypeRoot Type = 'r'
+)
+
+// The names simdjson-go gives three of the types above. The values are identical,
+// so a switch written against either name compiles and matches here.
+const (
+	TypeInt   = TypeInt64
+	TypeUint  = TypeUint64
+	TypeFloat = TypeDouble
 )
 
 // String returns the type name.
@@ -267,6 +281,10 @@ func (t Type) String() string {
 		return "null"
 	case TypeBigInt:
 		return "bigint"
+	case TypeNone:
+		return "none"
+	case TypeRoot:
+		return "root"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(t))
 	}
@@ -276,7 +294,7 @@ func (t Type) String() string {
 func (pj *ParsedJson) RootType() Type {
 	iter, err := pj.Iter()
 	if err != nil {
-		return Type(-1)
+		return TypeNone
 	}
 	return iter.Type()
 }

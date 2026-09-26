@@ -428,7 +428,7 @@ func collectViaAdvance(t *testing.T, pj *ParsedJson, maxSteps int) []interface{}
 			t.Fatalf("manual step %d landed on a non-value: %v", step, err)
 		}
 		got = append(got, v)
-		if it.Advance() == Type(-1) {
+		if it.Advance() == TypeNone {
 			break
 		}
 	}
@@ -576,7 +576,7 @@ func TestParseNDManualAdvanceWalk(t *testing.T) {
 					t.Fatalf("step %d: %v", step, err)
 				}
 				got = append(got, v)
-				if it.Advance() == Type(-1) {
+				if it.Advance() == TypeNone {
 					break
 				}
 			}

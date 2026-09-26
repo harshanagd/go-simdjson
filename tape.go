@@ -7,11 +7,16 @@ package simdjson
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
 	"unsafe"
 )
+
+// ErrPathNotFound reports a path component that does not exist. The errors
+// returned by FindPath and FindElement wrap it and name the key that failed.
+var ErrPathNotFound = errors.New("path not found")
 
 // Tag is the raw tape tag byte. Compatible with simdjson-go's Tag type.
 type Tag uint8
@@ -32,7 +37,13 @@ const (
 	TagEnd         = Tag(0)
 	TagBigInt      = Tag('Z')
 
-	payloadMask = 0x00ffffffffffffff
+	// The tape entry layout, under the names simdjson-go gives it. They describe
+	// this tape too: the tag is the high 8 bits, the payload the low 56.
+	JSONTAGOFFSET = 56
+	JSONTAGMASK   = 0xff << JSONTAGOFFSET
+	JSONVALUEMASK = 0xff_ffff_ffff_ffff
+
+	payloadMask = JSONVALUEMASK
 
 	// Container entry layout: [tag:8 | count:24 | endIdx:32]
 	// endIdx = one past the closing '}' or ']' tape entry (exclusive end).
@@ -62,16 +73,31 @@ const (
 	tagBigint = byte(TagBigInt)
 )
 
+// TagToType maps a tag to its type. Only the basic types and the container START
+// tags have one; every other index is TypeNone. Tag.Type() is the equivalent
+// method and folds TagBoolFalse the same way.
+var TagToType = [256]Type{
+	TagString:      TypeString,
+	TagInteger:     TypeInt64,
+	TagUint:        TypeUint64,
+	TagFloat:       TypeDouble,
+	TagNull:        TypeNull,
+	TagBoolTrue:    TypeBool,
+	TagBoolFalse:   TypeBool,
+	TagObjectStart: TypeObject,
+	TagArrayStart:  TypeArray,
+	TagRoot:        TypeRoot,
+	TagBigInt:      TypeBigInt,
+}
+
 // Type converts a Tag to its corresponding Type.
 func (tag Tag) Type() Type {
-	switch tag {
-	case TagBoolFalse:
+	// Only false needs folding: every other tag byte is its own type, and TagEnd
+	// is Tag(0), which is TypeNone.
+	if tag == TagBoolFalse {
 		return TypeBool
-	case TagEnd:
-		return Type(-1)
-	default:
-		return Type(tag)
 	}
+	return Type(tag)
 }
 
 // Tape holds the raw tape and string buffer from a parsed JSON document.
@@ -141,10 +167,10 @@ func (pj *ParsedJson) TapeInterfaceUseNumber() (interface{}, error) {
 }
 
 // RootType returns the type of the root element.
-// Returns Type(-1) when the tape holds no root document, or for a zero tag.
+// Returns TypeNone when the tape holds no root document, or for a zero tag.
 func (t *Tape) RootType() Type {
 	if !t.hasRootDoc() {
-		return Type(-1)
+		return TypeNone
 	}
 	return Tag(t.tapeTagAt(1)).Type()
 }
@@ -161,10 +187,10 @@ type TapeIter struct {
 }
 
 // Type returns the JSON type at the current position.
-// Returns Type(-1) when the cursor is past the end of the tape.
+// Returns TypeNone when the cursor is past the end of the tape.
 func (ti *TapeIter) Type() Type {
 	// Tag.Type() is the single source of truth for the tag-to-Type mapping: it
-	// folds 'f' (false) into TypeBool and maps a zero tag to Type(-1). tag()
+	// folds 'f' (false) into TypeBool and maps a zero tag to TypeNone. tag()
 	// already yields a zero tag when the cursor is past end.
 	return Tag(ti.tag()).Type()
 }
@@ -604,11 +630,12 @@ func (o *TapeObject) FindKey(key string) (iter TapeIter, ok bool) {
 }
 
 // ForEach iterates over all key-value pairs.
-// NOP padding left behind by DeleteElems is skipped.
-func (o *TapeObject) ForEach(fn func(key string, val TapeIter) error) error {
+// NOP padding left behind by DeleteElems is skipped. The key is valid only for the
+// duration of the call; copy it to retain it.
+func (o *TapeObject) ForEach(fn func(key []byte, val TapeIter) error) error {
 	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	for pos < o.endIdx {
-		key, err := o.tape.readString(o.tape.tapePayloadAt(pos))
+		key, err := o.tape.readStringBytes(o.tape.tapePayloadAt(pos))
 		if err != nil {
 			return err
 		}
@@ -634,12 +661,12 @@ func (o *TapeObject) Map(dst map[string]interface{}) (map[string]interface{}, er
 	// Delegate to ForEach rather than walking the range here: it skips the NOP
 	// padding DeleteElems leaves behind (an open-coded walk stops at the first
 	// deleted key), and val.Interface() honours UseNumber for free.
-	err := o.ForEach(func(key string, val TapeIter) error {
+	err := o.ForEach(func(key []byte, val TapeIter) error {
 		v, err := val.Interface()
 		if err != nil {
 			return err
 		}
-		dst[key] = v
+		dst[string(key)] = v
 		return nil
 	})
 	return dst, err
@@ -662,7 +689,7 @@ func (o *TapeObject) findPath(path []string) (iter TapeIter, err error) {
 	for _, key := range path[:len(path)-1] {
 		ti, ok := cur.FindKey(key)
 		if !ok {
-			return iter, fmt.Errorf("key %q not found", key)
+			return iter, fmt.Errorf("key %q: %w", key, ErrPathNotFound)
 		}
 		next, err := ti.Object()
 		if err != nil {
@@ -673,7 +700,7 @@ func (o *TapeObject) findPath(path []string) (iter TapeIter, err error) {
 	last := path[len(path)-1]
 	ti, ok := cur.FindKey(last)
 	if !ok {
-		return iter, fmt.Errorf("key %q not found", last)
+		return iter, fmt.Errorf("key %q: %w", last, ErrPathNotFound)
 	}
 	return ti, nil
 }
@@ -744,11 +771,39 @@ func (a *TapeArray) AsFloat() ([]float64, error) {
 	return result, err
 }
 
+// AsUint64 returns all elements as []uint64.
+func (a *TapeArray) AsUint64() ([]uint64, error) {
+	result := make([]uint64, 0, a.Count())
+	err := a.ForEach(func(val TapeIter) error {
+		v, err := val.Uint()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
 // AsString returns all elements as []string.
 func (a *TapeArray) AsString() ([]string, error) {
 	result := make([]string, 0, a.Count())
 	err := a.ForEach(func(val TapeIter) error {
 		v, err := val.String()
+		if err != nil {
+			return err
+		}
+		result = append(result, v)
+		return nil
+	})
+	return result, err
+}
+
+// AsStringCvt returns all elements converted to strings via StringCvt.
+func (a *TapeArray) AsStringCvt() ([]string, error) {
+	result := make([]string, 0, a.Count())
+	err := a.ForEach(func(val TapeIter) error {
+		v, err := val.StringCvt()
 		if err != nil {
 			return err
 		}
@@ -1014,12 +1069,12 @@ func (ti *TapeIter) Advance() Type {
 	// INPUT, not just the result. An exhausted cursor is reachable from Iter() on
 	// an empty or fully deleted container.
 	if ti.pastEnd() {
-		return Type(-1)
+		return TypeNone
 	}
 	next := ti.tape.skipNopsUntil(ti.tape.skipValue(ti.idx), len(ti.tape.data))
 	ti.idx = ti.tape.skipRootBoundary(next)
 	if ti.pastEnd() {
-		return Type(-1)
+		return TypeNone
 	}
 	return ti.Type()
 }
@@ -1035,22 +1090,22 @@ func (ti *TapeIter) PeekNext() Type {
 }
 
 // AdvanceInto steps into a container (object/array), positioning at the first child.
-// Returns Type(-1) if the element is not a container, the iterator is past end,
+// Returns TypeNone if the element is not a container, the iterator is past end,
 // or the container is empty (e.g. [] or {}) — including an container left empty
 // by DeleteElems, whose children are NOP padding.
 func (ti *TapeIter) AdvanceInto() Type {
 	tag := ti.tag()
 	if tag != tagObject && tag != tagArray {
-		return Type(-1)
+		return TypeNone
 	}
 	ti.idx = ti.tape.skipNopsUntil(ti.idx+1, len(ti.tape.data))
 	if ti.pastEnd() {
-		return Type(-1)
+		return TypeNone
 	}
 	// A closing bracket here means the container has no remaining children.
 	switch ti.tag() {
 	case tagObjEnd, tagArrEnd, tagRoot:
-		return Type(-1)
+		return TypeNone
 	}
 	return ti.Type()
 }
@@ -1109,7 +1164,7 @@ func (ti *TapeIter) StringCvt() (string, error) {
 // Iter returns a TapeIter at the first element of the array.
 // NOP padding left behind by DeleteElems is skipped. For an empty array — or one
 // left empty by deletion — the returned iterator is positioned past end, so
-// Type() returns Type(-1).
+// Type() returns TypeNone.
 func (a *TapeArray) Iter() TapeIter {
 	pos := a.tape.skipNopsUntil(a.startIdx, a.endIdx)
 	if pos >= a.endIdx {
@@ -1118,12 +1173,12 @@ func (a *TapeArray) Iter() TapeIter {
 	return TapeIter{tape: a.tape, idx: pos}
 }
 
-// FirstType returns the type of the first element, or Type(-1) if empty.
+// FirstType returns the type of the first element, or TypeNone if empty.
 // NOP padding left behind by DeleteElems is skipped.
 func (a *TapeArray) FirstType() Type {
 	pos := a.tape.skipNopsUntil(a.startIdx, a.endIdx)
 	if pos >= a.endIdx {
-		return Type(-1)
+		return TypeNone
 	}
 	return Tag(a.tape.tapeTagAt(pos)).Type()
 }
@@ -1145,7 +1200,7 @@ func (a *TapeArray) Interface() ([]interface{}, error) {
 // Iter returns a TapeIter at the first key of the object.
 // NOP padding left behind by DeleteElems is skipped. For an empty object — or one
 // left empty by deletion — the returned iterator is positioned past end, so
-// Type() returns Type(-1).
+// Type() returns TypeNone.
 func (o *TapeObject) Iter() TapeIter {
 	pos := o.tape.skipNopsUntil(o.startIdx, o.endIdx)
 	if pos >= o.endIdx {

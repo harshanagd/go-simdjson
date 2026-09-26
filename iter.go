@@ -29,6 +29,15 @@ func (f FloatFlags) Contains(flag FloatFlag) bool {
 	return FloatFlag(f)&flag == flag
 }
 
+// Flags converts the flag to FloatFlags, merging any additional flags given.
+func (f FloatFlag) Flags(more ...FloatFlag) FloatFlags {
+	out := FloatFlags(f)
+	for _, m := range more {
+		out |= FloatFlags(m)
+	}
+	return out
+}
+
 // Iter represents a position in the parsed JSON document.
 type Iter struct {
 	tape        *Tape
@@ -170,10 +179,21 @@ func (o *Object) FindKey(key string, reuse *Element) *Element {
 	return o.element(key, ti, reuse)
 }
 
-// ForEach iterates over all key-value pairs in O(n) time.
-func (o *Object) ForEach(fn func(key string, i Iter) error) error {
-	return o.tobj.ForEach(func(key string, val TapeIter) error {
-		return fn(key, Iter{tape: val.tape, tapeIdx: val.idx, copyStrings: o.copyStrings, useNumber: o.useNumber})
+// ForEach iterates over all key-value pairs in O(n) time, or only those named in
+// onlyKeys when it is non-empty. The key is valid for the duration of the call.
+//
+// The callback cannot abort the walk; use NextElementBytes for that. The returned
+// error is a failed key read, which a tape from Deserialize can still produce —
+// Validate does not range-check string payload offsets.
+func (o *Object) ForEach(fn func(key []byte, i Iter), onlyKeys map[string]struct{}) error {
+	return o.tobj.ForEach(func(key []byte, val TapeIter) error {
+		if len(onlyKeys) > 0 {
+			if _, ok := onlyKeys[string(key)]; !ok {
+				return nil
+			}
+		}
+		fn(key, Iter{tape: val.tape, tapeIdx: val.idx, copyStrings: o.copyStrings, useNumber: o.useNumber})
+		return nil
 	})
 }
 
@@ -208,9 +228,13 @@ func (i *Iter) Array(reuse *Array) (*Array, error) {
 }
 
 // ForEach iterates over all elements in O(n) time.
-func (a *Array) ForEach(fn func(i Iter) error) error {
-	return a.tarr.ForEach(func(val TapeIter) error {
-		return fn(Iter{tape: val.tape, tapeIdx: val.idx, copyStrings: a.copyStrings, useNumber: a.useNumber})
+//
+// The callback cannot abort the walk and a read failure is not reported. Use the
+// tape layer's TapeArray.Iter when you need either.
+func (a *Array) ForEach(fn func(i Iter)) {
+	_ = a.tarr.ForEach(func(val TapeIter) error {
+		fn(Iter{tape: val.tape, tapeIdx: val.idx, copyStrings: a.copyStrings, useNumber: a.useNumber})
+		return nil
 	})
 }
 
@@ -221,7 +245,7 @@ func (a *Array) Count() (int, error) {
 	return a.tarr.Count(), nil
 }
 
-// FirstType returns the type of the first element without consuming it, or Type(-1)
+// FirstType returns the type of the first element without consuming it, or TypeNone
 // for an empty array. NOP padding left by DeleteElems is skipped.
 func (a *Array) FirstType() Type {
 	return a.tarr.FirstType()
@@ -298,7 +322,7 @@ func (i *Iter) FindElement(reuse *Element, path ...string) (*Element, error) {
 }
 
 // Advance moves to the next sibling element and returns its type.
-// Returns Type(-1) at end.
+// Returns TypeNone at end.
 func (i *Iter) Advance() Type {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	t := ti.Advance()
@@ -307,13 +331,13 @@ func (i *Iter) Advance() Type {
 }
 
 // AdvanceIter advances and copies the current element into dst.
-// Returns the type of the element, or Type(-1) with a nil error at end — the
+// Returns the type of the element, or TypeNone with a nil error at end — the
 // error return is reserved for future use and is never currently non-nil.
 func (i *Iter) AdvanceIter(dst *Iter) (Type, error) {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	t := ti.Advance()
-	if int(t) == -1 {
-		return Type(-1), nil
+	if t == TypeNone {
+		return TypeNone, nil
 	}
 	i.tapeIdx = ti.idx
 	if dst != i {
@@ -335,7 +359,7 @@ func (i *Iter) PeekNext() Type {
 // Returns TagEnd at end.
 func (i *Iter) PeekNextTag() Tag {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
-	if ti.Advance() == Type(-1) {
+	if ti.Advance() == TypeNone {
 		return TagEnd
 	}
 	return Tag(ti.tag())
@@ -349,7 +373,7 @@ func (i *Iter) PeekNextTag() Tag {
 // used to hardcode tape index 1 and so always returned the FIRST document, with a
 // nil error, no matter where the cursor was.
 //
-// Returns Type(-1) and an error when the cursor is not inside any document, in
+// Returns TypeNone and an error when the cursor is not inside any document, in
 // which case dst is positioned past the end of the tape. Cost is O(documents
 // before the cursor), and O(1) for a single-document tape.
 func (i *Iter) Root(dst *Iter) (Type, *Iter, error) {
@@ -364,7 +388,7 @@ func (i *Iter) Root(dst *Iter) (Type, *Iter, error) {
 		// Keep dst usable rather than nil: this method never used to fail, so a
 		// caller that ignores the error must not be handed a nil pointer.
 		dst.tapeIdx = len(i.tape.data)
-		return Type(-1), dst, fmt.Errorf("iterator at tape index %d is not inside a root document", i.tapeIdx)
+		return TypeNone, dst, fmt.Errorf("iterator at tape index %d is not inside a root document", i.tapeIdx)
 	}
 	dst.tapeIdx = root + 1
 	return dst.Type(), dst, nil
@@ -391,7 +415,7 @@ func (i *Iter) FloatFlags() (float64, FloatFlags, error) {
 }
 
 // NextElement returns the next key-value pair. Initialize the iterator by
-// calling Object() first. At end it returns Type(-1); the name is "" then, but so
+// calling Object() first. At end it returns TypeNone; the name is "" then, but so
 // is a legitimate empty key, so test the type rather than the name.
 func (o *Object) NextElement(dst *Iter) (name string, t Type, err error) {
 	n, t, err := o.NextElementBytes(dst)
@@ -399,7 +423,7 @@ func (o *Object) NextElement(dst *Iter) (name string, t Type, err error) {
 }
 
 // NextElementBytes is like NextElement but returns the key as []byte,
-// avoiding a string allocation. At end it returns a nil name with Type(-1), the
+// avoiding a string allocation. At end it returns a nil name with TypeNone, the
 // same end-of-tape sentinel Advance and TapeIter.Type use; no real entry can carry
 // that type, so testing it is safe where testing len(name) == 0 is not.
 // The key is copied when WithCopyStrings(true) (the default); when false it is a
@@ -411,12 +435,12 @@ func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
 	// Skip any NOP padding left by a prior delete before reading the key.
 	o.iterPos = o.tobj.tape.skipNopsUntil(o.iterPos, o.tobj.endIdx)
 	if o.iterPos >= o.tobj.endIdx {
-		return nil, Type(-1), nil
+		return nil, TypeNone, nil
 	}
 	keyEntry := o.tobj.tape.data[o.iterPos]
 	s, err := o.tobj.tape.readStringBytes(keyEntry & payloadMask)
 	if err != nil {
-		return nil, Type(-1), err
+		return nil, TypeNone, err
 	}
 	if o.copyStrings || o.tobj.tape.pj != nil {
 		cp := make([]byte, len(s))
@@ -425,7 +449,7 @@ func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
 	}
 	valIdx := o.iterPos + 1
 	if valIdx >= len(o.tobj.tape.data) {
-		return nil, Type(-1), fmt.Errorf("truncated tape: key at %d has no value", o.iterPos)
+		return nil, TypeNone, fmt.Errorf("truncated tape: key at %d has no value", o.iterPos)
 	}
 	if dst != nil {
 		dst.tape = o.tobj.tape
@@ -434,7 +458,7 @@ func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error) {
 		dst.useNumber = o.useNumber
 	}
 	// Tag.Type() is the single source of truth for tag-to-Type mapping: it folds
-	// 'f' (false) into TypeBool and maps a zero tag to Type(-1).
+	// 'f' (false) into TypeBool and maps a zero tag to TypeNone.
 	t = Tag(o.tobj.tape.tapeTagAt(valIdx)).Type()
 	o.iterPos = o.tobj.tape.skipValue(valIdx)
 	return s, t, nil
@@ -481,7 +505,7 @@ func (o *Object) Parse(dst *Elements) (*Elements, error) {
 		if err != nil {
 			return dst, err
 		}
-		if t == Type(-1) {
+		if t == TypeNone {
 			break
 		}
 		dst.Index[name] = len(dst.Elements)
@@ -496,91 +520,32 @@ func (o *Object) Parse(dst *Elements) (*Elements, error) {
 
 // Interface returns the array as []interface{}.
 func (a *Array) Interface() ([]interface{}, error) {
-	var result []interface{}
-	err := a.ForEach(func(elem Iter) error {
-		v, err := elem.Interface()
-		if err != nil {
-			return err
-		}
-		result = append(result, v)
-		return nil
-	})
-	return result, err
+	return a.tarr.Interface()
 }
 
 // AsFloat returns all elements as []float64.
 func (a *Array) AsFloat() ([]float64, error) {
-	n, _ := a.Count()
-	result := make([]float64, 0, n)
-	err := a.ForEach(func(elem Iter) error {
-		v, err := elem.Float()
-		if err != nil {
-			return err
-		}
-		result = append(result, v)
-		return nil
-	})
-	return result, err
+	return a.tarr.AsFloat()
 }
 
 // AsInteger returns all elements as []int64.
 func (a *Array) AsInteger() ([]int64, error) {
-	n, _ := a.Count()
-	result := make([]int64, 0, n)
-	err := a.ForEach(func(elem Iter) error {
-		v, err := elem.Int()
-		if err != nil {
-			return err
-		}
-		result = append(result, v)
-		return nil
-	})
-	return result, err
+	return a.tarr.AsInteger()
 }
 
 // AsUint64 returns all elements as []uint64.
 func (a *Array) AsUint64() ([]uint64, error) {
-	n, _ := a.Count()
-	result := make([]uint64, 0, n)
-	err := a.ForEach(func(elem Iter) error {
-		v, err := elem.Uint()
-		if err != nil {
-			return err
-		}
-		result = append(result, v)
-		return nil
-	})
-	return result, err
+	return a.tarr.AsUint64()
 }
 
 // AsString returns all elements as []string.
 func (a *Array) AsString() ([]string, error) {
-	n, _ := a.Count()
-	result := make([]string, 0, n)
-	err := a.ForEach(func(elem Iter) error {
-		v, err := elem.String()
-		if err != nil {
-			return err
-		}
-		result = append(result, v)
-		return nil
-	})
-	return result, err
+	return a.tarr.AsString()
 }
 
 // AsStringCvt returns all elements converted to strings via StringCvt.
 func (a *Array) AsStringCvt() ([]string, error) {
-	n, _ := a.Count()
-	result := make([]string, 0, n)
-	err := a.ForEach(func(elem Iter) error {
-		v, err := elem.StringCvt()
-		if err != nil {
-			return err
-		}
-		result = append(result, v)
-		return nil
-	})
-	return result, err
+	return a.tarr.AsStringCvt()
 }
 
 // TagNop is a no-operation tape entry used to fill gaps after mutations.
@@ -1026,7 +991,7 @@ func (a *Array) DeleteElems(fn func(i Iter) bool) {
 			continue
 		}
 		valueEnd := t.skipValue(pos)
-		if fn(Iter{tape: t, tapeIdx: pos, copyStrings: a.copyStrings}) {
+		if fn(Iter{tape: t, tapeIdx: pos, copyStrings: a.copyStrings, useNumber: a.useNumber}) {
 			// NOP-fill the entire element.
 			t.tapeNopRange(pos, valueEnd)
 		} else {
@@ -1044,10 +1009,10 @@ func (i *Iter) AdvanceInto() Tag {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
 	t := ti.AdvanceInto()
 	i.tapeIdx = ti.idx
-	if int(t) == -1 {
+	if t == TypeNone {
 		return TagEnd
 	}
-	return Tag(t) //nolint:gosec // a Type other than the -1 sentinel above holds a tag byte
+	return Tag(t) //nolint:gosec // a Type other than the TypeNone sentinel above holds a tag byte
 }
 
 // MarshalJSON serializes the current element and its children to JSON bytes.

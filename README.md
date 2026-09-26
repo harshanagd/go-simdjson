@@ -103,11 +103,10 @@ elem := obj.FindKey("users", nil)
 arr, _ := elem.Iter.Array(nil)
 
 // Iterate array
-arr.ForEach(func(i simdjson.Iter) error {
+arr.ForEach(func(i simdjson.Iter) {
     userObj, _ := i.Object(nil)
     name := userObj.FindKey("name", nil)
     fmt.Println(name.Iter.String())
-    return nil
 })
 
 // Or convert everything to Go native types
@@ -153,7 +152,7 @@ s, _ := val.String()
 // Cursor-style iteration
 arr, _ := ti.Array()
 ai := arr.Iter()
-for ai.Type() != simdjson.Type(-1) {
+for ai.Type() != simdjson.TypeNone {
     v, _ := ai.Int()
     fmt.Println(v)
     ai.Advance()
@@ -275,7 +274,7 @@ func (i *Iter) SetNull() error
 ```go
 func (o *Object) FindKey(key string, reuse *Element) *Element
 func (o *Object) FindPath(reuse *Element, path ...string) (*Element, error)
-func (o *Object) ForEach(fn func(key string, i Iter) error) error
+func (o *Object) ForEach(fn func(key []byte, i Iter), onlyKeys map[string]struct{}) error
 func (o *Object) Map(dst map[string]interface{}) (map[string]interface{}, error)
 func (o *Object) NextElement(dst *Iter) (name string, t Type, err error)
 func (o *Object) NextElementBytes(dst *Iter) (name []byte, t Type, err error)
@@ -287,7 +286,7 @@ func (o *Object) DeleteElems(fn func(key []byte, i Iter) bool, onlyKeys map[stri
 ### Array
 
 ```go
-func (a *Array) ForEach(fn func(i Iter) error) error
+func (a *Array) ForEach(fn func(i Iter))
 func (a *Array) Interface() ([]interface{}, error)
 func (a *Array) AsFloat() ([]float64, error)
 func (a *Array) AsInteger() ([]int64, error)
@@ -342,7 +341,7 @@ func (o *TapeObject) FindPath(path ...string) (TapeIter, bool)
 func (o *TapeObject) ForEach/Map/Count/Iter
 
 // TapeArray
-func (a *TapeArray) ForEach/AsFloat/AsInteger/AsString/Count/Interface/FirstType/Iter
+func (a *TapeArray) ForEach/AsFloat/AsInteger/AsUint64/AsString/AsStringCvt/Count/Interface/FirstType/Iter
 ```
 
 ## Building and Testing
@@ -461,17 +460,19 @@ These show the cost of individual API calls (twitter.json, 632KB, pre-parsed):
 | `TapeIter.Advance` (tape cursor) | 42ns | 0 | 0 |
 | `NextElementBytes` (key as `[]byte`) | 56ns | 2 | 48 |
 | `NextElement` (key as `string`) | 62ns | 2 | 48 |
-| `Object.ForEach` | 92ns | 4 | 72 |
+| `Object.ForEach` | 92ns | 1 | 48 |
 | `Object.FindKey` | 114ns | 3 | 104 |
 | `Object.FindPath` (2 levels) | 399ns | 11 | 192 |
-| `Array.ForEach` (243 elements) | 1.1µs | 11 | 224 |
-| `AsFloat` (numbers.json) | 68µs | 3 | 82KB |
-| `AsInteger` (10K ints) | 67µs | 3 | 82KB |
+| `Array.ForEach` (243 elements) | 1.1µs | 8 | 200 |
+| `AsFloat` (numbers.json) | 68µs | 2 | 82KB |
+| `AsInteger` (10K ints) | 67µs | 2 | 82KB |
 | `Clone` (full document) | 172µs | 2 | 713KB |
 
 Allocation counts for `TapeIter.Advance`, `FindKey` and `FindPath` reflect the by-value
-tape navigation; the timings predate it and are pending a re-run on the reference
-machine, so all three are faster than shown.
+tape navigation, and those for both `ForEach` methods reflect the simdjson-go
+signatures (an object key is now `[]byte`, so it is no longer copied into a string).
+The timings predate both changes and are pending a re-run on the reference machine,
+so every one of those rows is faster than shown.
 
 Use `reuse` parameters to eliminate `Object`/`Array`/`Element` heap allocations in hot loops:
 
@@ -492,25 +493,53 @@ for {
 | Interface() on a clone, NoCopy | fewer | Skips string copies; clone required, see above |
 | Targeted access | 0–5 per call | Use `reuse` params to minimize |
 | Elements.Lookup | 0 | Zero-alloc after initial `Object.Parse` |
-| AsFloat/AsInteger | 3 | Single slice allocation for result |
+| AsFloat/AsInteger | 2 | The result slice, plus the `*Array` unless you pass a `reuse` |
 
-## API Parity with simdjson-go
+## simdjson-go compatibility
 
-| Category | APIs | Status |
-|----------|------|--------|
-| Parse / Pool | `Parse`, `GetParser`, `PutParser`, `SupportedCPU`, `ActiveImplementation` | ✅ |
-| Read (Iter) | `Type`, `String`, `Int`, `Uint`, `Float`, `Bool`, `Object`, `Array`, `Interface` | ✅ |
-| Navigation | `Advance`, `AdvanceInto`, `AdvanceIter`, `PeekNext`, `PeekNextTag`, `Root`, `FindElement` | ✅ |
-| Object | `FindKey`, `FindPath`, `ForEach`, `Map`, `NextElement`, `NextElementBytes`, `Parse`, `Count` | ✅ |
-| Array | `ForEach`, `Interface`, `AsFloat`, `AsInteger`, `AsUint64`, `AsString`, `AsStringCvt`, `Count` | ✅ |
-| Elements | `Lookup` | ✅ |
-| Tape (pure Go) | `TapeIter`, `TapeObject`, `TapeArray` — full navigation | ✅ |
-| Mutation | `SetFloat`, `SetInt`, `SetUInt`, `SetString`, `SetStringBytes`, `SetBool`, `SetNull` | ✅ |
-| Delete | `Object.DeleteElems`, `Array.DeleteElems` | ✅ |
-| Serialization | `MarshalJSON`, `MarshalJSONBuffer` (Iter, Array, Elements) | ✅ |
-| Binary | `NewSerializer`, `Serialize`, `Deserialize` | ✅ |
-| NDJSON | `ParseND`, `ParseNDStream` | ✅ |
-| Big Integer | `UseBigInt`, `BigInt`, `TypeBigInt` | ✅ |
+The exported surface aims to be drop-in compatible with
+[minio/simdjson-go](https://github.com/minio/simdjson-go) — same names, same
+signatures, so switching the import path is enough. It is not fully there, so this
+section lists where it diverges instead of claiming parity.
+
+### Matching
+
+`Parse`, `ParseND`, `ParseNDStream`, `SupportedCPU`, `WithCopyStrings`, `Stream`,
+`ParsedJson.Clone`/`ForEach`/`Reset`, all of `Iter` — including the `Set*`
+mutations, `MarshalJSON`/`MarshalJSONBuffer`, `Root`, `FindElement` and
+`FloatFlags` — all of `Object`, all of `Array` except `Iter()`, `Element`,
+`Elements.Lookup`, `Serializer.Serialize`/`Deserialize`, every `Tag` constant,
+`TagToType`, `ErrPathNotFound`, `FloatFlag.Flags`, and the `JSONTAGOFFSET` /
+`JSONTAGMASK` / `JSONVALUEMASK` tape constants.
+
+`TypeInt`, `TypeUint` and `TypeFloat` exist as simdjson-go's names for
+`TypeInt64`, `TypeUint64` and `TypeDouble`. The values are identical, so a switch
+written against either set compiles and matches.
+
+### Diverging
+
+| | simdjson-go | here | why |
+|---|---|---|---|
+| `ParsedJson.Iter()` | `Iter` | `(Iter, error)` | An unparsed `ParsedJson` is an error, not a past-end cursor. Dropping the error would make that failure surface later and quieter. |
+| `ParsedJson.Message` | `[]byte` | absent | The tape views the C++ parser's buffers; there is no retained Go message buffer for payloads to index into. A nil field their code reads is worse than its absence. |
+| `ParsedJson.Tape`, `.Strings` | exported fields | `GetTape() (*Tape, error)` | Same ownership reason: the buffers are parser-owned and valid only until the next `Parse` or `Close`, which a bare field cannot express. |
+| `Array.Iter()` | `Iter`, first value ready after `Advance` | absent | Their cursor starts *before* the first element. `Advance` here moves by skipping the value at the cursor, so no index exists from which it lands on element 0 — a naive port would silently skip the first element. `TapeArray.Iter` is the equivalent, positioned *at* the first element. |
+| `Serializer.CompressMode` | present | absent | Nothing here compresses, so it could only be accepted and ignored. The serialized formats are not interchangeable anyway. |
+| `Type` underlying type | `uint8`, iota 0–9 | `int`, tag bytes | Our values are the tape's own tag bytes, which is what makes `Tag.Type()` a conversion rather than a lookup. |
+| `Type.String()` | `int`, `uint`, `float` | `int64`, `uint64`, `double` | Names the width actually stored. |
+| `STRINGBUFBIT`, `STRINGBUFMASK` | exported | absent | They mark a payload that points into the message buffer rather than the string buffer. This tape has no such bit; strings always live in the string buffer. |
+
+### Additions
+
+`Iter.StringRef`, `Iter.BigInt`, `Object.Count`, `Array.Count`, `GetParser`,
+`PutParser`, `Close`, `ActiveImplementation`, `FindString`, the `Root*`
+accessors, `UseNumber`, `UseBigInt`, `TypeBigInt`, `TagBigInt` and the whole
+`Tape`/`TapeIter`/`TapeObject`/`TapeArray` layer have no simdjson-go equivalent,
+so they cannot break a program written against it.
+
+`compat_test.go` checks behaviour against shared fixtures; only
+`TestSimdjsonGoTypeAliases` checks a signature. The tables above are maintained by
+hand, so a rename upstream will not fail the build here.
 
 ## License
 

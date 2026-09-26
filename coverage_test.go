@@ -48,7 +48,7 @@ func TestIterPeekNext(t *testing.T) {
 	ti.AdvanceInto()
 	// Now at first element (1)
 	next := ti.PeekNext()
-	if next == Type(-1) {
+	if next == TypeNone {
 		t.Error("PeekNext returned end")
 	}
 }
