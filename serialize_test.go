@@ -318,6 +318,39 @@ func TestSerializeReuse(t *testing.T) {
 	}
 }
 
+// Deserialize installs a tape; the ParsedJson's own option fields feed Iter, so
+// reusing a ParsedJson from a Parse(UseNumber()) must not leave the two disagreeing.
+func TestDeserializeResetsOptionsOnReuse(t *testing.T) {
+	ser := NewSerializer()
+	pj, err := Parse([]byte(`[42]`), nil, UseNumber())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	pj, err = ser.Deserialize(ser.Serialize(nil, *pj), pj)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iter, _ := pj.Iter()
+	viaIter, err := iter.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr, _ := iter.Array(nil)
+	viaTape, err := arr.Interface()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := viaIter.([]interface{})[0].(int64); !ok {
+		t.Errorf("Iter saw %T, want int64", viaIter.([]interface{})[0])
+	}
+	if _, ok := viaTape[0].(int64); !ok {
+		t.Errorf("tape layer saw %T, want int64", viaTape[0])
+	}
+}
+
 // FuzzDeserialize asserts the contract Deserialize's boundary check exists to
 // establish: anything it accepts is safe for every reader to walk. It reaches the
 // envelope parser -- version byte and the two length prefixes -- which FuzzTapeContract

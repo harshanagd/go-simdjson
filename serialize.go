@@ -104,6 +104,13 @@ func (s *Serializer) Deserialize(src []byte, dst *ParsedJson) (*ParsedJson, erro
 	if dst == nil {
 		dst = newParsedJson()
 	}
+	// The envelope carries no options, so restore the defaults the tape below is
+	// built with. Without this a ParsedJson reused from a Parse(UseNumber()) reads
+	// numbers one way through Iter (which carries the field) and another through
+	// the tape layer (which carries the tape's copy).
+	dst.copyStrings = true
+	dst.useNumber = false
+	dst.bigInt = false
 	dst.tape = Tape{
 		data:        tapeData,
 		strings:     strings,
