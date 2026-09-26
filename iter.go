@@ -92,46 +92,7 @@ func (i *Iter) StringRef() (string, error) {
 // their original digits and returned verbatim.
 func (i *Iter) StringCvt() (string, error) {
 	ti := TapeIter{tape: i.tape, idx: i.tapeIdx}
-	switch ti.Type() {
-	case TypeObject, TypeArray:
-		return "", fmt.Errorf("cannot convert %v to string", ti.Type())
-	case TypeString:
-		return ti.String()
-	case TypeInt64:
-		v, err := ti.Int()
-		if err != nil {
-			return "", err
-		}
-		return strconv.FormatInt(v, 10), nil
-	case TypeUint64:
-		v, err := ti.Uint()
-		if err != nil {
-			return "", err
-		}
-		return strconv.FormatUint(v, 10), nil
-	case TypeDouble:
-		v, err := ti.Float()
-		if err != nil {
-			return "", err
-		}
-		return strconv.FormatFloat(v, 'g', -1, 64), nil
-	case TypeBool:
-		v, err := ti.Bool()
-		if err != nil {
-			return "", err
-		}
-		if v {
-			return "true", nil
-		}
-		return "false", nil
-	case TypeNull:
-		return "null", nil
-	case TypeBigInt:
-		v, err := ti.BigInt()
-		return string(v), err
-	default:
-		return "", fmt.Errorf("cannot convert %v to string", ti.Type())
-	}
+	return ti.StringCvt()
 }
 
 // Int returns the element value as int64.

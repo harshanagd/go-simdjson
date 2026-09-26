@@ -356,6 +356,27 @@ func TestStringCvt(t *testing.T) {
 	}
 }
 
+// Containers have no string form. Iter.StringCvt reached this through its own
+// case before it delegated; it now reaches TapeIter's default arm.
+func TestStringCvtOnContainer(t *testing.T) {
+	pj, err := Parse([]byte(`{"o":{"k":1},"a":[1]}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pj.Close()
+
+	iter, _ := pj.Iter()
+	obj, _ := iter.Object(nil)
+
+	for _, key := range []string{"o", "a"} {
+		t.Run(key, func(t *testing.T) {
+			if s, err := obj.FindKey(key, nil).Iter.StringCvt(); err == nil {
+				t.Fatalf("StringCvt on a container returned %q with no error", s)
+			}
+		})
+	}
+}
+
 func TestUseNumber(t *testing.T) {
 	pj, err := Parse([]byte(`{"i":42,"f":3.14,"big":9223372036854775807}`), nil, UseNumber())
 	if err != nil {
