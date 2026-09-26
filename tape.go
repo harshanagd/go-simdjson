@@ -619,9 +619,11 @@ func (o *TapeObject) FindKey(key string) (iter TapeIter, ok bool) {
 	for pos < o.endIdx {
 		// A key that fails to decode cannot match, so skip past it. FindKey has
 		// no error return; use ForEach if you need the failure reported.
-		k, err := o.tape.readString(o.tape.tapePayloadAt(pos))
+		// Comparing against the bytes lets the compiler elide the string
+		// conversion, so a scan allocates nothing per candidate key.
+		kb, err := o.tape.readStringBytes(o.tape.tapePayloadAt(pos))
 		valIdx := pos + 1
-		if err == nil && k == key {
+		if err == nil && string(kb) == key {
 			return TapeIter{tape: o.tape, idx: valIdx}, true
 		}
 		pos = o.tape.skipNopsUntil(o.tape.skipValue(valIdx), o.endIdx)

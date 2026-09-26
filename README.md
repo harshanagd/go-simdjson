@@ -122,13 +122,18 @@ The difference is allocation:
 
 | | ns/op | B/op | allocs |
 |---|---|---|---|
-| `TapeObject.FindKey` | 15 | 8 | 1 |
-| `Object.FindKey(key, nil)` | 53 | 104 | 3 |
-| `Object.FindKey(key, &reuse)` | 22 | 8 | 1 |
+| `TapeObject.FindKey` | 9 | 0 | 0 |
+| `Object.FindKey(key, nil)` | 27 | 48 | 1 |
+| `Object.FindKey(key, &reuse)` | 11 | 0 | 0 |
 
-The tape layer returns values and materialises no `Element`, so it allocates less;
-passing a `reuse` brings `Iter` to parity for lookups, and `Advance` is already equal
-on both (`TapeIter.Advance` and `Iter.Advance` are both zero-alloc).
+Measured on an Apple M3 Pro (arm64, NEON), so these timings are not comparable with
+the Benchmarks section further down, which uses an Intel Xeon. The allocation columns
+are machine-independent.
+
+Neither layer allocates for the key itself — it is compared as bytes. What `Iter`
+adds is the `*Object` and the `*Element` it returns, both of which a `reuse`
+removes, bringing lookups to parity. `Advance` is already equal on both
+(`TapeIter.Advance` and `Iter.Advance` are zero-alloc).
 
 Use `Iter` by default — it has the larger surface, including mutation, marshalling,
 `Root` and `FindElement` with reuse. Reach for the tape layer in allocation-sensitive
@@ -456,31 +461,41 @@ These show the cost of individual API calls (twitter.json, 632KB, pre-parsed):
 
 | Operation | Time | Allocs | Bytes |
 |-----------|------|--------|-------|
+| `TapeObject.FindKey` | — | 0 | 0 |
 | `Elements.Lookup` | 18ns | 0 | 0 |
 | `TapeIter.Advance` (tape cursor) | 42ns | 0 | 0 |
-| `NextElementBytes` (key as `[]byte`) | 56ns | 2 | 48 |
-| `NextElement` (key as `string`) | 62ns | 2 | 48 |
 | `Object.ForEach` | 92ns | 1 | 48 |
-| `Object.FindKey` | 114ns | 3 | 104 |
-| `Object.FindPath` (2 levels) | 399ns | 11 | 192 |
-| `Array.ForEach` (243 elements) | 1.1µs | 8 | 200 |
+| `Object.FindKey` | 114ns | 2 | 96 |
+| `NextElementBytes` (key as `[]byte`) | 56ns | 3 | 72 |
+| `NextElement` (key as `string`) | 62ns | 3 | 72 |
+| `Object.FindPath` (2 levels) | 399ns | 2 | 96 |
+| `Array.ForEach` (243 elements) | 1.1µs | 3 | 128 |
 | `AsFloat` (numbers.json) | 68µs | 2 | 82KB |
 | `AsInteger` (10K ints) | 67µs | 2 | 82KB |
-| `Clone` (full document) | 172µs | 2 | 713KB |
+| `MarshalJSONBuffer` (full document) | — | 0 | 0 |
+| `Clone` (full document) | 172µs | 3 | 713KB |
 
-Allocation counts for `TapeIter.Advance`, `FindKey` and `FindPath` reflect the by-value
-tape navigation, and those for both `ForEach` methods reflect the simdjson-go
-signatures (an object key is now `[]byte`, so it is no longer copied into a string).
-The timings predate both changes and are pending a re-run on the reference machine,
-so every one of those rows is faster than shown.
+The allocation and byte columns are current; the timings are not, and are pending a
+re-run on the reference machine, so every row that changed is faster than shown. The
+two rows without a timing are new and have never run there — see the Tape Navigation
+table above for `TapeObject.FindKey` measured elsewhere.
+
+The counts moved for four reasons: by-value tape navigation (`FindKey`, `FindPath`),
+the simdjson-go `ForEach` signatures (an object key is `[]byte`, so it is no longer
+copied into a string), comparing keys as bytes rather than materialising a string per
+candidate (`FindKey`, `FindPath`, and marshalling), and reuse now covering the
+`*Element` as well.
 
 Use `reuse` parameters to eliminate `Object`/`Array`/`Element` heap allocations in hot loops:
 
 ```go
 var obj *simdjson.Object
+var elem simdjson.Element
 for {
-    obj, _ = iter.Object(obj) // reuses obj, zero alloc
+    obj, _ = iter.Object(obj)          // reuses obj, zero alloc
+    e := obj.FindKey("id", &elem)      // reuses elem, zero alloc
     // ...
+    _ = e
 }
 ```
 
@@ -491,7 +506,9 @@ for {
 | Parse | 0 | zero-copy view over the C++ parser's buffers |
 | Interface() | O(elements) | Unavoidable: `interface{}` boxing, map/slice creation |
 | Interface() on a clone, NoCopy | fewer | Skips string copies; clone required, see above |
-| Targeted access | 0–5 per call | Use `reuse` params to minimize |
+| Targeted access | 0–3 per call | Use `reuse` params to reach 0 |
+| Key lookup | 0 | The key is compared as bytes, never materialised |
+| MarshalJSONBuffer | 0 | Given a caller-supplied buffer with room |
 | Elements.Lookup | 0 | Zero-alloc after initial `Object.Parse` |
 | AsFloat/AsInteger | 2 | The result slice, plus the `*Array` unless you pass a `reuse` |
 

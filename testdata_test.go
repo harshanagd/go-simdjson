@@ -327,6 +327,43 @@ func BenchmarkTapeAdvance(b *testing.B) {
 	}
 }
 
+// BenchmarkTapeFindKey benchmarks tape-layer key lookup, which allocates nothing
+// because the key is compared as bytes.
+func BenchmarkTapeFindKey(b *testing.B) {
+	data := loadTestFileB(b, "twitter")
+	pj := GetParser()
+	defer PutParser(pj)
+	pj, _ = Parse(data, pj)
+	tape, _ := pj.GetTape()
+	ti := tape.Iter()
+	obj, _ := ti.Object()
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		obj.FindKey("search_metadata")
+	}
+}
+
+// BenchmarkMarshalJSONBuffer benchmarks re-serializing a whole document into a
+// caller-supplied buffer, which allocates nothing.
+func BenchmarkMarshalJSONBuffer(b *testing.B) {
+	data := loadTestFileB(b, "twitter")
+	pj := GetParser()
+	defer PutParser(pj)
+	pj, _ = Parse(data, pj)
+	buf := make([]byte, 0, len(data)+1024)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		iter, _ := pj.Iter()
+		if _, err := iter.MarshalJSONBuffer(buf[:0]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkElementsLookup benchmarks indexed key lookup vs FindKey.
 func BenchmarkElementsLookup(b *testing.B) {
 	data := loadTestFileB(b, "twitter")

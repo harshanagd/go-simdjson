@@ -1075,7 +1075,7 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 		return marshalTape(t, idx+1, dst)
 
 	case tagString:
-		s, err := t.readString(t.tapePayloadAt(idx))
+		s, err := t.readStringBytes(t.tapePayloadAt(idx))
 		if err != nil {
 			return nil, err
 		}
@@ -1128,7 +1128,7 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 			}
 			first = false
 			// Key
-			key, err := t.readString(t.tapePayloadAt(pos))
+			key, err := t.readStringBytes(t.tapePayloadAt(pos))
 			if err != nil {
 				return nil, err
 			}
@@ -1176,7 +1176,7 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 		return dst, nil
 
 	case tagBigint:
-		s, err := t.readString(t.tapePayloadAt(idx))
+		s, err := t.readStringBytes(t.tapePayloadAt(idx))
 		if err != nil {
 			return nil, err
 		}
@@ -1187,8 +1187,9 @@ func marshalTape(t *Tape, idx int, dst []byte) ([]byte, error) {
 	}
 }
 
-// appendEscaped appends a JSON-escaped string to dst.
-func appendEscaped(dst []byte, s string) []byte {
+// appendEscaped appends JSON-escaped text to dst. Taking either representation
+// lets a tape walker pass the string bytes without materialising a string.
+func appendEscaped[T ~string | ~[]byte](dst []byte, s T) []byte {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
