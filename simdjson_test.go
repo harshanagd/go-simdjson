@@ -655,3 +655,65 @@ func TestStringBytesCapIsPinnedUnderNoCopy(t *testing.T) {
 		t.Errorf("neighbouring value corrupted by append: %q, want \"bbbb\"", string(b))
 	}
 }
+
+func TestLargeNumbers(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantErr   bool
+		wantType  Type
+		wantFloat float64
+	}{
+		{"max_int64", `9223372036854775807`, false, TypeInt64, 0},
+		{"min_int64", `-9223372036854775808`, false, TypeInt64, 0},
+		{"max_uint64", `18446744073709551615`, false, TypeUint64, 0},
+		{"overflow_uint64", `18446744073709551616`, true, TypeNull, 0},
+		{"huge_int", `99999999999999999999`, true, TypeNull, 0},
+		{"huge_negative", `-99999999999999999999`, true, TypeNull, 0},
+		{"float_big", `1e308`, false, TypeDouble, 1e308},
+		{"float_tiny", `5e-324`, false, TypeDouble, 5e-324},
+		{"float_overflow", `1e309`, true, TypeNull, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pj, err := Parse([]byte(tt.input), nil)
+			if tt.wantErr {
+				if err == nil {
+					pj.Close()
+					t.Fatal("expected parse error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Parse failed: %v", err)
+			}
+			defer pj.Close()
+
+			if pj.RootType() != tt.wantType {
+				t.Fatalf("expected type %v, got %v", tt.wantType, pj.RootType())
+			}
+
+			if tt.wantType == TypeDouble {
+				v, err := pj.RootDouble()
+				if err != nil {
+					t.Fatalf("RootDouble failed: %v", err)
+				}
+				if v != tt.wantFloat {
+					t.Fatalf("expected %v, got %v", tt.wantFloat, v)
+				}
+			}
+		})
+	}
+}
+
+func TestLargeNumberUseNumber(t *testing.T) {
+	// Numbers that overflow int64 but fit in uint64
+	pj, _ := Parse([]byte(`{"big":18446744073709551615}`), nil, UseNumber())
+	defer pj.Close()
+	v, _ := pj.TapeInterfaceUseNumber()
+	m := v.(map[string]interface{})
+	n := m["big"].(json.Number)
+	if n.String() != "18446744073709551615" {
+		t.Fatalf("expected '18446744073709551615', got %q", n.String())
+	}
+}

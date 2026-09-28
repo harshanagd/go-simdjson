@@ -231,6 +231,41 @@ func (pj *ParsedJson) ForEach(fn func(i Iter) error) error {
 	return nil
 }
 
+// Iter returns an Iter positioned at the root of the parsed document.
+func (pj *ParsedJson) Iter() (Iter, error) {
+	if !pj.hasTape {
+		return Iter{}, fmt.Errorf("no parsed document")
+	}
+	return Iter{tape: &pj.tape, tapeIdx: 1, copyStrings: pj.copyStrings, useNumber: pj.useNumber}, nil
+}
+
+// GetTape returns the tape extracted during Parse. Zero-cost after parse.
+func (pj *ParsedJson) GetTape() (*Tape, error) {
+	if !pj.hasTape {
+		return nil, fmt.Errorf("no parsed document")
+	}
+	return &pj.tape, nil
+}
+
+// TapeInterface converts the entire document to Go native types via pure Go
+// tape walking. Zero CGo calls — significantly faster than DOM-based Interface().
+func (pj *ParsedJson) TapeInterface() (interface{}, error) {
+	t, err := pj.GetTape()
+	if err != nil {
+		return nil, err
+	}
+	return t.Interface()
+}
+
+// TapeInterfaceUseNumber is like TapeInterface but returns json.Number for numerics.
+func (pj *ParsedJson) TapeInterfaceUseNumber() (interface{}, error) {
+	t, err := pj.GetTape()
+	if err != nil {
+		return nil, err
+	}
+	return t.InterfaceUseNumber()
+}
+
 // Type represents a JSON element type.
 type Type int
 

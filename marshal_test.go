@@ -347,3 +347,18 @@ func TestMarshalJSONRealFiles(t *testing.T) {
 		})
 	}
 }
+
+func TestMarshalTapeOnTruncatedTape(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tag  byte
+	}{{"int", tagInt64}, {"uint", tagUint64}, {"double", tagDouble}} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp, _ := truncatedNumericTape(tc.tag)
+			it := Iter{tape: tp, tapeIdx: 1}
+			if _, err := it.MarshalJSON(); err == nil {
+				t.Errorf("MarshalJSON() on a truncated %s entry returned no error", tc.name)
+			}
+		})
+	}
+}

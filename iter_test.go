@@ -1963,3 +1963,43 @@ func TestMutateParsedTapeInPlace(t *testing.T) {
 		t.Errorf(`m["b"] = %v, want 99`, m["b"])
 	}
 }
+
+func TestLargeNumberStringCvt(t *testing.T) {
+	// max uint64 via StringCvt
+	pj, _ := Parse([]byte(`18446744073709551615`), nil)
+	defer pj.Close()
+	iter, _ := pj.Iter()
+	s, err := iter.StringCvt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != "18446744073709551615" {
+		t.Fatalf("expected '18446744073709551615', got %q", s)
+	}
+}
+
+// TestIterExhaustedPeekNextTagDoesNotPanic is the Iter-layer counterpart: it
+// builds its own skipValue call and so needs its own input guard.
+func TestIterExhaustedPeekNextTagDoesNotPanic(t *testing.T) {
+	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool { return true })
+	defer pj.Close()
+
+	cur := arr.Iter()
+	ei := Iter{tape: cur.tape, tapeIdx: cur.idx}
+	if got := ei.PeekNextTag(); got != TagEnd {
+		t.Errorf("PeekNextTag() on an exhausted iterator = %q, want TagEnd", rune(got))
+	}
+	if got := ei.Advance(); got != TypeNone {
+		t.Errorf("Iter.Advance() on an exhausted iterator = %v, want TypeNone", got)
+	}
+	if got := ei.PeekNext(); got != TypeNone {
+		t.Errorf("Iter.PeekNext() on an exhausted iterator = %v, want TypeNone", got)
+	}
+	if got := ei.AdvanceInto(); got != TagEnd {
+		t.Errorf("Iter.AdvanceInto() on an exhausted iterator = %q, want TagEnd", rune(got))
+	}
+	var dst Iter
+	if got, err := ei.AdvanceIter(&dst); got != TypeNone || err != nil {
+		t.Errorf("AdvanceIter() on an exhausted iterator = %v, %v; want TypeNone, nil", got, err)
+	}
+}

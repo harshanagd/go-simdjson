@@ -37,6 +37,10 @@ const (
 	TagEnd         = Tag(0)
 	TagBigInt      = Tag('Z')
 
+	// TagNop is a no-operation tape entry used to fill gaps after mutations.
+	// The payload stores the skip distance for Advance().
+	TagNop = Tag('N')
+
 	// The tape entry layout, under the names simdjson-go gives it. They describe
 	// this tape too: the tag is the high 8 bits, the payload the low 56.
 	JSONTAGOFFSET = 56
@@ -71,6 +75,7 @@ const (
 	tagFalse  = byte(TagBoolFalse)
 	tagNull   = byte(TagNull)
 	tagBigint = byte(TagBigInt)
+	tagNop    = byte(TagNop)
 )
 
 // TagToType maps a tag to its type. Only the basic types and the container START
@@ -130,14 +135,6 @@ type Tape struct {
 	pj *ParsedJson
 }
 
-// GetTape returns the tape extracted during Parse. Zero-cost after parse.
-func (pj *ParsedJson) GetTape() (*Tape, error) {
-	if !pj.hasTape {
-		return nil, fmt.Errorf("no parsed document")
-	}
-	return &pj.tape, nil
-}
-
 // Clone returns a deep copy of the tape and string buffer.
 func (t *Tape) Clone() *Tape {
 	d := make([]uint64, len(t.data))
@@ -145,25 +142,6 @@ func (t *Tape) Clone() *Tape {
 	s := make([]byte, len(t.strings))
 	copy(s, t.strings)
 	return &Tape{data: d, strings: s, copyStrings: t.copyStrings, useNumber: t.useNumber}
-}
-
-// TapeInterface converts the entire document to Go native types via pure Go
-// tape walking. Zero CGo calls — significantly faster than DOM-based Interface().
-func (pj *ParsedJson) TapeInterface() (interface{}, error) {
-	t, err := pj.GetTape()
-	if err != nil {
-		return nil, err
-	}
-	return t.Interface()
-}
-
-// TapeInterfaceUseNumber is like TapeInterface but returns json.Number for numerics.
-func (pj *ParsedJson) TapeInterfaceUseNumber() (interface{}, error) {
-	t, err := pj.GetTape()
-	if err != nil {
-		return nil, err
-	}
-	return t.InterfaceUseNumber()
 }
 
 // RootType returns the type of the root element.
@@ -584,6 +562,48 @@ func (ti *TapeIter) tag() byte {
 }
 
 func (ti *TapeIter) payload() uint64 { return ti.tape.data[ti.idx] & payloadMask }
+
+// --- Tape entry format ---
+// These abstract the tape entry format: [tag:8 | payload:56].
+
+// tapeEntry builds a tape entry from a tag byte and payload.
+func tapeEntry(tag byte, payload uint64) uint64 {
+	return (uint64(tag) << 56) | (payload & payloadMask)
+}
+
+// tapeTagAt returns the tag byte at the given tape index.
+// Callers must have bounded idx. Walkers rely on the tape's structural invariants,
+// which are established once at the trust boundary (see Tape.validate), so no bounds
+// check is paid per element here.
+func (t *Tape) tapeTagAt(idx int) byte {
+	return byte(t.data[idx] >> 56)
+}
+
+// tapePayloadAt returns the 56-bit payload at the given tape index.
+// See tapeTagAt for the bounding contract.
+func (t *Tape) tapePayloadAt(idx int) uint64 {
+	return t.data[idx] & payloadMask
+}
+
+// tapeSkipNop advances past a NOP entry, returning the next index.
+func (t *Tape) tapeSkipNop(idx int) int {
+	skip := int(t.tapePayloadAt(idx)) //nolint:gosec // payloadMask is 56 bits, so this cannot go negative
+	if skip == 0 {
+		skip = 1
+	}
+	return idx + skip
+}
+
+// skipNopsUntil advances idx past any leading NOP entries, stopping before limit.
+// Mutation (DeleteElems, and the setters when they shrink a value) leaves NOP
+// padding on the tape; every walker must step over it before treating an index
+// as a value. Bounded by limit so it is safe to call at a container's end.
+func (t *Tape) skipNopsUntil(idx, limit int) int {
+	for idx < limit && t.tapeTagAt(idx) == tagNop {
+		idx = t.tapeSkipNop(idx)
+	}
+	return idx
+}
 
 // skipValue returns the tape index after the value at idx.
 //
@@ -1209,4 +1229,176 @@ func (o *TapeObject) Iter() TapeIter {
 		return TapeIter{tape: o.tape, idx: len(o.tape.data)}
 	}
 	return TapeIter{tape: o.tape, idx: pos}
+}
+
+// --- Tape mutation helpers ---
+
+// tapeSetTag writes a tag-only entry (no payload) at the given index.
+func (t *Tape) tapeSetTag(idx int, tag byte) {
+	t.data[idx] = tapeEntry(tag, 0)
+}
+
+// tapeSetTagPayload writes a tag + payload entry at the given index.
+func (t *Tape) tapeSetTagPayload(idx int, tag byte, payload uint64) {
+	t.data[idx] = tapeEntry(tag, payload)
+}
+
+// tapeSetNop writes a NOP entry at idx. Advance() will skip forward by `skip` entries.
+func (t *Tape) tapeSetNop(idx int, skip uint64) {
+	t.data[idx] = tapeEntry(tagNop, skip)
+}
+
+// tapeNopRange fills tape[start:end] with NOP entries, each pointing to end.
+// end must be within the tape; callers derive it from a validated container header.
+func (t *Tape) tapeNopRange(start, end int) {
+	for j := start; j < end; j++ {
+		t.tapeSetNop(j, uint64(end-j)) //nolint:gosec // j < end by the loop condition, so end-j is positive
+	}
+}
+
+// tapeCountObjectEntries counts the key-value pairs in [from, to), stepping over NOP
+// runs. It reads tags and end indices only, never string payloads, so it is safe on
+// the tape that made a key read fail.
+func (t *Tape) tapeCountObjectEntries(from, to int) int {
+	n := 0
+	for p := t.skipNopsUntil(from, to); p < to; p = t.skipNopsUntil(t.skipValue(p+1), to) {
+		n++
+	}
+	return n
+}
+
+// tapeSetContainerCount writes n as the element count of the container header at
+// headerIdx, clamping to containerCountMask the way simdjson's stage 2 does. Callers
+// pass a counted number of surviving elements rather than an adjustment, so a count
+// that reached the field's ceiling at parse time becomes exact again once the
+// container holds few enough elements to represent.
+func (t *Tape) tapeSetContainerCount(headerIdx, n int) {
+	if n > containerCountMask {
+		n = containerCountMask
+	}
+	w := t.data[headerIdx]
+	t.data[headerIdx] = w&^(uint64(containerCountMask)<<32) | uint64(n)<<32
+}
+
+// tapeAppendString appends a string to the string buffer and returns the offset.
+// Format: [4-byte LE length][UTF-8 bytes][null terminator].
+// The buffer is already well-sized from parse; append handles growth if needed.
+// len(v) must fit a uint32 — SetStringBytes, the only caller, rejects longer.
+func (t *Tape) tapeAppendString(v []byte) uint64 {
+	off := len(t.strings)
+	t.strings = append(t.strings, 0, 0, 0, 0)
+	binary.NativeEndian.PutUint32(t.strings[off:], uint32(len(v))) //nolint:gosec // SetStringBytes rejects a length that would not fit
+	t.strings = append(t.strings, v...)
+	t.strings = append(t.strings, 0)
+	return uint64(off)
+}
+
+// --- Root document blocks ---
+//
+// simdjson_parse_many lays out an NDJSON stream as one self-contained block per
+// document, each of the form
+//
+//	[k]   tagRoot   payload = index one past the block's closing root
+//	[k+1] the document's value (an object, array or scalar)
+//	...
+//	[e]   tagRoot   payload = k (points back to the opening root)
+//	[e+1] NOT WRITTEN BY simdjson
+//
+// so the next document's opening root, if any, sits at payload+1. A tape from a
+// single-document Parse is the same shape with exactly one block.
+//
+// The word at payload is the important trap: tape_len counts it, so Parse copies
+// it, but simdjson never writes it and the C++ parser does not zero its tape
+// between parses — it holds whatever a previous parse left there. Never infer
+// structure from its contents; only the root payload chain is reliable.
+
+// nextRootDoc returns the index of the opening root entry of the next READABLE
+// root document after the one at rootIdx, or len(t.data) when there is none.
+//
+// "Readable" means the returned index is a root marker with a value entry after
+// it, so callers may read at index+1 without a further bound check. It always
+// makes progress, so it is safe to drive a loop.
+func (t *Tape) nextRootDoc(rootIdx int) int {
+	if !t.hasRootAt(rootIdx) {
+		return len(t.data)
+	}
+	next := int(t.tapePayloadAt(rootIdx)) + 1 //nolint:gosec // payloadMask is 56 bits, so this cannot go negative
+	if next <= rootIdx || !t.hasRootDocAt(next) {
+		return len(t.data)
+	}
+	return next
+}
+
+// hasRootAt reports whether idx is in range and holds a root entry. Use this to
+// recognise a root marker; use hasRootDocAt when you intend to read its value.
+func (t *Tape) hasRootAt(idx int) bool {
+	return idx >= 0 && idx < len(t.data) && t.tapeTagAt(idx) == tagRoot
+}
+
+// hasRootDocAt reports whether idx holds a readable root document: a root marker
+// with a value entry following it.
+//
+// Both halves are load-bearing. A bare length check only confirms a value slot
+// exists and never looks at the marker, so a tape with no root would pass it;
+// hasRootAt alone confirms the marker but not that anything follows. Neither
+// implies the other, and Serializer.Deserialize can produce either shape, since
+// it validates length prefixes but not structure.
+func (t *Tape) hasRootDocAt(idx int) bool {
+	return t.hasRootAt(idx) && idx+1 < len(t.data)
+}
+
+// hasRootDoc reports whether the tape holds at least one readable root document.
+// This is the guard for every entry point that reads from index 1 — RootType,
+// Interface, InterfaceUseNumber and ForEach.
+func (t *Tape) hasRootDoc() bool {
+	return t.hasRootDocAt(0)
+}
+
+// rootDocContaining returns the index of the opening root entry of the document
+// that contains idx, or -1 if idx is not inside any document.
+//
+// The block's extent is [root, payload): the opening root marker itself counts as
+// inside, so a cursor already sitting on a root resolves to that document rather
+// than being reported as outside one. The padding slot at payload does not count —
+// nothing on the tape refers to it and simdjson never writes it.
+//
+// Root blocks are laid out in order and do not overlap, so this walks them from
+// the start: O(documents before idx), and O(1) for a single-document tape. There
+// is no back-pointer from an arbitrary entry to its enclosing root, so a scan is
+// the only option — only the closing root points back, and a cursor deep inside a
+// container cannot reach it cheaply.
+func (t *Tape) rootDocContaining(idx int) int {
+	for root := 0; t.hasRootDocAt(root); root = t.nextRootDoc(root) {
+		if root > idx {
+			break
+		}
+		if idx < int(t.tapePayloadAt(root)) { //nolint:gosec // payloadMask is 56 bits, so this cannot go negative
+			return root
+		}
+	}
+	return -1
+}
+
+// skipRootBoundary advances a cursor that has landed on a root marker to the
+// value of the next root document, or past the end of the tape when there is
+// none. A cursor not on a root marker is returned unchanged.
+//
+// A closing root's payload points back to its opening root, whose payload in turn
+// locates the end of the block — so the next document is found purely from the
+// payload chain, without reading the uninitialised padding word.
+func (t *Tape) skipRootBoundary(idx int) int {
+	if !t.hasRootAt(idx) {
+		return idx
+	}
+	payload := int(t.tapePayloadAt(idx)) //nolint:gosec // payloadMask is 56 bits, so this cannot go negative
+	if payload > idx {
+		// An opening root: its document's value is the next entry.
+		return idx + 1
+	}
+	// A closing root: payload is its opening root.
+	next := t.nextRootDoc(payload)
+	if next >= len(t.data) {
+		return len(t.data)
+	}
+	return next + 1
 }

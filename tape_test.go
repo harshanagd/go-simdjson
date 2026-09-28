@@ -758,82 +758,6 @@ func TestTapeIterAdvanceIntoFullyDeletedContainer(t *testing.T) {
 	}
 }
 
-func TestLargeNumbers(t *testing.T) {
-	tests := []struct {
-		name      string
-		input     string
-		wantErr   bool
-		wantType  Type
-		wantFloat float64
-	}{
-		{"max_int64", `9223372036854775807`, false, TypeInt64, 0},
-		{"min_int64", `-9223372036854775808`, false, TypeInt64, 0},
-		{"max_uint64", `18446744073709551615`, false, TypeUint64, 0},
-		{"overflow_uint64", `18446744073709551616`, true, TypeNull, 0},
-		{"huge_int", `99999999999999999999`, true, TypeNull, 0},
-		{"huge_negative", `-99999999999999999999`, true, TypeNull, 0},
-		{"float_big", `1e308`, false, TypeDouble, 1e308},
-		{"float_tiny", `5e-324`, false, TypeDouble, 5e-324},
-		{"float_overflow", `1e309`, true, TypeNull, 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pj, err := Parse([]byte(tt.input), nil)
-			if tt.wantErr {
-				if err == nil {
-					pj.Close()
-					t.Fatal("expected parse error")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("Parse failed: %v", err)
-			}
-			defer pj.Close()
-
-			if pj.RootType() != tt.wantType {
-				t.Fatalf("expected type %v, got %v", tt.wantType, pj.RootType())
-			}
-
-			if tt.wantType == TypeDouble {
-				v, err := pj.RootDouble()
-				if err != nil {
-					t.Fatalf("RootDouble failed: %v", err)
-				}
-				if v != tt.wantFloat {
-					t.Fatalf("expected %v, got %v", tt.wantFloat, v)
-				}
-			}
-		})
-	}
-}
-
-func TestLargeNumberStringCvt(t *testing.T) {
-	// max uint64 via StringCvt
-	pj, _ := Parse([]byte(`18446744073709551615`), nil)
-	defer pj.Close()
-	iter, _ := pj.Iter()
-	s, err := iter.StringCvt()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s != "18446744073709551615" {
-		t.Fatalf("expected '18446744073709551615', got %q", s)
-	}
-}
-
-func TestLargeNumberUseNumber(t *testing.T) {
-	// Numbers that overflow int64 but fit in uint64
-	pj, _ := Parse([]byte(`{"big":18446744073709551615}`), nil, UseNumber())
-	defer pj.Close()
-	v, _ := pj.TapeInterfaceUseNumber()
-	m := v.(map[string]interface{})
-	n := m["big"].(json.Number)
-	if n.String() != "18446744073709551615" {
-		t.Fatalf("expected '18446744073709551615', got %q", n.String())
-	}
-}
-
 func TestTapeAdvance(t *testing.T) {
 	pj, _ := Parse([]byte(`[1,"two",true]`), nil)
 	defer pj.Close()
@@ -1230,32 +1154,6 @@ func TestTapeIterExhaustedAccessorsDoNotPanic(t *testing.T) {
 	}
 }
 
-// TestIterExhaustedPeekNextTagDoesNotPanic is the Iter-layer counterpart: it
-// builds its own skipValue call and so needs its own input guard.
-func TestIterExhaustedPeekNextTagDoesNotPanic(t *testing.T) {
-	pj, arr := deleteFromArray(t, `[1,2,3]`, func(i Iter) bool { return true })
-	defer pj.Close()
-
-	cur := arr.Iter()
-	ei := Iter{tape: cur.tape, tapeIdx: cur.idx}
-	if got := ei.PeekNextTag(); got != TagEnd {
-		t.Errorf("PeekNextTag() on an exhausted iterator = %q, want TagEnd", rune(got))
-	}
-	if got := ei.Advance(); got != TypeNone {
-		t.Errorf("Iter.Advance() on an exhausted iterator = %v, want TypeNone", got)
-	}
-	if got := ei.PeekNext(); got != TypeNone {
-		t.Errorf("Iter.PeekNext() on an exhausted iterator = %v, want TypeNone", got)
-	}
-	if got := ei.AdvanceInto(); got != TagEnd {
-		t.Errorf("Iter.AdvanceInto() on an exhausted iterator = %q, want TagEnd", rune(got))
-	}
-	var dst Iter
-	if got, err := ei.AdvanceIter(&dst); got != TypeNone || err != nil {
-		t.Errorf("AdvanceIter() on an exhausted iterator = %v, %v; want TypeNone, nil", got, err)
-	}
-}
-
 // TestRootTypeAgreesAcrossLayers covers the tag-to-Type mapping at the root.
 // Tape.RootType previously returned the raw tag, so a document whose root is
 // `false` reported unknown(102) while ParsedJson.RootType (which routes through
@@ -1426,21 +1324,6 @@ func TestReadValueOnTruncatedTape(t *testing.T) {
 			// Tape.Interface enters at index 1, the same entry.
 			if _, err := tp.Interface(); err == nil {
 				t.Error("Tape.Interface() on a truncated numeric entry returned no error")
-			}
-		})
-	}
-}
-
-func TestMarshalTapeOnTruncatedTape(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		tag  byte
-	}{{"int", tagInt64}, {"uint", tagUint64}, {"double", tagDouble}} {
-		t.Run(tc.name, func(t *testing.T) {
-			tp, _ := truncatedNumericTape(tc.tag)
-			it := Iter{tape: tp, tapeIdx: 1}
-			if _, err := it.MarshalJSON(); err == nil {
-				t.Errorf("MarshalJSON() on a truncated %s entry returned no error", tc.name)
 			}
 		})
 	}
